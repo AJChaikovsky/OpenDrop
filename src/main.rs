@@ -4,6 +4,9 @@
 //!   opendrop peers [--wait SECONDS]
 //!   opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
 //!   opendrop send-file <DEVICE|IP[:PORT]> <FILE>... [--name NAME]
+//!   opendrop pair <DEVICE|IP[:PORT]>
+//!   opendrop devices [--wait SECONDS]
+//!   opendrop unpair <DEVICE>
 
 use opendrop::DEFAULT_PORT;
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
@@ -11,11 +14,14 @@ use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::server::{Approval, FileRequest};
 use opendrop::network::{APPROVAL_TIMEOUT, DeviceIdentity, server};
+use opendrop::pairing::store::PairedDevices;
+use opendrop::pairing::{PAIRING_TIMEOUT, PairOutcome, PairPrompt, PairPrompts};
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
@@ -33,6 +39,11 @@ USAGE:
     opendrop peers [--wait SECONDS] list devices on this network
     opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
     opendrop send-file <DEVICE|IP[:PORT]> <FILE>... [--name NAME]
+    opendrop pair <DEVICE|IP[:PORT]>  pair with a device (both screens show a code)
+    opendrop devices [--wait SECONDS] list nearby and paired devices
+    opendrop unpair <DEVICE>          forget a paired device
+
+Every command also takes --config DIR.
 
 `listen` asks before accepting each file; --auto-accept takes every file without asking.
 Received files go to --dir (default: Downloads/OpenDrop in your home folder).
@@ -44,7 +55,8 @@ EXAMPLES:
     opendrop peers
     opendrop send \"AJ's MacBook\" \"hello from my PC\"
     opendrop send-file \"AJ's MacBook\" photo.jpg notes.pdf
-    opendrop send 192.168.1.20 \"hello from my Mac\"";
+    opendrop send 192.168.1.20 \"hello from my Mac\"
+    opendrop pair \"AJ's MacBook\"";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -71,6 +83,25 @@ async fn main() -> ExitCode {
         Ok(identity) => identity,
         Err(e) => return fail(&e.to_string()),
     };
+    // A damaged store must not stop the device from receiving files: carry
+    // on with nothing paired (and leave the file alone for the user to fix).
+    // Commands that manage pairing refuse to run on it instead.
+    let (paired, store_error) = match PairedDevices::load(&config_dir) {
+        Ok(paired) => (Arc::new(paired), None),
+        Err(e) => (Arc::new(PairedDevices::in_memory()), Some(e.to_string())),
+    };
+    let needs_store = matches!(
+        args.first().map(String::as_str),
+        Some("pair" | "unpair" | "devices")
+    );
+    if let Some(error) = &store_error {
+        if needs_store {
+            return fail(error);
+        }
+        eprintln!("warning: {error}");
+        eprintln!("warning: carrying on with no paired devices; changes won't be saved");
+    }
+    let me = Me { identity, paired };
 
     match args
         .iter()
@@ -78,12 +109,15 @@ async fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["listen"] => listen(identity, port, download_dir, auto_accept).await,
-        ["peers"] => peers(identity, wait).await,
-        ["send", target, message] => send(identity, target, message, wait).await,
+        ["listen"] => listen(me, port, download_dir, auto_accept).await,
+        ["peers"] => peers(&me, wait).await,
+        ["send", target, message] => send(&me, target, message, wait).await,
         ["send-file", target, files @ ..] if !files.is_empty() => {
-            send_files(identity, target, files, wait).await
+            send_files(&me, target, files, wait).await
         }
+        ["pair", target] => pair(&me, target, wait).await,
+        ["devices"] => devices(&me, wait).await,
+        ["unpair", target] => unpair(&me, target),
         ["help"] | ["--help"] | ["-h"] => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -95,12 +129,14 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn listen(
+/// This device: who it is and whom it has paired with.
+struct Me {
     identity: DeviceIdentity,
-    port: u16,
-    download_dir: PathBuf,
-    auto_accept: bool,
-) -> ExitCode {
+    paired: Arc<PairedDevices>,
+}
+
+async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> ExitCode {
+    let Me { identity, paired } = me;
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) => return fail(&format!("could not listen on port {port}: {e}")),
@@ -116,13 +152,18 @@ async fn listen(
         None => println!("Could not detect this device's LAN IP; check your network settings"),
     }
     println!("Received files are saved to {}", download_dir.display());
+    let (file_prompts, pair_prompts) = spawn_prompt();
     let approval = if auto_accept {
         println!("Accepting every incoming file without asking (--auto-accept).");
         Approval::AcceptAll
     } else {
         println!("You'll be asked before any incoming file is saved.");
-        Approval::Ask(spawn_prompt())
+        Approval::Ask(file_prompts)
     };
+    match paired.list().len() {
+        0 => println!("No paired devices yet; others can pair with `opendrop pair`."),
+        n => println!("{n} paired device(s); see `opendrop devices`."),
+    }
     let discovery = match Discovery::start(&identity, Some(port)) {
         Ok(d) => {
             println!("Advertising on the local network; nearby devices will appear below.");
@@ -136,6 +177,7 @@ async fn listen(
     println!("Press Ctrl+C to stop.\n");
     if let Some(discovery) = &discovery {
         let mut events = discovery.subscribe();
+        let paired = Arc::clone(&paired);
         tokio::spawn(async move {
             // Address each peer was last shown with. Updates mostly add
             // addresses as more interfaces answer; only mention the ones that
@@ -144,12 +186,12 @@ async fn listen(
             while let Ok(event) = events.recv().await {
                 match event {
                     PeerEvent::Found(p) => {
-                        println!("+ found {}", describe(&p));
+                        println!("+ found {}", describe(&p, &paired));
                         shown.insert(p.id.clone(), p.socket_addr());
                     }
                     PeerEvent::Updated(p) => {
                         if shown.insert(p.id.clone(), p.socket_addr()) != Some(p.socket_addr()) {
-                            println!("~ updated {}", describe(&p));
+                            println!("~ updated {}", describe(&p, &paired));
                         }
                     }
                     PeerEvent::Lost(p) => {
@@ -162,7 +204,11 @@ async fn listen(
     }
 
     tokio::select! {
-        result = server::run(listener, identity, download_dir, approval) => match result {
+        result = server::serve(listener, server::Options {
+            paired,
+            pair_prompts: Some(pair_prompts),
+            ..server::Options::new(identity, download_dir, approval)
+        }) => match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&format!("server stopped: {e}")),
         },
@@ -173,8 +219,8 @@ async fn listen(
     }
 }
 
-async fn peers(identity: DeviceIdentity, wait: Duration) -> ExitCode {
-    let discovery = match Discovery::start(&identity, None) {
+async fn peers(me: &Me, wait: Duration) -> ExitCode {
+    let discovery = match Discovery::start(&me.identity, None) {
         Ok(d) => d,
         Err(e) => return fail(&format!("could not start mDNS discovery: {e}")),
     };
@@ -188,13 +234,13 @@ async fn peers(identity: DeviceIdentity, wait: Duration) -> ExitCode {
         println!("No devices found. Is `opendrop listen` running on the same network?");
     }
     for peer in found {
-        println!("{}", describe(&peer));
+        println!("{}", describe(&peer, &me.paired));
     }
     ExitCode::SUCCESS
 }
 
-async fn send(identity: DeviceIdentity, target: &str, message: &str, wait: Duration) -> ExitCode {
-    let (mut connection, addr) = match connect(&identity, target, wait).await {
+async fn send(me: &Me, target: &str, message: &str, wait: Duration) -> ExitCode {
+    let (mut connection, addr) = match connect(me, target, wait).await {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -210,12 +256,7 @@ async fn send(identity: DeviceIdentity, target: &str, message: &str, wait: Durat
     }
 }
 
-async fn send_files(
-    identity: DeviceIdentity,
-    target: &str,
-    files: &[&str],
-    wait: Duration,
-) -> ExitCode {
+async fn send_files(me: &Me, target: &str, files: &[&str], wait: Duration) -> ExitCode {
     // Catch typos before connecting rather than halfway through a batch.
     for file in files {
         match std::fs::metadata(file) {
@@ -228,7 +269,7 @@ async fn send_files(
             Err(e) => return fail(&format!("cannot read {file}: {e}")),
         }
     }
-    let (mut connection, addr) = match connect(&identity, target, wait).await {
+    let (mut connection, addr) = match connect(me, target, wait).await {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -268,18 +309,118 @@ async fn send_files(
     ExitCode::SUCCESS
 }
 
+async fn pair(me: &Me, target: &str, wait: Duration) -> ExitCode {
+    let (mut connection, addr) = match connect(me, target, wait).await {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let peer = connection.peer.clone();
+    if connection.paired {
+        println!("Already paired with \"{}\" ({}).", peer.name, peer.id);
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "Asking \"{}\" ({}) at {addr} to pair. Both screens will show a 6-digit code.",
+        peer.name, peer.id
+    );
+    let (_files, prompts) = spawn_prompt();
+    match connection.pair(&me.identity, &prompts, &me.paired).await {
+        Ok(PairOutcome::Paired) => {
+            println!("Paired with \"{}\" ({}).", peer.name, peer.id);
+            ExitCode::SUCCESS
+        }
+        Ok(PairOutcome::Declined { by_peer: true }) => {
+            fail(&format!("\"{}\" declined; not paired", peer.name))
+        }
+        Ok(PairOutcome::Declined { by_peer: false }) => fail("you declined; not paired"),
+        Ok(PairOutcome::TimedOut) => fail(&format!(
+            "no answer within {}s; not paired",
+            PAIRING_TIMEOUT.as_secs()
+        )),
+        Err(e) => fail(&format!("pairing failed: {e}")),
+    }
+}
+
+/// Nearby devices with their pairing status, then paired devices that
+/// aren't around right now.
+async fn devices(me: &Me, wait: Duration) -> ExitCode {
+    let found = match Discovery::start(&me.identity, None) {
+        Ok(discovery) => {
+            tokio::time::sleep(wait).await;
+            discovery.peers()
+        }
+        Err(e) => {
+            eprintln!("warning: could not look for nearby devices ({e})");
+            Vec::new()
+        }
+    };
+    let paired = me.paired.list();
+    if found.is_empty() && paired.is_empty() {
+        println!("No devices nearby and none paired.");
+        return ExitCode::SUCCESS;
+    }
+    for peer in &found {
+        let status = if peer.protocol_version != opendrop::protocol::PROTOCOL_VERSION {
+            "Incompatible"
+        } else if me.paired.get(&peer.id).is_some() {
+            "Paired"
+        } else {
+            "Unpaired"
+        };
+        println!("{status:<13}{}", describe(peer, &me.paired));
+    }
+    for device in paired.iter().filter(|d| found.iter().all(|p| p.id != d.id)) {
+        println!(
+            "{:<13}\"{}\" ({}) not on the network right now",
+            "Paired", device.name, device.id
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Forget a paired device, named by id or (unambiguous) name.
+fn unpair(me: &Me, target: &str) -> ExitCode {
+    let matches: Vec<_> = me
+        .paired
+        .list()
+        .into_iter()
+        .filter(|d| d.id == target || d.name.eq_ignore_ascii_case(target))
+        .collect();
+    let device = match matches.as_slice() {
+        [device] => device,
+        [] => {
+            return fail(&format!(
+                "no paired device named \"{target}\" (see `opendrop devices`)"
+            ));
+        }
+        several => {
+            let ids: Vec<&str> = several.iter().map(|d| d.id.as_str()).collect();
+            return fail(&format!(
+                "several paired devices are named \"{target}\"; use an id: {}",
+                ids.join(", ")
+            ));
+        }
+    };
+    match me.paired.remove(&device.id) {
+        Ok(_) => {
+            println!(
+                "Unpaired \"{}\" ({}). It will see this the next time you connect.",
+                device.name, device.id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("could not save the change: {e}")),
+    }
+}
+
 /// Connect to `target`: a bare IP (default port), IP:PORT, or a discovered
 /// device's name or id. A discovered device may advertise several
 /// addresses; the first that answers wins.
-async fn connect(
-    identity: &DeviceIdentity,
-    target: &str,
-    wait: Duration,
-) -> Result<(Connection, String), ExitCode> {
+async fn connect(me: &Me, target: &str, wait: Duration) -> Result<(Connection, String), ExitCode> {
     let addrs = match target.parse::<IpAddr>() {
         Ok(ip) => vec![SocketAddr::new(ip, DEFAULT_PORT).to_string()],
         Err(_) if target.parse::<SocketAddr>().is_ok() => vec![target.to_owned()],
-        Err(_) => find_peer(identity, target, wait)
+        Err(_) => find_peer(&me.identity, target, wait)
             .await?
             .iter()
             .map(SocketAddr::to_string)
@@ -287,7 +428,7 @@ async fn connect(
     };
     let mut last_error = String::new();
     for addr in addrs {
-        match Connection::open(&addr, identity).await {
+        match Connection::open_with(&addr, &me.identity, &me.paired).await {
             Ok(connection) => return Ok((connection, addr)),
             Err(e) => last_error = e.to_string(),
         }
@@ -390,7 +531,7 @@ async fn find_peer(
     Ok(addrs)
 }
 
-fn describe(peer: &Peer) -> String {
+fn describe(peer: &Peer, paired: &PairedDevices) -> String {
     let addr = peer
         .socket_addr()
         .map_or_else(|| format!("?:{}", peer.port), |a| a.to_string());
@@ -400,48 +541,65 @@ fn describe(peer: &Peer) -> String {
             " [protocol v{}, incompatible]",
             peer.protocol_version
         ));
+    } else if paired.get(&peer.id).is_some() {
+        line.push_str(" [paired]");
     }
     line
 }
 
-/// Ask on the terminal about each offered file, one at a time. Offers that
-/// arrive while one is pending wait their turn.
-fn spawn_prompt() -> mpsc::Sender<FileRequest> {
-    let (requests, mut pending) = mpsc::channel::<FileRequest>(16);
+/// Ask on the terminal about each offered file and each pairing request,
+/// one at a time. Requests that arrive while one is pending wait their turn.
+fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
+    let (file_requests, mut files) = mpsc::channel::<FileRequest>(16);
+    let (pair_requests, mut pairs) = mpsc::channel::<PairPrompt>(4);
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        while let Some(FileRequest {
-            peer_name,
-            peer_addr,
-            name,
-            size,
-            mut respond,
-            ..
-        }) = pending.recv().await
-        {
+        loop {
+            let (question, limit, mut respond) = tokio::select! {
+                Some(FileRequest { peer_name, peer_addr, name, size, respond, .. }) = files.recv() => (
+                    format!(
+                        "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
+                        peer_addr.ip(),
+                        human_size(size),
+                    ),
+                    APPROVAL_TIMEOUT,
+                    respond,
+                ),
+                Some(PairPrompt { peer, code, incoming, respond }) = pairs.recv() => (
+                    format!(
+                        "{} Pairing code: {code}\n  Does \"{}\" show the same code?",
+                        if incoming {
+                            format!("\"{}\" ({}) wants to pair.", peer.name, peer.id)
+                        } else {
+                            format!("Pairing with \"{}\" ({}).", peer.name, peer.id)
+                        },
+                        peer.name
+                    ),
+                    PAIRING_TIMEOUT,
+                    respond,
+                ),
+                else => break,
+            };
             if respond.is_closed() {
                 continue; // Timed out or the sender hung up while queued.
             }
-            print!(
-                "\n? \"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept? [y/N] (within {}s): ",
-                peer_addr.ip(),
-                human_size(size),
-                APPROVAL_TIMEOUT.as_secs()
-            );
+            print!("\n? {question} [y/N] (within {}s): ", limit.as_secs());
             let _ = std::io::stdout().flush();
             let answer = tokio::select! {
                 line = lines.next_line() => line.ok().flatten(),
                 _ = respond.closed() => {
-                    println!("\n  No answer in time; declined.");
+                    println!("\n  No answer in time, or the other side cancelled; declined.");
                     continue;
                 }
             };
-            let accept =
-                answer.is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "y" | "yes"));
-            let _ = respond.send(accept);
+            let _ = respond.send(is_yes(answer));
         }
     });
-    requests
+    (file_requests, pair_requests)
+}
+
+fn is_yes(answer: Option<String>) -> bool {
+    answer.is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 /// Remove `--flag` from `args`, returning whether it was there.
