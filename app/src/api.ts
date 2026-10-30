@@ -17,6 +17,9 @@ export interface Api {
   devices(): Promise<Device[]>;
   sendFiles(target: { deviceId?: string; address?: string }, paths: string[]): Promise<string[]>;
   respond(transferId: string, accept: boolean): Promise<boolean>;
+  pairDevice(deviceId: string): Promise<void>;
+  respondPair(pairId: string, accept: boolean): Promise<boolean>;
+  unpairDevice(deviceId: string): Promise<boolean>;
   pickFiles(): Promise<string[]>;
   onEvent(handler: (event: AppEvent) => void): Promise<() => void>;
   onDrag(handler: (event: DragEvent) => void): Promise<() => void>;
@@ -28,6 +31,9 @@ export const tauriApi: Api = {
   sendFiles: (target, paths) =>
     invoke("send_files", { deviceId: target.deviceId ?? null, address: target.address ?? null, paths }),
   respond: (transferId, accept) => invoke("respond", { transferId, accept }),
+  pairDevice: (deviceId) => invoke("pair_device", { deviceId }),
+  respondPair: (pairId, accept) => invoke("respond_pair", { pairId, accept }),
+  unpairDevice: (deviceId) => invoke("unpair_device", { deviceId }),
   async pickFiles() {
     const picked = await open({ multiple: true, directory: false });
     if (picked === null) return [];

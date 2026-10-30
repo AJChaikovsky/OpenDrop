@@ -66,6 +66,17 @@ pub enum PairOutcome {
     TimedOut,
 }
 
+/// How a pairing the other device started ended, for a UI to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairResult {
+    pub peer: PeerIdentity,
+    /// `Err` if the attempt broke off (protocol error, dropped connection).
+    pub outcome: Result<PairOutcome, String>,
+}
+
+/// Where a server reports [`PairResult`]s.
+pub type PairResults = mpsc::UnboundedSender<PairResult>;
+
 /// What the two sides of one pairing agreed on, enough to compute the code.
 struct Session<'a> {
     identity: &'a DeviceIdentity,

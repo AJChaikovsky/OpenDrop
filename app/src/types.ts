@@ -5,6 +5,8 @@ export interface Device {
   name: string;
   address: string | null;
   compatible: boolean;
+  /** We have this device's key from an earlier pairing. */
+  paired: boolean;
 }
 
 export interface Me {
@@ -12,7 +14,11 @@ export interface Me {
   name: string;
   port: number;
   download_dir: string;
+  /** A startup problem to show, e.g. a damaged paired-devices file. */
+  warning: string | null;
 }
+
+export type PairStatus = "paired" | "declined" | "declined_by_peer" | "timed_out" | "failed";
 
 export type AppEvent =
   | { kind: "devices"; devices: Device[] }
@@ -26,6 +32,10 @@ export type AppEvent =
   | { kind: "send_progress"; transfer_id: string; bytes: number; size: number; bytes_per_sec: number }
   | { kind: "send_done"; transfer_id: string; sha256: string }
   | { kind: "send_declined"; transfer_id: string }
-  | { kind: "send_failed"; transfer_id: string; error: string };
+  | { kind: "send_failed"; transfer_id: string; error: string }
+  | { kind: "pair_code"; pair_id: string; device_id: string; device_name: string; code: string; incoming: boolean }
+  | { kind: "pair_expired"; pair_id: string }
+  | { kind: "pair_done"; device_id: string; device_name: string; status: PairStatus; error: string | null };
 
 export type IncomingRequest = Extract<AppEvent, { kind: "incoming_request" }>;
+export type PairCode = Extract<AppEvent, { kind: "pair_code" }>;

@@ -25,7 +25,7 @@
 
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
 use crate::pairing::store::PairedDevices;
-use crate::pairing::{self, PairOutcome, PairPrompts};
+use crate::pairing::{self, PairOutcome, PairPrompts, PairResult, PairResults};
 use crate::protocol::{ErrorCode, Message, ProtocolError, read_message, write_message};
 use crate::transfer::{PartFile, copy_hashed, sanitize_file_name};
 use std::net::SocketAddr;
@@ -100,6 +100,8 @@ pub struct Options {
     /// Where to show pairing codes when a peer asks to pair. Without it,
     /// pair requests are declined.
     pub pair_prompts: Option<PairPrompts>,
+    /// Where to report how pairings that peers started ended, if anywhere.
+    pub pair_results: Option<PairResults>,
 }
 
 impl Options {
@@ -111,6 +113,7 @@ impl Options {
             events: None,
             paired: Arc::new(PairedDevices::in_memory()),
             pair_prompts: None,
+            pair_results: None,
         }
     }
 }
@@ -202,7 +205,7 @@ async fn handle_connection(
                 .await?;
             }
             Ok(Message::PairRequest { commitment }) => {
-                let outcome = pairing::respond(
+                let result = pairing::respond(
                     &mut stream,
                     &options.identity,
                     &peer.peer,
@@ -211,7 +214,14 @@ async fn handle_connection(
                     options.pair_prompts.as_ref(),
                     &options.paired,
                 )
-                .await?;
+                .await;
+                if let Some(results) = &options.pair_results {
+                    let _ = results.send(PairResult {
+                        peer: peer.peer.clone(),
+                        outcome: result.as_ref().map(Clone::clone).map_err(|e| e.to_string()),
+                    });
+                }
+                let outcome = result?;
                 println!("[{peer_addr}] pairing with {peer_name}: {outcome:?}");
                 if outcome == PairOutcome::TimedOut {
                     // A late answer may still be in flight; start afresh.

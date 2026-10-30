@@ -3,18 +3,27 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Api, DragEvent } from "./api";
 import App from "./App";
-import type { AppEvent, Device } from "./types";
+import type { AppEvent, Device, Me } from "./types";
 
-const pc: Device = { id: "device-pc", name: "AJ-PC", address: "192.168.1.30:45454", compatible: true };
+const pc: Device = { id: "device-pc", name: "AJ-PC", address: "192.168.1.30:45454", compatible: true, paired: false };
 
 function fakeApi(devices: Device[] = [pc]) {
   let emit: (e: AppEvent) => void = () => {};
   let drag: (e: DragEvent) => void = () => {};
   const api = {
-    me: vi.fn(async () => ({ id: "device-me", name: "AJ's MacBook", port: 45454, download_dir: "/Users/aj/Downloads/OpenDrop" })),
+    me: vi.fn(async (): Promise<Me> => ({
+      id: "device-me",
+      name: "AJ's MacBook",
+      port: 45454,
+      download_dir: "/Users/aj/Downloads/OpenDrop",
+      warning: null,
+    })),
     devices: vi.fn(async () => devices),
     sendFiles: vi.fn(async () => ["send-1"]),
     respond: vi.fn(async () => true),
+    pairDevice: vi.fn(async () => {}),
+    respondPair: vi.fn(async () => true),
+    unpairDevice: vi.fn(async () => true),
     pickFiles: vi.fn(async () => ["/tmp/photo.jpg"]),
     onEvent: vi.fn(async (h: (e: AppEvent) => void) => ((emit = h), () => {})),
     onDrag: vi.fn(async (h: (e: DragEvent) => void) => ((drag = h), () => {})),
@@ -109,5 +118,104 @@ describe("App", () => {
     render(<App api={api} />);
     await userEvent.click(await screen.findByRole("button", { name: /AJ-PC/ }));
     expect(await screen.findByRole("alert")).toHaveTextContent("could not reach the device");
+  });
+
+  const code = (incoming = false): AppEvent => ({
+    kind: "pair_code",
+    pair_id: "pair-1",
+    device_id: "device-pc",
+    device_name: "AJ-PC",
+    code: "042917",
+    incoming,
+  });
+
+  it("pairs: shows the code, confirms, then reports success", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    const card = await screen.findByRole("listitem", { name: "AJ-PC" });
+    await userEvent.click(within(card).getByRole("button", { name: "Pair" }));
+    expect(api.pairDevice).toHaveBeenCalledWith("device-pc");
+
+    emit(code());
+    const dialog = screen.getByRole("dialog", { name: "Pair with AJ-PC" });
+    expect(within(dialog).getByLabelText("Pairing code")).toHaveTextContent("042 917");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
+    expect(api.respondPair).toHaveBeenCalledWith("pair-1", true);
+    // Stays up, waiting for the other side.
+    expect(screen.getByRole("dialog")).toHaveTextContent("Waiting for AJ-PC to confirm");
+    expect(within(screen.getByRole("dialog")).getByRole("button", { name: "Confirm" })).toBeDisabled();
+
+    emit({ kind: "pair_done", device_id: "device-pc", device_name: "AJ-PC", status: "paired", error: null });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Paired with AJ-PC.");
+  });
+
+  it("asks about incoming pairing and passes on a cancel", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("listitem", { name: "AJ-PC" });
+    emit(code(true));
+    const dialog = screen.getByRole("dialog", { name: "AJ-PC wants to pair" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(api.respondPair).toHaveBeenCalledWith("pair-1", false);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    emit({ kind: "pair_done", device_id: "device-pc", device_name: "AJ-PC", status: "declined", error: null });
+    expect(screen.getByRole("status")).toHaveTextContent("you cancelled");
+  });
+
+  it("gives up after 60 seconds and closes when the other side withdraws", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { api, emit } = fakeApi();
+      render(<App api={api} />);
+      await screen.findByRole("listitem", { name: "AJ-PC" });
+      emit(code());
+      expect(screen.getByRole("dialog")).toHaveTextContent("Cancels automatically in 60s");
+      act(() => vi.advanceTimersByTime(59_000));
+      expect(screen.getByRole("dialog")).toHaveTextContent("in 1s");
+      expect(api.respondPair).not.toHaveBeenCalled();
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(api.respondPair).toHaveBeenCalledWith("pair-1", false);
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      emit({ kind: "pair_done", device_id: "device-pc", device_name: "AJ-PC", status: "timed_out", error: null });
+      expect(screen.getByRole("status")).toHaveTextContent("nobody confirmed in time");
+
+      // A code the other side withdraws (it cancelled) just goes away.
+      emit({ ...code(), pair_id: "pair-2" } as AppEvent);
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      emit({ kind: "pair_expired", pair_id: "pair-2" });
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a Paired badge and unpairs from the device menu", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    let card = await screen.findByRole("listitem", { name: "AJ-PC" });
+    expect(within(card).queryByText("Paired")).not.toBeInTheDocument();
+    emit({ kind: "devices", devices: [{ ...pc, paired: true }] });
+    card = screen.getByRole("listitem", { name: "AJ-PC" });
+    expect(within(card).getByText("Paired")).toBeInTheDocument();
+    expect(within(card).queryByRole("button", { name: "Pair" })).not.toBeInTheDocument();
+    await userEvent.click(within(card).getByRole("button", { name: "Device menu" }));
+    await userEvent.click(within(card).getByRole("menuitem", { name: "Unpair" }));
+    expect(api.unpairDevice).toHaveBeenCalledWith("device-pc");
+    emit({ kind: "devices", devices: [pc] });
+    expect(within(screen.getByRole("listitem", { name: "AJ-PC" })).queryByText("Paired")).not.toBeInTheDocument();
+  });
+
+  it("shows startup warnings such as a damaged paired-devices file", async () => {
+    const { api } = fakeApi();
+    api.me.mockResolvedValueOnce({
+      id: "device-me",
+      name: "Mac",
+      port: 45454,
+      download_dir: "/tmp",
+      warning: "paired devices file /x/paired-devices.json is unreadable",
+    });
+    render(<App api={api} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("paired-devices.json is unreadable");
   });
 });

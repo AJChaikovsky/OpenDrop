@@ -38,13 +38,22 @@ h2 { font-size: 15px; text-transform: uppercase; letter-spacing: 0.04em; color: 
 .hint { font-size: 13px; }
 
 .devices { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
-.device button {
+.device { position: relative; }
+.device .device-main {
   width: 100%; display: flex; flex-direction: column; align-items: center; gap: 6px;
   padding: 18px 10px; background: var(--card); color: var(--text);
   border: 2px solid var(--border); border-radius: 14px; cursor: pointer; font: inherit;
 }
-.device button:hover:not(:disabled), .device.hovered button { border-color: var(--accent); background: var(--accent-soft); }
-.device button:disabled { opacity: 0.5; cursor: not-allowed; }
+.device .device-main:hover:not(:disabled), .device.hovered .device-main { border-color: var(--accent); background: var(--accent-soft); }
+.device .device-main:disabled { opacity: 0.5; cursor: not-allowed; }
+.device-pairing { display: flex; justify-content: center; align-items: center; gap: 6px; margin-top: 6px; min-height: 28px; }
+.badge { font-size: 12px; font-weight: 600; color: var(--ok); border: 1px solid var(--ok); border-radius: 999px; padding: 1px 8px; }
+.pair-button, .menu-button, .menu button {
+  font-size: 13px; padding: 3px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer;
+}
+.menu-button { padding: 1px 8px; }
+.menu { position: absolute; top: 100%; right: 0; z-index: 2; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 4px; box-shadow: 0 6px 20px rgba(0,0,0,0.2); }
+.menu button { border: none; width: 100%; text-align: left; }
 .avatar { width: 48px; height: 48px; border-radius: 50%; background: var(--accent); color: white; display: grid; place-items: center; font-size: 22px; font-weight: 600; }
 .device-name { font-weight: 600; text-align: center; overflow-wrap: anywhere; }
 .device-address { font-size: 12px; color: var(--muted); }
@@ -54,7 +63,9 @@ input, button { font: inherit; }
 .address input, .address button, .actions button {
   padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text);
 }
-.error { color: var(--bad); }
+.error, .warning { color: var(--bad); }
+.notice { color: var(--muted); }
+.notice.ok { color: var(--ok); }
 
 .transfers { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; }
 .transfer { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
@@ -72,6 +83,8 @@ input, button { font: inherit; }
 .dialog h2 { margin-top: 0; color: var(--text); text-transform: none; letter-spacing: 0; font-size: 18px; }
 .dialog .file { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
 .dialog .file span { font-weight: 400; color: var(--muted); font-size: 14px; margin-left: 6px; }
+.dialog .code { font-size: 34px; font-weight: 700; letter-spacing: 0.12em; text-align: center; margin: 12px 0; font-variant-numeric: tabular-nums; }
+.actions button:disabled { opacity: 0.6; }
 .countdown { color: var(--muted); font-size: 13px; }
 .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .actions .primary { background: var(--accent); color: white; border-color: var(--accent); }
