@@ -10,8 +10,9 @@
 //!
 //! The payload is UTF-8 JSON carrying a `version` and a `type` field, e.g.
 //! `{"version":1,"type":"text","body":"hi"}`. Framing means we never assume one
-//! TCP read equals one message, and it leaves room to send raw file bytes
-//! between control frames later.
+//! TCP read equals one message, and it lets raw file bytes travel between
+//! control frames: after a `file_accept`, the sender writes exactly the offered
+//! number of bytes, unframed, then resumes with a `file_done` frame.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -42,6 +43,21 @@ pub enum Message {
     Text { body: String },
     /// Acknowledges a `Text` message.
     TextAck { received_bytes: usize },
+    /// Client proposes sending a file. `name` is a bare file name, never a path.
+    FileOffer {
+        transfer_id: String,
+        name: String,
+        size: u64,
+    },
+    /// Receiver agrees; the client then sends exactly `size` raw bytes.
+    FileAccept { transfer_id: String },
+    /// Sent right after the raw bytes, with their SHA-256 in lowercase hex.
+    FileDone { transfer_id: String, sha256: String },
+    /// Receiver checked the hash and saved the file.
+    FileReceived {
+        transfer_id: String,
+        received_bytes: u64,
+    },
     /// Something went wrong; the sender closes the connection afterwards.
     Error { code: ErrorCode, message: String },
 }
@@ -52,6 +68,12 @@ pub enum ErrorCode {
     UnsupportedVersion,
     UnexpectedMessage,
     BadMessage,
+    /// The receiver won't take this file (e.g. its name is unusable).
+    FileRejected,
+    /// The received bytes don't match the sender's SHA-256.
+    ChecksumMismatch,
+    /// The receiver couldn't write the file to disk.
+    StorageError,
 }
 
 /// What actually goes on the wire: the message plus the protocol version.
@@ -175,6 +197,15 @@ mod tests {
                 body: "héllo 👋".into(),
             },
             Message::TextAck { received_bytes: 11 },
+            Message::FileOffer {
+                transfer_id: "t1".into(),
+                name: "photo.jpg".into(),
+                size: 5_000_000_000,
+            },
+            Message::FileDone {
+                transfer_id: "t1".into(),
+                sha256: "ab".repeat(32),
+            },
         ];
         for m in &msgs {
             write_message(&mut a, m).await.unwrap();
