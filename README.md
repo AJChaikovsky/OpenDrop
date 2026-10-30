@@ -3,9 +3,9 @@
 Cross-platform, AirDrop-style file sharing over the local network (macOS, Windows, Linux).
 No accounts, no cloud: every device runs the same app and talks directly to its peers.
 
-**Status:** Phase 1, Tasks 1 and 2 done. Devices find each other on the local network over
-mDNS and exchange messages over TCP, by device name or IP address. File transfer (Task 3) is
-next.
+**Status:** Phase 1 done (Tasks 1-3). Devices find each other on the local network over mDNS
+and send each other messages and files over TCP, by device name or IP address. Files are
+verified with SHA-256 before they're saved.
 
 ## Try it
 
@@ -24,6 +24,27 @@ cargo run -- peers
 cargo run -- send "AJ's MacBook" "hello from my PC"
 ```
 
+Send files the same way (one or more per command, with live progress):
+
+```bash
+cargo run --release -- send-file "AJ's MacBook" photo.jpg notes.pdf
+```
+
+The receiver saves them to `~/Downloads/OpenDrop` (change with `listen --dir DIR`). Existing
+files are never overwritten: a second `photo.jpg` becomes `photo (1).jpg`. Folders aren't
+supported yet.
+
+The receiver is asked about every file before anything is written:
+
+```text
+? "AJ's MacBook" (192.168.1.53) wants to send you "photo.jpg" (2.1 MB).
+  Accept? [y/N] (within 60s):
+```
+
+Anything but `y`/`yes`, or no answer within 60 seconds, declines it; the sender is told and
+moves on to its next file. `listen --auto-accept` skips the question (handy for scripted
+tests, not for everyday use).
+
 Names match case-insensitively; a device id (`device-1a2b3c4d`) works too. An IP still works:
 
 ```bash
@@ -33,8 +54,11 @@ cargo run -- send 192.168.1.20 "hello from my Mac"
 Both on one machine? Use two terminals and give the second listener another port
 (`--port 45455`, or `--port 0` to let the OS pick).
 
-Options: `--port PORT` (default 45454), `--name NAME` (defaults to the hostname) and
-`--wait SECONDS` (how long `peers` and `send DEVICE` browse; default 3).
+Options: `--port PORT` (default 45454), `--name NAME` (defaults to the hostname),
+`--dir DIR` (where `listen` saves files), `--auto-accept` (`listen` takes files without
+asking) and `--wait SECONDS` (how long `peers`, `send` and `send-file` look for a device by
+name; default 3). Use `--release` for large files; debug
+builds hash much more slowly.
 Run the tests with `cargo test`; `cargo test -- --ignored` also runs a discovery test over
 real multicast on this machine.
 
@@ -48,13 +72,13 @@ sending by IP still works.
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | CLI: `listen`, `peers` and `send` commands |
+| `src/main.rs` | CLI: `listen`, `peers`, `send` and `send-file` commands |
 | `src/lib.rs` | Library root, so the Tauri app can reuse everything later |
 | `src/protocol/` | Message types, versioning, length-prefixed framing |
 | `src/network/server.rs` | Accepts connections, one Tokio task per peer |
-| `src/network/client.rs` | Connects to a peer and exchanges messages |
+| `src/network/client.rs` | `Connection`: connects to a peer, sends texts and files |
 | `src/discovery/` | mDNS advertising, browsing and the discovered-peer table |
-| `src/transfer/` | Chunked file streaming (Task 3, stub) |
+| `src/transfer/` | Chunked streaming with SHA-256, temp files, safe file names |
 
 ## Protocol (v1)
 
@@ -72,10 +96,26 @@ UTF-8 JSON. Frames over 64 KiB are rejected before any allocation. Every message
 | `welcome` | server reply to `hello` | `device_id`, `device_name` |
 | `text` | client to server | `body` |
 | `text_ack` | server reply to `text` | `received_bytes` |
-| `error` | either, then close | `code` (`unsupported_version`, `unexpected_message`, `bad_message`), `message` |
+| `file_offer` | client to server | `transfer_id`, `name` (bare file name), `size` |
+| `file_accept` | server reply to `file_offer` | `transfer_id` |
+| `file_decline` | server reply to `file_offer`; connection stays open | `transfer_id` |
+| `file_done` | client, after the raw bytes | `transfer_id`, `sha256` (lowercase hex) |
+| `file_received` | server, once verified and saved | `transfer_id`, `received_bytes` |
+| `error` | either, then close | `code` (`unsupported_version`, `unexpected_message`, `bad_message`, `file_rejected`, `checksum_mismatch`, `storage_error`), `message` |
 
 A peer with a different `version` gets an `unsupported_version` error rather than a parse
 failure. Reads time out after 10 seconds so a stalled peer can't hold a connection open.
+
+### File transfer
+
+The receiver answers each `file_offer` only once its user has decided (the sender waits up
+to 70 seconds). After `file_accept`, the sender writes exactly `size` bytes of file content straight onto the
+socket (unframed, in 64 KiB chunks), then a `file_done` frame. The receiver strips any
+directory parts and unsafe characters from `name` and streams the bytes into a hidden
+`.opendrop-*.part` file in the download folder, hashing as it goes. Only if its SHA-256
+matches `file_done` is the file synced and renamed into place, then confirmed with
+`file_received`. On a mismatch, a dropped connection or a stall, the temp file is deleted.
+Several files (and texts) can be sent over one connection, one after another.
 
 ## Discovery
 

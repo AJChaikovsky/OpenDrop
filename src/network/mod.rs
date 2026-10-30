@@ -10,6 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// giving up, so a stalled peer can't hold a connection open forever.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the receiver's user has to accept or decline an offered file.
+/// An offer nobody answers in time is declined.
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Who this device is, as announced to peers.
@@ -44,10 +48,286 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     async fn start_server() -> std::net::SocketAddr {
+        start_server_in(std::env::temp_dir().join("opendrop-tests-unused")).await
+    }
+
+    async fn start_server_in(download_dir: std::path::PathBuf) -> std::net::SocketAddr {
+        start_server_with(download_dir, server::Approval::AcceptAll).await
+    }
+
+    async fn start_server_with(
+        download_dir: std::path::PathBuf,
+        approval: server::Approval,
+    ) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(server::run(listener, DeviceIdentity::new("Receiver")));
+        tokio::spawn(server::run(
+            listener,
+            DeviceIdentity::new("Receiver"),
+            download_dir,
+            approval,
+        ));
         addr
+    }
+
+    #[tokio::test]
+    async fn receiver_decides_on_each_file() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("wanted.txt"), b"yes please").unwrap();
+        std::fs::write(src.path().join("unwanted.txt"), b"no thanks").unwrap();
+        let (requests, mut pending) = tokio::sync::mpsc::channel(4);
+        let addr = start_server_with(dest.path().to_owned(), server::Approval::Ask(requests)).await;
+        // Stand-in for the user: accept only "wanted.txt".
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&asked);
+        tokio::spawn(async move {
+            while let Some(request) = pending.recv().await {
+                let server::FileRequest {
+                    name,
+                    size,
+                    respond,
+                    ..
+                } = request;
+                let accept = name == "wanted.txt";
+                log.lock().unwrap().push((name, size));
+                let _ = respond.send(accept);
+            }
+        });
+
+        let mut conn = client::Connection::open(&addr.to_string(), &DeviceIdentity::new("S"))
+            .await
+            .unwrap();
+        let declined = conn
+            .send_file(&src.path().join("unwanted.txt"), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(declined, client::FileResult::Declined));
+        // A decline leaves the connection usable for the next file.
+        let accepted = conn
+            .send_file(&src.path().join("wanted.txt"), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(accepted, client::FileResult::Delivered(_)));
+
+        assert_eq!(files_in(dest.path()), ["wanted.txt"]);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                ("unwanted.txt".to_owned(), 9),
+                ("wanted.txt".to_owned(), 10)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn offer_is_declined_when_nobody_is_asking() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hi").unwrap();
+        let (requests, pending) = tokio::sync::mpsc::channel(1);
+        drop(pending); // The prompt has gone away.
+        let addr = start_server_with(dest.path().to_owned(), server::Approval::Ask(requests)).await;
+        let mut conn = client::Connection::open(&addr.to_string(), &DeviceIdentity::new("S"))
+            .await
+            .unwrap();
+        let result = conn
+            .send_file(&src.path().join("a.txt"), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(result, client::FileResult::Declined));
+        assert!(files_in(dest.path()).is_empty());
+    }
+
+    /// Connect and complete the handshake by hand, for protocol-level tests.
+    async fn handshake(addr: std::net::SocketAddr) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        write_message(
+            &mut stream,
+            &Message::Hello {
+                device_id: "device-test".into(),
+                device_name: "Test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_message(&mut stream).await.unwrap(),
+            Message::Welcome { .. }
+        ));
+        stream
+    }
+
+    fn files_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn files_arrive_intact_over_one_connection() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let addr = start_server_in(dest.path().join("inbox")).await;
+
+        let big: Vec<u8> = (0..3_000_000u32).map(|i| (i * 7) as u8).collect();
+        std::fs::write(src.path().join("big.bin"), &big).unwrap();
+        std::fs::write(src.path().join("empty.txt"), b"").unwrap();
+
+        let mut conn = client::Connection::open(&addr.to_string(), &DeviceIdentity::new("S"))
+            .await
+            .unwrap();
+        let mut last = 0;
+        let client::FileResult::Delivered(out) = conn
+            .send_file(&src.path().join("big.bin"), &mut |n| last = n)
+            .await
+            .unwrap()
+        else {
+            panic!("file was declined");
+        };
+        assert_eq!(out.size, big.len() as u64);
+        assert_eq!(last, big.len() as u64);
+        assert_eq!(out.sha256, crate::transfer::sha256_hex(&big));
+        conn.send_file(&src.path().join("empty.txt"), &mut |_| {})
+            .await
+            .unwrap();
+        // Same name again: saved alongside, never overwritten.
+        conn.send_file(&src.path().join("big.bin"), &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(conn.send_text("still here").await.unwrap(), 10);
+
+        let inbox = dest.path().join("inbox");
+        assert_eq!(files_in(&inbox), ["big (1).bin", "big.bin", "empty.txt"]);
+        assert_eq!(std::fs::read(inbox.join("big.bin")).unwrap(), big);
+        assert_eq!(std::fs::read(inbox.join("big (1).bin")).unwrap(), big);
+    }
+
+    #[tokio::test]
+    async fn corrupted_file_is_rejected_and_discarded() {
+        let dest = tempfile::tempdir().unwrap();
+        let addr = start_server_in(dest.path().to_owned()).await;
+        let mut stream = handshake(addr).await;
+        let offer = |name: &str| Message::FileOffer {
+            transfer_id: "t1".into(),
+            name: name.into(),
+            size: 5,
+        };
+        write_message(&mut stream, &offer("data.bin"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut stream).await.unwrap(),
+            Message::FileAccept { .. }
+        ));
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"hello")
+            .await
+            .unwrap();
+        write_message(
+            &mut stream,
+            &Message::FileDone {
+                transfer_id: "t1".into(),
+                sha256: crate::transfer::sha256_hex(b"HELLO"),
+            },
+        )
+        .await
+        .unwrap();
+        match read_message(&mut stream).await.unwrap() {
+            Message::Error { code, .. } => assert_eq!(code, ErrorCode::ChecksumMismatch),
+            other => panic!("expected error, got {other:?}"),
+        }
+        // Give the server task a moment to drop the temp file.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(files_in(dest.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn path_names_cannot_escape_the_download_folder() {
+        let dest = tempfile::tempdir().unwrap();
+        let inbox = dest.path().join("inbox");
+        let addr = start_server_in(inbox.clone()).await;
+        let mut stream = handshake(addr).await;
+
+        write_message(
+            &mut stream,
+            &Message::FileOffer {
+                transfer_id: "t1".into(),
+                name: "../escaped.txt".into(),
+                size: 2,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_message(&mut stream).await.unwrap(),
+            Message::FileAccept { .. }
+        ));
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"hi")
+            .await
+            .unwrap();
+        write_message(
+            &mut stream,
+            &Message::FileDone {
+                transfer_id: "t1".into(),
+                sha256: crate::transfer::sha256_hex(b"hi"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_message(&mut stream).await.unwrap(),
+            Message::FileReceived {
+                received_bytes: 2,
+                ..
+            }
+        ));
+        assert_eq!(files_in(&inbox), ["escaped.txt"]);
+        assert_eq!(files_in(dest.path()), ["inbox"]);
+
+        write_message(
+            &mut stream,
+            &Message::FileOffer {
+                transfer_id: "t2".into(),
+                name: "..".into(),
+                size: 2,
+            },
+        )
+        .await
+        .unwrap();
+        match read_message(&mut stream).await.unwrap() {
+            Message::Error { code, .. } => assert_eq!(code, ErrorCode::FileRejected),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_transfer_leaves_nothing_behind() {
+        let dest = tempfile::tempdir().unwrap();
+        let addr = start_server_in(dest.path().to_owned()).await;
+        let mut stream = handshake(addr).await;
+        write_message(
+            &mut stream,
+            &Message::FileOffer {
+                transfer_id: "t1".into(),
+                name: "movie.mp4".into(),
+                size: 1_000_000,
+            },
+        )
+        .await
+        .unwrap();
+        read_message(&mut stream).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &[0u8; 1000])
+            .await
+            .unwrap();
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(files_in(dest.path()).is_empty());
     }
 
     #[tokio::test]
