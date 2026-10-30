@@ -83,8 +83,12 @@ pub enum Message {
     },
     /// This side's user confirmed the code. Either side sends it.
     PairAccept,
-    /// This side's user rejected the code, cancelled, or took too long.
-    PairDecline,
+    /// This side's user rejected the code or cancelled; with `timed_out`,
+    /// nobody answered in time.
+    PairDecline {
+        #[serde(default)]
+        timed_out: bool,
+    },
     /// A plain text message (Task 1 milestone; later reused for clipboard sharing).
     Text { body: String },
     /// Acknowledges a `Text` message.

@@ -8,6 +8,7 @@
 //!   | <-------------- welcome |
 //!   | --- hello_proof ------> |
 //!   | <---------------- ready |
+//!   | --- pair_request -----> |   (optional; see `pairing`)
 //!   | --- text -------------> |   (repeatable)
 //!   | <------------- text_ack |
 //!   |                         |
@@ -24,6 +25,7 @@
 
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
 use crate::pairing::store::PairedDevices;
+use crate::pairing::{self, PairOutcome, PairPrompts};
 use crate::protocol::{ErrorCode, Message, ProtocolError, read_message, write_message};
 use crate::transfer::{PartFile, copy_hashed, sanitize_file_name};
 use std::net::SocketAddr;
@@ -95,6 +97,9 @@ pub struct Options {
     pub events: Option<ReceiveEvents>,
     /// Devices we paired with; every connecting peer is checked against it.
     pub paired: Arc<PairedDevices>,
+    /// Where to show pairing codes when a peer asks to pair. Without it,
+    /// pair requests are declined.
+    pub pair_prompts: Option<PairPrompts>,
 }
 
 impl Options {
@@ -105,6 +110,7 @@ impl Options {
             approval,
             events: None,
             paired: Arc::new(PairedDevices::in_memory()),
+            pair_prompts: None,
         }
     }
 }
@@ -194,6 +200,23 @@ async fn handle_connection(
                     size,
                 )
                 .await?;
+            }
+            Ok(Message::PairRequest { commitment }) => {
+                let outcome = pairing::respond(
+                    &mut stream,
+                    &options.identity,
+                    &peer.peer,
+                    peer.nonces,
+                    commitment,
+                    options.pair_prompts.as_ref(),
+                    &options.paired,
+                )
+                .await?;
+                println!("[{peer_addr}] pairing with {peer_name}: {outcome:?}");
+                if outcome == PairOutcome::TimedOut {
+                    // A late answer may still be in flight; start afresh.
+                    return Ok(());
+                }
             }
             Ok(other) => {
                 return reject(

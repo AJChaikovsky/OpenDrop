@@ -2,6 +2,7 @@
 
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity, handshake};
 use crate::pairing::store::PairedDevices;
+use crate::pairing::{self, PairOutcome, PairPrompts};
 use crate::protocol::{Message, read_message, write_message};
 use crate::transfer::{copy_hashed, sanitize_file_name};
 use std::path::Path;
@@ -41,6 +42,8 @@ pub struct Connection {
     pub peer: PeerIdentity,
     /// Whether we and the peer are paired (checked during the handshake).
     pub paired: bool,
+    /// Handshake nonces, `(client, server)`, which pairing builds on.
+    nonces: ([u8; 32], [u8; 32]),
 }
 
 impl Connection {
@@ -66,7 +69,32 @@ impl Connection {
             stream,
             peer: done.peer,
             paired: done.paired,
+            nonces: done.nonces,
         })
+    }
+
+    /// Ask the peer to pair: both users see the same 6-digit code (ours on
+    /// `prompts`) and must both accept. On success the peer is stored in
+    /// `paired`. A timed-out attempt leaves the connection unusable.
+    pub async fn pair(
+        &mut self,
+        identity: &DeviceIdentity,
+        prompts: &PairPrompts,
+        paired: &PairedDevices,
+    ) -> Result<PairOutcome, BoxError> {
+        let outcome = pairing::initiate(
+            &mut self.stream,
+            identity,
+            &self.peer,
+            self.nonces,
+            prompts,
+            paired,
+        )
+        .await?;
+        if outcome == PairOutcome::Paired {
+            self.paired = true;
+        }
+        Ok(outcome)
     }
 
     /// Send a text message and wait for the acknowledgement.

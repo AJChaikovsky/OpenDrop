@@ -555,6 +555,68 @@ mod tests {
         );
     }
 
+    /// Two nodes pair over loopback TCP; afterwards each new connection
+    /// sees the other as paired.
+    #[tokio::test]
+    async fn nodes_pair_over_loopback() {
+        use crate::pairing::store::PairedDevices;
+        use crate::pairing::{PairOutcome, PairPrompt};
+        use std::sync::Arc;
+
+        fn accept_all() -> (
+            tokio::sync::mpsc::Sender<PairPrompt>,
+            tokio::sync::oneshot::Receiver<String>,
+        ) {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<PairPrompt>(1);
+            let (code_tx, code_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let prompt = rx.recv().await.unwrap();
+                let _ = code_tx.send(prompt.code);
+                let _ = prompt.respond.send(true);
+            });
+            (tx, code_rx)
+        }
+
+        let dest = tempfile::tempdir().unwrap();
+        let pc = DeviceIdentity::new("PC");
+        let pc_store = Arc::new(PairedDevices::in_memory());
+        let (pc_prompts, pc_code) = accept_all();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(server::serve(
+            listener,
+            server::Options {
+                paired: Arc::clone(&pc_store),
+                pair_prompts: Some(pc_prompts),
+                ..server::Options::new(
+                    pc.clone(),
+                    dest.path().to_owned(),
+                    server::Approval::AcceptAll,
+                )
+            },
+        ));
+
+        let mac = DeviceIdentity::new("Mac");
+        let mac_store = PairedDevices::in_memory();
+        let (mac_prompts, mac_code) = accept_all();
+        let mut conn = client::Connection::open_with(&addr, &mac, &mac_store)
+            .await
+            .unwrap();
+        assert!(!conn.paired);
+        let outcome = conn.pair(&mac, &mac_prompts, &mac_store).await.unwrap();
+        assert_eq!(outcome, PairOutcome::Paired);
+        assert_eq!(mac_code.await.unwrap(), pc_code.await.unwrap());
+        // The connection is still good for files and text after pairing.
+        assert_eq!(conn.send_text("paired!").await.unwrap(), 7);
+        assert_eq!(mac_store.get(&pc.id).unwrap().public_key, pc.public_key());
+        assert_eq!(pc_store.get(&mac.id).unwrap().public_key, mac.public_key());
+
+        let again = client::Connection::open_with(&addr, &mac, &mac_store)
+            .await
+            .unwrap();
+        assert!(again.paired);
+    }
+
     #[tokio::test]
     async fn client_reports_unreachable_peer() {
         // Bind then drop to get a port nothing is listening on.
