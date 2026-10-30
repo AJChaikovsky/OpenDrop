@@ -1,6 +1,7 @@
 //! Connects to another device and talks to it.
 
-use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity};
+use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity, handshake};
+use crate::pairing::store::PairedDevices;
 use crate::protocol::{Message, read_message, write_message};
 use crate::transfer::{copy_hashed, sanitize_file_name};
 use std::path::Path;
@@ -38,35 +39,34 @@ pub enum FileResult {
 pub struct Connection {
     stream: TcpStream,
     pub peer: PeerIdentity,
+    /// Whether we and the peer are paired (checked during the handshake).
+    pub paired: bool,
 }
 
 impl Connection {
-    /// Connect to `addr` (e.g. `"192.168.1.20:45454"`) and introduce ourselves.
+    /// Connect to `addr` (e.g. `"192.168.1.20:45454"`) and introduce
+    /// ourselves, treating no device as paired.
     pub async fn open(addr: &str, identity: &DeviceIdentity) -> Result<Self, BoxError> {
+        Self::open_with(addr, identity, &PairedDevices::in_memory()).await
+    }
+
+    /// Connect to `addr`, run the signed handshake, and check the peer
+    /// against our paired devices.
+    pub async fn open_with(
+        addr: &str,
+        identity: &DeviceIdentity,
+        paired: &PairedDevices,
+    ) -> Result<Self, BoxError> {
         let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| format!("timed out connecting to {addr}"))?
             .map_err(|e| format!("could not connect to {addr}: {e}"))?;
-
-        write_message(
-            &mut stream,
-            &Message::Hello {
-                device_id: identity.id.clone(),
-                device_name: identity.name.clone(),
-            },
-        )
-        .await?;
-        let peer = match recv(&mut stream).await? {
-            Message::Welcome {
-                device_id,
-                device_name,
-            } => PeerIdentity {
-                id: device_id,
-                name: device_name,
-            },
-            other => return Err(unexpected(other)),
-        };
-        Ok(Self { stream, peer })
+        let done = handshake::connect(&mut stream, identity, paired).await?;
+        Ok(Self {
+            stream,
+            peer: done.peer,
+            paired: done.paired,
+        })
     }
 
     /// Send a text message and wait for the acknowledgement.

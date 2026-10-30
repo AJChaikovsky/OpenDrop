@@ -2,6 +2,7 @@
 //! connecting side (`client`). Every device runs both.
 
 pub mod client;
+pub mod handshake;
 pub mod server;
 
 use std::time::Duration;
@@ -19,10 +20,13 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub use crate::identity::DeviceIdentity;
 
 /// The device on the other end of a connection, as it introduced itself.
+/// Its id is always the fingerprint of `public_key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerIdentity {
     pub id: String,
     pub name: String,
+    /// Proven during the handshake: the peer holds the matching private key.
+    pub public_key: [u8; 32],
 }
 
 #[cfg(test)]
@@ -200,22 +204,16 @@ mod tests {
         assert!(files_in(dest.path()).is_empty());
     }
 
-    /// Connect and complete the handshake by hand, for protocol-level tests.
+    /// Connect and complete the handshake, for protocol-level tests.
     async fn handshake(addr: std::net::SocketAddr) -> TcpStream {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        write_message(
+        handshake::connect(
             &mut stream,
-            &Message::Hello {
-                device_id: "device-test".into(),
-                device_name: "Test".into(),
-            },
+            &DeviceIdentity::new("Test"),
+            &crate::pairing::store::PairedDevices::in_memory(),
         )
         .await
         .unwrap();
-        assert!(matches!(
-            read_message(&mut stream).await.unwrap(),
-            Message::Welcome { .. }
-        ));
         stream
     }
 
@@ -467,6 +465,94 @@ mod tests {
             let _ = node.await;
         }
         assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+    }
+
+    /// An impostor using a real device's id with its own key is cut off at
+    /// the handshake; its file offer never reaches the user.
+    #[tokio::test]
+    async fn impostor_is_refused_before_any_offer_is_shown() {
+        let dest = tempfile::tempdir().unwrap();
+        let (requests, mut pending) = tokio::sync::mpsc::channel(4);
+        let paired = std::sync::Arc::new(crate::pairing::store::PairedDevices::in_memory());
+        let mac = DeviceIdentity::new("Mac");
+        paired
+            .insert(crate::pairing::store::PairedDevice::new(
+                mac.id.clone(),
+                "Mac".into(),
+                mac.public_key(),
+            ))
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(server::serve(
+            listener,
+            server::Options {
+                paired,
+                ..server::Options::new(
+                    DeviceIdentity::new("PC"),
+                    dest.path().to_owned(),
+                    server::Approval::Ask(requests),
+                )
+            },
+        ));
+
+        let impostor = DeviceIdentity::new("Mac");
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        write_message(
+            &mut stream,
+            &Message::Hello {
+                device_id: mac.id.clone(),
+                device_name: "Mac".into(),
+                public_key: impostor.public_key(),
+                nonce: [3; 32],
+            },
+        )
+        .await
+        .unwrap();
+        // Offer a file straight away, without waiting for a reply.
+        let _ = write_message(
+            &mut stream,
+            &Message::FileOffer {
+                transfer_id: "t1".into(),
+                name: "evil.exe".into(),
+                size: 4,
+            },
+        )
+        .await;
+        match read_message(&mut stream).await.unwrap() {
+            Message::Error { code, .. } => assert_eq!(code, ErrorCode::IdentityMismatch),
+            other => panic!("expected identity_mismatch, got {other:?}"),
+        }
+        assert!(matches!(
+            read_message(&mut stream).await,
+            Err(crate::protocol::ProtocolError::ConnectionClosed)
+                | Err(crate::protocol::ProtocolError::Io(_))
+        ));
+        assert!(pending.try_recv().is_err(), "the offer reached the prompt");
+        assert!(files_in(dest.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn loopback_handshake_takes_under_50ms() {
+        let addr = start_server().await;
+        let me = DeviceIdentity::new("Sender");
+        // Warm up (first connect pays for lazy initialisation).
+        client::Connection::open(&addr.to_string(), &me)
+            .await
+            .unwrap();
+        let mut slowest = std::time::Duration::ZERO;
+        for _ in 0..10 {
+            let started = std::time::Instant::now();
+            client::Connection::open(&addr.to_string(), &me)
+                .await
+                .unwrap();
+            slowest = slowest.max(started.elapsed());
+        }
+        println!("slowest of 10 loopback handshakes: {slowest:?}");
+        assert!(
+            slowest < std::time::Duration::from_millis(50),
+            "{slowest:?}"
+        );
     }
 
     #[tokio::test]

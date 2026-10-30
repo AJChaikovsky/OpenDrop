@@ -6,6 +6,7 @@
 pub mod discovery;
 pub mod identity;
 pub mod network;
+pub mod pairing;
 pub mod protocol;
 pub mod transfer;
 

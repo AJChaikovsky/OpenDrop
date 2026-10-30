@@ -1,11 +1,13 @@
 //! Listens for incoming connections and answers them.
 //!
-//! Connection lifecycle (Task 1):
+//! Connection lifecycle:
 //!
 //! ```text
 //! client                     server
-//!   | --- hello ------------> |
+//!   | --- hello ------------> |   signed handshake, see `handshake`
 //!   | <-------------- welcome |
+//!   | --- hello_proof ------> |
+//!   | <---------------- ready |
 //!   | --- text -------------> |   (repeatable)
 //!   | <------------- text_ack |
 //!   |                         |
@@ -20,7 +22,8 @@
 //! Every offered file needs the receiving user's approval (see [`Approval`])
 //! before any bytes are written; accepted files land in the download folder.
 
-use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT};
+use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
+use crate::pairing::store::PairedDevices;
 use crate::protocol::{ErrorCode, Message, ProtocolError, read_message, write_message};
 use crate::transfer::{PartFile, copy_hashed, sanitize_file_name};
 use std::net::SocketAddr;
@@ -81,6 +84,31 @@ pub enum Approval {
     AcceptAll,
 }
 
+/// Everything a listening device needs.
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub identity: DeviceIdentity,
+    /// Where accepted files are saved; created when the first file arrives.
+    pub download_dir: PathBuf,
+    pub approval: Approval,
+    /// Where to report what happens to each accepted file, if anywhere.
+    pub events: Option<ReceiveEvents>,
+    /// Devices we paired with; every connecting peer is checked against it.
+    pub paired: Arc<PairedDevices>,
+}
+
+impl Options {
+    pub fn new(identity: DeviceIdentity, download_dir: PathBuf, approval: Approval) -> Self {
+        Self {
+            identity,
+            download_dir,
+            approval,
+            events: None,
+            paired: Arc::new(PairedDevices::in_memory()),
+        }
+    }
+}
+
 /// Accept connections forever, handling each on its own task. Received files
 /// are saved in `download_dir`, which is created when the first file arrives.
 pub async fn run(
@@ -89,7 +117,7 @@ pub async fn run(
     download_dir: PathBuf,
     approval: Approval,
 ) -> std::io::Result<()> {
-    run_with_events(listener, identity, download_dir, approval, None).await
+    serve(listener, Options::new(identity, download_dir, approval)).await
 }
 
 /// [`run`], also reporting what happens to each accepted file on `events`.
@@ -100,24 +128,21 @@ pub async fn run_with_events(
     approval: Approval,
     events: Option<ReceiveEvents>,
 ) -> std::io::Result<()> {
-    let download_dir = Arc::new(download_dir);
+    let options = Options {
+        events,
+        ..Options::new(identity, download_dir, approval)
+    };
+    serve(listener, options).await
+}
+
+/// Accept connections forever with the given [`Options`].
+pub async fn serve(listener: TcpListener, options: Options) -> std::io::Result<()> {
+    let options = Arc::new(options);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
-        let identity = identity.clone();
-        let download_dir = Arc::clone(&download_dir);
-        let approval = approval.clone();
-        let events = events.clone();
+        let options = Arc::clone(&options);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(
-                stream,
-                peer_addr,
-                &identity,
-                &download_dir,
-                &approval,
-                events.as_ref(),
-            )
-            .await
-            {
+            if let Err(e) = handle_connection(stream, peer_addr, &options).await {
                 eprintln!("[{peer_addr}] connection ended with error: {e}");
             }
         });
@@ -127,46 +152,18 @@ pub async fn run_with_events(
 async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
-    identity: &DeviceIdentity,
-    download_dir: &Path,
-    approval: &Approval,
-    events: Option<&ReceiveEvents>,
+    options: &Options,
 ) -> Result<(), BoxError> {
-    // Handshake: the first message must be `hello`.
-    let peer_name = match next_message(&mut stream).await {
-        Ok(Message::Hello {
-            device_id,
-            device_name,
-        }) => {
-            println!("[{peer_addr}] connected: \"{device_name}\" ({device_id})");
-            write_message(
-                &mut stream,
-                &Message::Welcome {
-                    device_id: identity.id.clone(),
-                    device_name: identity.name.clone(),
-                },
-            )
-            .await?;
-            device_name
-        }
-        Ok(other) => {
-            return reject(
-                &mut stream,
-                ErrorCode::UnexpectedMessage,
-                format!("expected hello, got {other:?}"),
-            )
-            .await;
-        }
-        Err(ProtocolError::UnsupportedVersion(v)) => {
-            return reject(
-                &mut stream,
-                ErrorCode::UnsupportedVersion,
-                format!("version {v} not supported"),
-            )
-            .await;
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let download_dir = options.download_dir.as_path();
+    let approval = &options.approval;
+    let events = options.events.as_ref();
+    let peer = handshake::accept(&mut stream, &options.identity, &options.paired).await?;
+    let peer_name = peer.peer.name.clone();
+    println!(
+        "[{peer_addr}] connected: \"{peer_name}\" ({}){}",
+        peer.peer.id,
+        if peer.paired { ", paired" } else { "" }
+    );
 
     loop {
         match next_message(&mut stream).await {
