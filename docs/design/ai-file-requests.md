@@ -1,9 +1,10 @@
 # Design: AI-assisted file requests
 
 **Status:** Proposal, not implemented. No code changes yet.
-**Product direction:** Option A, a cross-device AI file assistant ("get the PDF from my
-MacBook"). Option B, pushing a file into an existing ChatGPT or Claude conversation from
-another device, is discussed under [Stage 3](#stage-3-hosted-connector-and-option-b).
+**Product direction (confirmed):** Build option A first, a cross-device AI file assistant
+("get the PDF from my MacBook"). Option B, a universal AI file uploader (pick a file on any
+device and send it to your assistant), is fully planned below under
+[Option B](#option-b-universal-ai-file-uploader-implement-later) but implemented later.
 
 ## Goal
 
@@ -225,25 +226,145 @@ Each stage is usable and demoable on its own.
 - `send_file` tool, time-boxed folder grants, audit log view.
 - Pairing and an encrypted transport from Phase 4 before calling it secure.
 
-### Stage 3: hosted connector and option B
-claude.ai connectors and ChatGPT apps reach MCP servers over the internet (Streamable HTTP
-with OAuth), not stdio on the user's machine. Supporting them means:
+### Stage 3: option B
+See the next section. It starts only after Stage 2.2 works end to end.
 
-- A small relay service the user's daemons connect out to, since home devices sit behind NAT.
-- OAuth so the connector acts for one user and only reaches that user's paired devices.
-- Moving the file through the relay or handing back a short-lived signed download link,
-  since the assistant runs in the vendor's cloud and cannot read a local path.
+## Option B: universal AI file uploader (implement later)
 
-This is also where option B lives. Neither platform offers a documented way for an outside
-app to drop a file into an existing conversation unprompted, so B in practice becomes "the
-assistant pulls the file through the connector when asked", which is option A over the
-internet. Stage 3 is worth doing only once Stage 2 works end to end, and it is the first point
-where OpenDrop would need a server and accounts, a change to the current "no cloud" promise
-that should be made deliberately.
+**Status:** Planned, not scheduled. Nothing here blocks or changes the option A work above,
+except that the daemon and control API are designed so B can plug in.
+
+### What B means in practice
+
+The goal: you are on your phone or any other device, pick a file, and it ends up in your
+assistant conversation without manual transfers.
+
+What the platforms allow shapes the design. As of this writing, neither ChatGPT nor Claude
+documents a way for an outside app to push a file into an existing conversation on its own.
+What both do support is a hosted MCP connector (claude.ai custom connectors, ChatGPT apps)
+that the assistant calls during a conversation. So B is built as an **inbox**:
+
+1. You send a file to "My assistant" from any OpenDrop device (share sheet, CLI, app).
+2. It lands, encrypted, in your OpenDrop inbox on a relay service.
+3. In the chat you say "use the file I just sent" (or the assistant checks on its own when
+   you mention one). It calls the connector's `list_inbox` / `get_inbox_file` tools and gets
+   the file.
+
+The user-visible effect is close to "send into the conversation", and it only uses
+documented integration points. If a platform later adds a real push or attach API, the
+inbox becomes the place that API pulls from, and nothing else changes.
+
+B also unlocks option A over the internet: the hosted connector can relay `request_file` to
+a device that is not on the same network as the assistant.
+
+### Architecture
+
+```text
+ Any device (phone, laptop)            OpenDrop relay (cloud)               Assistant (cloud)
++------------------------+          +-----------------------------+      +-------------------+
+| opendrop daemon / app  |  WSS     |  device gateway             |      | claude.ai /       |
+|  "Send to assistant" --+--------->|   - auth by device key      |      | ChatGPT           |
+|  answers relayed       |<---------+   - relays fetch requests   |      |                   |
+|  fetch requests        |          |  inbox store (encrypted,    | MCP  |                   |
++------------------------+          |   short TTL)                |<-----+ hosted connector  |
+                                    |  hosted MCP server          |HTTPS |  calls tools      |
+                                    |   (Streamable HTTP + OAuth) |      |                   |
+                                    |  accounts + device registry |      +-------------------+
+                                    +-----------------------------+
+```
+
+Pieces:
+
+- **Relay service** (new, Rust, `opendrop-relay` crate in the same workspace). Axum + Tokio,
+  Postgres for accounts and device registry, S3-compatible object storage for inbox blobs.
+  Small enough to run on one container.
+- **Device gateway.** Daemons that opt in keep one outbound WebSocket to the relay, since home
+  and phone networks sit behind NAT. Devices authenticate with the same key pair Phase 4
+  pairing uses; the relay only learns public keys.
+- **Hosted MCP server.** Streamable HTTP transport, OAuth 2.1 authorization (the flow both
+  claude.ai connectors and ChatGPT apps expect), each token scoped to one OpenDrop account.
+- **Inbox store.** Files uploaded for the assistant, deleted on first successful read or
+  after a TTL (proposed 24 hours), whichever comes first.
+
+### Tool surface (hosted connector)
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `list_inbox` | none | `[{inbox_id, name, size, mime, from_device, sent_at, expires_at}]` |
+| `get_inbox_file` | `inbox_id` | File content (text, image or embedded resource) when within size limits, otherwise a short-lived signed download URL |
+| `delete_inbox_file` | `inbox_id` | `{deleted: true}` |
+| `list_devices` | none | Same as option A, but only devices connected to the relay |
+| `list_shared_files` | `device`, optional `query` | Relayed to the device, same rules as option A |
+| `request_file` | `device`, `file_id`, `reason` | Same as option A; on approval the device uploads to the inbox and the result points at the new `inbox_id` |
+| `get_transfer_status` | `transfer_id` | Same as option A |
+
+Keeping the names and shapes of the shared tools identical to the local server means the
+same prompts and tests apply to both.
+
+### Security and privacy
+
+- **Opt-in per device.** Relay use is off by default; the LAN-only, no-cloud behavior stays the
+  default for everyone who does not turn it on.
+- **Approval is unchanged.** Sending to the inbox is an explicit user action on the sending
+  device. Relayed `request_file` calls still prompt on the owning device, exactly like option
+  A. The connector cannot approve.
+- **Encryption.** TLS everywhere. Inbox blobs are encrypted at rest with per-file keys. Full
+  end-to-end encryption is not possible for the inbox, because the assistant (in the vendor's
+  cloud) has to read the plaintext; the doc and app should say so plainly.
+- **Data minimization.** Short TTL, delete on read, no file contents in logs, per-account
+  storage quota (proposed 100 MB) and per-file size limit (proposed 25 MB).
+- **OAuth scopes.** `inbox:read`, `inbox:write`, `devices:read`, `devices:request`, so a user
+  can grant inbox-only access.
+- **Abuse.** Rate limits per account and per device; revoke a device or a connector token from
+  the app.
+- **Prompt injection.** Same stance as option A: file contents are data, and nothing in a file
+  can approve a transfer.
+
+### Protocol and crate changes
+
+- **Device-relay protocol.** The same length-prefixed JSON messages, carried over a WebSocket
+  instead of raw TCP, plus `relay_hello` (device key, signature over a server nonce),
+  `inbox_upload_begin` / `inbox_upload_done` (presigned upload URL, SHA-256), and relayed
+  `share_list_request` / `fetch_request` wrapped with the requesting connector's identity.
+- **Workspace split.** At this point the repo becomes a Cargo workspace: `opendrop` (core
+  library, today's crate), `opendrop-cli`, `opendrop-mcp` (local stdio server),
+  `opendrop-relay`. The MCP tool definitions live in a shared module so the local and hosted
+  servers can't drift.
+- **Daemon.** A `relay/` module that holds the WebSocket, reconnects with backoff and feeds
+  relayed requests into the same approval path as LAN requests.
+
+### Stages
+
+| Stage | Scope | Demo |
+|---|---|---|
+| B1: relay skeleton | Accounts (email magic link), device registration with Phase 4 keys, WebSocket gateway, presence. Deploy to one container. | `opendrop relay login`; device shows as online in a web page. |
+| B2: inbox | `opendrop send-file --to assistant`, upload, TTL cleanup, `list_inbox`/`get_inbox_file` on a hosted MCP server with a test token. Test with the MCP Inspector. | File sent from the CLI shows up in the inspector. |
+| B3: OAuth and connectors | OAuth 2.1 server (authorization code + PKCE, dynamic client registration), add as a claude.ai custom connector and a ChatGPT app in developer mode. | Send a file from the laptop, ask Claude on the web to summarize it. |
+| B4: remote option A | Relay `list_shared_files` / `request_file` to devices. | From claude.ai: "get the PDF from my MacBook" while the Mac is on another network. |
+| B5: mobile sender | Share-sheet "Send to assistant" in the Tauri mobile app (iOS and Android). | Pick a photo on the phone, use it in a chat. |
+
+### Before building, verify
+
+Platform capabilities change quickly, so before B3 check the current docs for:
+
+- How claude.ai custom connectors and ChatGPT apps handle file-like tool results (size limits,
+  which content types render, whether resource links are fetched).
+- Whether either platform has added a way for an app to attach a file to a conversation
+  directly. If so, add it as an extra delivery path next to the inbox.
+- Connector review or publishing requirements, if this goes beyond personal use.
+
+### Costs and trade-offs
+
+- First server component and first accounts in OpenDrop. That is a real change to the
+  "no accounts, no cloud" promise, which is why it is opt-in and comes second.
+- Hosting is small at portfolio scale (one container, managed Postgres, object storage with a
+  24-hour TTL), but it is an ongoing cost and an operational responsibility.
+- Portfolio value: OAuth server, WebSocket gateway, object storage, multi-tenant
+  authorization, which complements option A's systems and networking work.
 
 ## Open questions
 
-1. A vs B: this doc assumes A. Confirm.
+1. ~~A vs B~~: decided. Build A first; B is planned above for later.
 2. Phones: the examples include "from my phone", but there is no mobile client yet. Tauri 2
    can target iOS and Android, though iOS limits background networking, so a phone would
    likely need the app open to answer a request. Defer to after the desktop flow works?
