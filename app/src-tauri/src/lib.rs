@@ -4,7 +4,7 @@ mod node;
 
 use node::{AppEvent, Device, EventSink, Node};
 use opendrop::DEFAULT_PORT;
-use opendrop::network::DeviceIdentity;
+use opendrop::identity::{DeviceIdentity, default_config_dir};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -84,8 +84,8 @@ pub fn run() {
             let sink: EventSink = Arc::new(move |event: AppEvent| {
                 let _ = handle.emit(EVENT, event);
             });
-            // OPENDROP_NAME and OPENDROP_DIR let two copies run side by side
-            // on one machine for testing.
+            // OPENDROP_NAME, OPENDROP_DIR and OPENDROP_CONFIG_DIR let two
+            // copies run side by side on one machine for testing.
             let download_dir = std::env::var_os("OPENDROP_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
@@ -95,7 +95,8 @@ pub fn run() {
                         .join("OpenDrop")
                 });
             let name = std::env::var("OPENDROP_NAME").unwrap_or_else(|_| device_name());
-            let identity = DeviceIdentity::new(name);
+            let identity = DeviceIdentity::load_or_create(&default_config_dir(), name)
+                .map_err(|e| e.to_string())?;
             let node = tauri::async_runtime::block_on(async move {
                 // Prefer the standard port so CLI peers can reach us by IP
                 // alone; if something already has it, take any port (mDNS

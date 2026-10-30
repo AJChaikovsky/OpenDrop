@@ -4,7 +4,7 @@
 pub mod client;
 pub mod server;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// How long we wait for a peer to connect or send its next message before
 /// giving up, so a stalled peer can't hold a connection open forever.
@@ -16,29 +16,13 @@ pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Who this device is, as announced to peers.
+pub use crate::identity::DeviceIdentity;
+
+/// The device on the other end of a connection, as it introduced itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceIdentity {
+pub struct PeerIdentity {
     pub id: String,
     pub name: String,
-}
-
-impl DeviceIdentity {
-    /// Build an identity with the given display name and a fresh device id.
-    ///
-    /// The id is not persisted yet; Phase 4 replaces it with a stable,
-    /// key-backed identity used for pairing.
-    pub fn new(name: impl Into<String>) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let mixed = nanos ^ ((std::process::id() as u128) << 64);
-        Self {
-            id: format!("device-{:08x}", (mixed % 0xffff_ffff) as u32),
-            name: name.into(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -454,6 +438,35 @@ mod tests {
             Message::Error { code, .. } => assert_eq!(code, ErrorCode::UnexpectedMessage),
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    /// Stop and restart a device three times: a peer connecting over
+    /// loopback sees the same device id every time.
+    #[tokio::test]
+    async fn device_id_is_stable_across_restarts() {
+        let config = tempfile::tempdir().unwrap();
+        let downloads = tempfile::tempdir().unwrap();
+        let visitor = DeviceIdentity::new("Visitor");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let me = DeviceIdentity::load_or_create(config.path(), "Receiver").unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let node = tokio::spawn(server::run(
+                listener,
+                me.clone(),
+                downloads.path().to_owned(),
+                server::Approval::AcceptAll,
+            ));
+            let conn = client::Connection::open(&addr.to_string(), &visitor)
+                .await
+                .unwrap();
+            assert_eq!(conn.peer.id, me.id);
+            seen.push(conn.peer.id);
+            node.abort();
+            let _ = node.await;
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
     }
 
     #[tokio::test]

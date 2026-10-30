@@ -4,6 +4,7 @@
 //! Tauri desktop app later, can reuse it without changes.
 
 pub mod discovery;
+pub mod identity;
 pub mod network;
 pub mod protocol;
 pub mod transfer;

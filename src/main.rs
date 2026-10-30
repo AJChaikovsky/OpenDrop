@@ -7,6 +7,7 @@
 
 use opendrop::DEFAULT_PORT;
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
+use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::server::{Approval, FileRequest};
 use opendrop::network::{APPROVAL_TIMEOUT, DeviceIdentity, server};
@@ -35,6 +36,8 @@ USAGE:
 
 `listen` asks before accepting each file; --auto-accept takes every file without asking.
 Received files go to --dir (default: Downloads/OpenDrop in your home folder).
+This device's key lives in --config (default: OPENDROP_CONFIG_DIR, or the OS
+config folder plus OpenDrop); its device id is derived from that key.
 
 EXAMPLES:
     opendrop listen
@@ -61,7 +64,13 @@ async fn main() -> ExitCode {
         .map(PathBuf::from)
         .unwrap_or_else(default_download_dir);
     let auto_accept = take_switch(&mut args, "--auto-accept");
-    let identity = DeviceIdentity::new(name);
+    let config_dir = take_flag(&mut args, "--config")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_config_dir);
+    let identity = match DeviceIdentity::load_or_create(&config_dir, name) {
+        Ok(identity) => identity,
+        Err(e) => return fail(&e.to_string()),
+    };
 
     match args
         .iter()

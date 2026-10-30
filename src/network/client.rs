@@ -1,6 +1,6 @@
 //! Connects to another device and talks to it.
 
-use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT};
+use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity};
 use crate::protocol::{Message, read_message, write_message};
 use crate::transfer::{copy_hashed, sanitize_file_name};
 use std::path::Path;
@@ -11,7 +11,7 @@ use tokio::time::timeout;
 /// Result of a successful `send_text`.
 #[derive(Debug)]
 pub struct SendOutcome {
-    pub peer: DeviceIdentity,
+    pub peer: PeerIdentity,
     pub received_bytes: usize,
 }
 
@@ -37,7 +37,7 @@ pub enum FileResult {
 /// sent over one connection.
 pub struct Connection {
     stream: TcpStream,
-    pub peer: DeviceIdentity,
+    pub peer: PeerIdentity,
 }
 
 impl Connection {
@@ -60,7 +60,7 @@ impl Connection {
             Message::Welcome {
                 device_id,
                 device_name,
-            } => DeviceIdentity {
+            } => PeerIdentity {
                 id: device_id,
                 name: device_name,
             },
