@@ -1,10 +1,10 @@
 //! Connects to another device and talks to it.
 
-use super::{BoxError, DeviceIdentity, IO_TIMEOUT};
+use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT};
 use crate::protocol::{Message, read_message, write_message};
 use crate::transfer::{copy_hashed, sanitize_file_name};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -21,6 +21,16 @@ pub struct FileOutcome {
     pub name: String,
     pub size: u64,
     pub sha256: String,
+}
+
+/// What became of an offered file.
+#[derive(Debug)]
+pub enum FileResult {
+    /// The receiver accepted it and confirmed it arrived intact.
+    Delivered(FileOutcome),
+    /// The receiver said no (or didn't answer in time). Nothing was sent, and
+    /// the connection is still usable.
+    Declined,
 }
 
 /// An open, introduced connection to a peer. Several texts and files can be
@@ -74,13 +84,14 @@ impl Connection {
         }
     }
 
-    /// Offer the file at `path`, stream it once accepted, and wait for the
-    /// peer to confirm it arrived intact. `progress` gets bytes sent so far.
+    /// Offer the file at `path`, stream it if the receiver accepts, and wait
+    /// for it to confirm the file arrived intact. `progress` gets bytes sent
+    /// so far.
     pub async fn send_file(
         &mut self,
         path: &Path,
         progress: &mut (dyn FnMut(u64) + Send),
-    ) -> Result<FileOutcome, BoxError> {
+    ) -> Result<FileResult, BoxError> {
         let mut file = tokio::fs::File::open(path)
             .await
             .map_err(|e| format!("could not open {}: {e}", path.display()))?;
@@ -105,8 +116,13 @@ impl Connection {
             },
         )
         .await?;
-        match recv(&mut self.stream).await? {
+        // The receiver may be asking its user, so allow for that on top of
+        // the usual network delay.
+        match recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT).await? {
             Message::FileAccept { transfer_id: id } if id == transfer_id => {}
+            Message::FileDecline { transfer_id: id } if id == transfer_id => {
+                return Ok(FileResult::Declined);
+            }
             other => return Err(unexpected(other)),
         }
 
@@ -133,7 +149,7 @@ impl Connection {
                 transfer_id: id,
                 received_bytes,
             } if id == transfer_id && received_bytes == size => {
-                Ok(FileOutcome { name, size, sha256 })
+                Ok(FileResult::Delivered(FileOutcome { name, size, sha256 }))
             }
             other => Err(unexpected(other)),
         }
@@ -156,7 +172,11 @@ pub async fn send_text(
 }
 
 async fn recv(stream: &mut TcpStream) -> Result<Message, BoxError> {
-    Ok(timeout(IO_TIMEOUT, read_message(stream))
+    recv_within(stream, IO_TIMEOUT).await
+}
+
+async fn recv_within(stream: &mut TcpStream, limit: Duration) -> Result<Message, BoxError> {
+    Ok(timeout(limit, read_message(stream))
         .await
         .map_err(|_| "timed out waiting for peer")??)
 }

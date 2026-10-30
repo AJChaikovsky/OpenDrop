@@ -10,6 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// giving up, so a stalled peer can't hold a connection open forever.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the receiver's user has to accept or decline an offered file.
+/// An offer nobody answers in time is declined.
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Who this device is, as announced to peers.
@@ -48,14 +52,91 @@ mod tests {
     }
 
     async fn start_server_in(download_dir: std::path::PathBuf) -> std::net::SocketAddr {
+        start_server_with(download_dir, server::Approval::AcceptAll).await
+    }
+
+    async fn start_server_with(
+        download_dir: std::path::PathBuf,
+        approval: server::Approval,
+    ) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(server::run(
             listener,
             DeviceIdentity::new("Receiver"),
             download_dir,
+            approval,
         ));
         addr
+    }
+
+    #[tokio::test]
+    async fn receiver_decides_on_each_file() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("wanted.txt"), b"yes please").unwrap();
+        std::fs::write(src.path().join("unwanted.txt"), b"no thanks").unwrap();
+        let (requests, mut pending) = tokio::sync::mpsc::channel(4);
+        let addr = start_server_with(dest.path().to_owned(), server::Approval::Ask(requests)).await;
+        // Stand-in for the user: accept only "wanted.txt".
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&asked);
+        tokio::spawn(async move {
+            while let Some(request) = pending.recv().await {
+                let server::FileRequest {
+                    name,
+                    size,
+                    respond,
+                    ..
+                } = request;
+                let accept = name == "wanted.txt";
+                log.lock().unwrap().push((name, size));
+                let _ = respond.send(accept);
+            }
+        });
+
+        let mut conn = client::Connection::open(&addr.to_string(), &DeviceIdentity::new("S"))
+            .await
+            .unwrap();
+        let declined = conn
+            .send_file(&src.path().join("unwanted.txt"), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(declined, client::FileResult::Declined));
+        // A decline leaves the connection usable for the next file.
+        let accepted = conn
+            .send_file(&src.path().join("wanted.txt"), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(accepted, client::FileResult::Delivered(_)));
+
+        assert_eq!(files_in(dest.path()), ["wanted.txt"]);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                ("unwanted.txt".to_owned(), 9),
+                ("wanted.txt".to_owned(), 10)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn offer_is_declined_when_nobody_is_asking() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hi").unwrap();
+        let (requests, pending) = tokio::sync::mpsc::channel(1);
+        drop(pending); // The prompt has gone away.
+        let addr = start_server_with(dest.path().to_owned(), server::Approval::Ask(requests)).await;
+        let mut conn = client::Connection::open(&addr.to_string(), &DeviceIdentity::new("S"))
+            .await
+            .unwrap();
+        let result = conn
+            .send_file(&src.path().join("a.txt"), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(result, client::FileResult::Declined));
+        assert!(files_in(dest.path()).is_empty());
     }
 
     /// Connect and complete the handshake by hand, for protocol-level tests.
@@ -103,10 +184,13 @@ mod tests {
             .await
             .unwrap();
         let mut last = 0;
-        let out = conn
+        let client::FileResult::Delivered(out) = conn
             .send_file(&src.path().join("big.bin"), &mut |n| last = n)
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("file was declined");
+        };
         assert_eq!(out.size, big.len() as u64);
         assert_eq!(last, big.len() as u64);
         assert_eq!(out.sha256, crate::transfer::sha256_hex(&big));

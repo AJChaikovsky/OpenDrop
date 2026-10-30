@@ -10,24 +10,49 @@
 //!   | <------------- text_ack |
 //!   |                         |
 //!   | --- file_offer -------> |   (repeatable; Task 3)
-//!   | <---------- file_accept |
+//!   | <---------- file_accept |   or file_decline, then the next offer
 //!   | === raw bytes ========> |   exactly `size` bytes, unframed
 //!   | --- file_done --------> |   SHA-256 of those bytes
 //!   | <-------- file_received |   after the hash matched and the file was saved
 //!   | --- [close] ----------> |
 //! ```
 //!
-//! Files are accepted automatically for now and saved to the download folder;
-//! asking the user first comes with the desktop app.
+//! Every offered file needs the receiving user's approval (see [`Approval`])
+//! before any bytes are written; accepted files land in the download folder.
 
-use super::{BoxError, DeviceIdentity, IO_TIMEOUT};
+use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT};
 use crate::protocol::{ErrorCode, Message, ProtocolError, read_message, write_message};
 use crate::transfer::{PartFile, copy_hashed, sanitize_file_name};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
+
+/// An offered file waiting for the user's decision. Send `true` on `respond`
+/// to accept it, `false` (or drop it) to decline.
+#[derive(Debug)]
+pub struct FileRequest {
+    pub peer_name: String,
+    pub peer_addr: SocketAddr,
+    /// Already sanitized: this is the name it will be saved under (or close
+    /// to it, if a file with that name exists).
+    pub name: String,
+    pub size: u64,
+    pub respond: oneshot::Sender<bool>,
+}
+
+/// How offered files get approved.
+#[derive(Debug, Clone)]
+pub enum Approval {
+    /// Send each offer to whoever holds the receiver (a terminal prompt now,
+    /// the desktop app's accept dialog later). Unanswered offers are declined
+    /// after [`APPROVAL_TIMEOUT`].
+    Ask(mpsc::Sender<FileRequest>),
+    /// Take every file without asking. Only for tests and explicit opt-in.
+    AcceptAll,
+}
 
 /// Accept connections forever, handling each on its own task. Received files
 /// are saved in `download_dir`, which is created when the first file arrives.
@@ -35,14 +60,18 @@ pub async fn run(
     listener: TcpListener,
     identity: DeviceIdentity,
     download_dir: PathBuf,
+    approval: Approval,
 ) -> std::io::Result<()> {
     let download_dir = Arc::new(download_dir);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let identity = identity.clone();
         let download_dir = Arc::clone(&download_dir);
+        let approval = approval.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer_addr, &identity, &download_dir).await {
+            if let Err(e) =
+                handle_connection(stream, peer_addr, &identity, &download_dir, &approval).await
+            {
                 eprintln!("[{peer_addr}] connection ended with error: {e}");
             }
         });
@@ -54,6 +83,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     identity: &DeviceIdentity,
     download_dir: &Path,
+    approval: &Approval,
 ) -> Result<(), BoxError> {
     // Handshake: the first message must be `hello`.
     let peer_name = match next_message(&mut stream).await {
@@ -111,6 +141,7 @@ async fn handle_connection(
                 receive_file(
                     &mut stream,
                     download_dir,
+                    approval,
                     &peer_name,
                     peer_addr,
                     transfer_id,
@@ -139,11 +170,13 @@ async fn handle_connection(
     }
 }
 
-/// Take one offered file: accept it, stream it into a temp file, check the
+/// Take one offered file: ask the user, stream it into a temp file, check the
 /// hash, then move it into `download_dir`.
+#[allow(clippy::too_many_arguments)]
 async fn receive_file(
     stream: &mut TcpStream,
     download_dir: &Path,
+    approval: &Approval,
     peer_name: &str,
     peer_addr: SocketAddr,
     transfer_id: String,
@@ -158,6 +191,26 @@ async fn receive_file(
         )
         .await;
     };
+    let accepted = match approval {
+        Approval::AcceptAll => true,
+        Approval::Ask(requests) => {
+            let (respond, decision) = oneshot::channel();
+            let request = FileRequest {
+                peer_name: peer_name.to_owned(),
+                peer_addr,
+                name: name.clone(),
+                size,
+                respond,
+            };
+            requests.send(request).await.is_ok()
+                && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)))
+        }
+    };
+    if !accepted {
+        println!("[{peer_addr}] declined \"{name}\" from {peer_name}");
+        write_message(stream, &Message::FileDecline { transfer_id }).await?;
+        return Ok(());
+    }
     let mut part = match PartFile::create(download_dir).await {
         Ok(part) => part,
         Err(e) => {

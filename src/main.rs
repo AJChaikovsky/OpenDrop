@@ -1,21 +1,24 @@
 //! OpenDrop command-line prototype.
 //!
-//!   opendrop listen [--port PORT] [--name NAME] [--dir DIR]
+//!   opendrop listen [--port PORT] [--name NAME] [--dir DIR] [--auto-accept]
 //!   opendrop peers [--wait SECONDS]
 //!   opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
 //!   opendrop send-file <DEVICE|IP[:PORT]> <FILE>... [--name NAME]
 
 use opendrop::DEFAULT_PORT;
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
-use opendrop::network::client::Connection;
-use opendrop::network::{DeviceIdentity, server};
+use opendrop::network::client::{Connection, FileResult};
+use opendrop::network::server::{Approval, FileRequest};
+use opendrop::network::{APPROVAL_TIMEOUT, DeviceIdentity, server};
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 /// How long `peers` and `send <DEVICE>` browse before giving up.
 const DEFAULT_WAIT: Duration = Duration::from_secs(3);
@@ -24,12 +27,13 @@ const USAGE: &str = "\
 OpenDrop networking prototype
 
 USAGE:
-    opendrop listen [--port PORT] [--name NAME] [--dir DIR]
+    opendrop listen [--port PORT] [--name NAME] [--dir DIR] [--auto-accept]
                                     advertise, receive messages and files
     opendrop peers [--wait SECONDS] list devices on this network
     opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
     opendrop send-file <DEVICE|IP[:PORT]> <FILE>... [--name NAME]
 
+`listen` asks before accepting each file; --auto-accept takes every file without asking.
 Received files go to --dir (default: Downloads/OpenDrop in your home folder).
 
 EXAMPLES:
@@ -56,6 +60,7 @@ async fn main() -> ExitCode {
     let download_dir = take_flag(&mut args, "--dir")
         .map(PathBuf::from)
         .unwrap_or_else(default_download_dir);
+    let auto_accept = take_switch(&mut args, "--auto-accept");
     let identity = DeviceIdentity::new(name);
 
     match args
@@ -64,7 +69,7 @@ async fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["listen"] => listen(identity, port, download_dir).await,
+        ["listen"] => listen(identity, port, download_dir, auto_accept).await,
         ["peers"] => peers(identity, wait).await,
         ["send", target, message] => send(identity, target, message, wait).await,
         ["send-file", target, files @ ..] if !files.is_empty() => {
@@ -81,7 +86,12 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn listen(identity: DeviceIdentity, port: u16, download_dir: PathBuf) -> ExitCode {
+async fn listen(
+    identity: DeviceIdentity,
+    port: u16,
+    download_dir: PathBuf,
+    auto_accept: bool,
+) -> ExitCode {
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) => return fail(&format!("could not listen on port {port}: {e}")),
@@ -97,6 +107,13 @@ async fn listen(identity: DeviceIdentity, port: u16, download_dir: PathBuf) -> E
         None => println!("Could not detect this device's LAN IP; check your network settings"),
     }
     println!("Received files are saved to {}", download_dir.display());
+    let approval = if auto_accept {
+        println!("Accepting every incoming file without asking (--auto-accept).");
+        Approval::AcceptAll
+    } else {
+        println!("You'll be asked before any incoming file is saved.");
+        Approval::Ask(spawn_prompt())
+    };
     let discovery = match Discovery::start(&identity, Some(port)) {
         Ok(d) => {
             println!("Advertising on the local network; nearby devices will appear below.");
@@ -136,7 +153,7 @@ async fn listen(identity: DeviceIdentity, port: u16, download_dir: PathBuf) -> E
     }
 
     tokio::select! {
-        result = server::run(listener, identity, download_dir) => match result {
+        result = server::run(listener, identity, download_dir, approval) => match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&format!("server stopped: {e}")),
         },
@@ -212,6 +229,8 @@ async fn send_files(
         connection.peer.name,
         connection.peer.id
     );
+    println!("Waiting for them to accept each file...");
+    let mut declined = 0;
     for file in files {
         let path = Path::new(file);
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -220,15 +239,22 @@ async fn send_files(
             .send_file(path, &mut |sent| bar.update(sent))
             .await
         {
-            Ok(outcome) => bar.finish(&format!(
+            Ok(FileResult::Delivered(outcome)) => bar.finish(&format!(
                 "done, verified (SHA-256 {}...)",
                 &outcome.sha256[..12]
             )),
+            Ok(FileResult::Declined) => {
+                bar.finish("declined by the receiver");
+                declined += 1;
+            }
             Err(e) => {
                 bar.finish("failed");
                 return fail(&e.to_string());
             }
         }
+    }
+    if declined > 0 {
+        return fail(&format!("{declined} of {} file(s) declined", files.len()));
     }
     ExitCode::SUCCESS
 }
@@ -284,6 +310,10 @@ impl Progress {
     }
 
     fn update(&mut self, sent: u64) {
+        if self.drawn.is_none() {
+            // Bytes only flow once the receiver accepts; don't count the wait.
+            self.started = Instant::now();
+        }
         self.sent = sent;
         if self
             .drawn
@@ -363,6 +393,52 @@ fn describe(peer: &Peer) -> String {
         ));
     }
     line
+}
+
+/// Ask on the terminal about each offered file, one at a time. Offers that
+/// arrive while one is pending wait their turn.
+fn spawn_prompt() -> mpsc::Sender<FileRequest> {
+    let (requests, mut pending) = mpsc::channel::<FileRequest>(16);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Some(FileRequest {
+            peer_name,
+            peer_addr,
+            name,
+            size,
+            mut respond,
+        }) = pending.recv().await
+        {
+            if respond.is_closed() {
+                continue; // Timed out or the sender hung up while queued.
+            }
+            print!(
+                "\n? \"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept? [y/N] (within {}s): ",
+                peer_addr.ip(),
+                human_size(size),
+                APPROVAL_TIMEOUT.as_secs()
+            );
+            let _ = std::io::stdout().flush();
+            let answer = tokio::select! {
+                line = lines.next_line() => line.ok().flatten(),
+                _ = respond.closed() => {
+                    println!("\n  No answer in time; declined.");
+                    continue;
+                }
+            };
+            let accept =
+                answer.is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "y" | "yes"));
+            let _ = respond.send(accept);
+        }
+    });
+    requests
+}
+
+/// Remove `--flag` from `args`, returning whether it was there.
+fn take_switch(args: &mut Vec<String>, flag: &str) -> bool {
+    let before = args.len();
+    args.retain(|a| a != flag);
+    args.len() != before
 }
 
 /// Remove `--flag VALUE` from `args` and return VALUE.

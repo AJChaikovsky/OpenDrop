@@ -51,6 +51,9 @@ pub enum Message {
     },
     /// Receiver agrees; the client then sends exactly `size` raw bytes.
     FileAccept { transfer_id: String },
+    /// Receiver (or its user) said no. The connection stays open, so the
+    /// client can go on to its next file.
+    FileDecline { transfer_id: String },
     /// Sent right after the raw bytes, with their SHA-256 in lowercase hex.
     FileDone { transfer_id: String, sha256: String },
     /// Receiver checked the hash and saved the file.
