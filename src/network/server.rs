@@ -34,6 +34,8 @@ use tokio::time::timeout;
 /// to accept it, `false` (or drop it) to decline.
 #[derive(Debug)]
 pub struct FileRequest {
+    /// Matches the [`ReceiveEvent`]s for this file if it's accepted.
+    pub transfer_id: String,
     pub peer_name: String,
     pub peer_addr: SocketAddr,
     /// Already sanitized: this is the name it will be saved under (or close
@@ -42,6 +44,31 @@ pub struct FileRequest {
     pub size: u64,
     pub respond: oneshot::Sender<bool>,
 }
+
+/// What happens to an accepted file, for a UI that shows incoming transfers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReceiveEvent {
+    /// Accepted; bytes are about to arrive.
+    Started {
+        transfer_id: String,
+        peer_name: String,
+        name: String,
+        size: u64,
+    },
+    /// Bytes received so far, after every chunk.
+    Progress { transfer_id: String, received: u64 },
+    /// Verified and saved at `path`.
+    Saved {
+        transfer_id: String,
+        path: PathBuf,
+        sha256: String,
+    },
+    /// Dropped connection, checksum mismatch or storage error; nothing saved.
+    Failed { transfer_id: String, error: String },
+}
+
+/// Where [`run_with_events`] reports [`ReceiveEvent`]s.
+pub type ReceiveEvents = mpsc::UnboundedSender<ReceiveEvent>;
 
 /// How offered files get approved.
 #[derive(Debug, Clone)]
@@ -62,15 +89,34 @@ pub async fn run(
     download_dir: PathBuf,
     approval: Approval,
 ) -> std::io::Result<()> {
+    run_with_events(listener, identity, download_dir, approval, None).await
+}
+
+/// [`run`], also reporting what happens to each accepted file on `events`.
+pub async fn run_with_events(
+    listener: TcpListener,
+    identity: DeviceIdentity,
+    download_dir: PathBuf,
+    approval: Approval,
+    events: Option<ReceiveEvents>,
+) -> std::io::Result<()> {
     let download_dir = Arc::new(download_dir);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let identity = identity.clone();
         let download_dir = Arc::clone(&download_dir);
         let approval = approval.clone();
+        let events = events.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, peer_addr, &identity, &download_dir, &approval).await
+            if let Err(e) = handle_connection(
+                stream,
+                peer_addr,
+                &identity,
+                &download_dir,
+                &approval,
+                events.as_ref(),
+            )
+            .await
             {
                 eprintln!("[{peer_addr}] connection ended with error: {e}");
             }
@@ -84,6 +130,7 @@ async fn handle_connection(
     identity: &DeviceIdentity,
     download_dir: &Path,
     approval: &Approval,
+    events: Option<&ReceiveEvents>,
 ) -> Result<(), BoxError> {
     // Handshake: the first message must be `hello`.
     let peer_name = match next_message(&mut stream).await {
@@ -142,6 +189,7 @@ async fn handle_connection(
                     &mut stream,
                     download_dir,
                     approval,
+                    events,
                     &peer_name,
                     peer_addr,
                     transfer_id,
@@ -177,6 +225,7 @@ async fn receive_file(
     stream: &mut TcpStream,
     download_dir: &Path,
     approval: &Approval,
+    events: Option<&ReceiveEvents>,
     peer_name: &str,
     peer_addr: SocketAddr,
     transfer_id: String,
@@ -196,6 +245,7 @@ async fn receive_file(
         Approval::Ask(requests) => {
             let (respond, decision) = oneshot::channel();
             let request = FileRequest {
+                transfer_id: transfer_id.clone(),
                 peer_name: peer_name.to_owned(),
                 peer_addr,
                 name: name.clone(),
@@ -211,6 +261,52 @@ async fn receive_file(
         write_message(stream, &Message::FileDecline { transfer_id }).await?;
         return Ok(());
     }
+    let emit = |event| {
+        if let Some(events) = events {
+            let _ = events.send(event);
+        }
+    };
+    emit(ReceiveEvent::Started {
+        transfer_id: transfer_id.clone(),
+        peer_name: peer_name.to_owned(),
+        name: name.clone(),
+        size,
+    });
+    let result = save_file(
+        stream,
+        download_dir,
+        &emit,
+        peer_addr,
+        &transfer_id,
+        &name,
+        size,
+    )
+    .await;
+    emit(match &result {
+        Ok((path, sha256)) => ReceiveEvent::Saved {
+            transfer_id,
+            path: path.clone(),
+            sha256: sha256.clone(),
+        },
+        Err(e) => ReceiveEvent::Failed {
+            transfer_id,
+            error: e.to_string(),
+        },
+    });
+    result.map(|_| ())
+}
+
+/// The accepted half of [`receive_file`]: tell the sender to go ahead, then
+/// stream, verify and save. Returns where the file was saved and its SHA-256.
+async fn save_file(
+    stream: &mut TcpStream,
+    download_dir: &Path,
+    emit: &(impl Fn(ReceiveEvent) + Sync),
+    peer_addr: SocketAddr,
+    transfer_id: &str,
+    name: &str,
+    size: u64,
+) -> Result<(PathBuf, String), BoxError> {
     let mut part = match PartFile::create(download_dir).await {
         Ok(part) => part,
         Err(e) => {
@@ -225,14 +321,20 @@ async fn receive_file(
     write_message(
         stream,
         &Message::FileAccept {
-            transfer_id: transfer_id.clone(),
+            transfer_id: transfer_id.to_owned(),
         },
     )
     .await?;
-    println!("[{peer_addr}] receiving \"{name}\" ({size} bytes) from {peer_name}");
+    println!("[{peer_addr}] receiving \"{name}\" ({size} bytes)");
 
     // The temp file is deleted if anything below fails.
-    let actual = copy_hashed(stream, part.file(), size, &mut |_| {}).await?;
+    let actual = copy_hashed(stream, part.file(), size, &mut |received| {
+        emit(ReceiveEvent::Progress {
+            transfer_id: transfer_id.to_owned(),
+            received,
+        })
+    })
+    .await?;
     let expected = match next_message(stream).await {
         Ok(Message::FileDone {
             transfer_id: id,
@@ -256,7 +358,7 @@ async fn receive_file(
         )
         .await;
     }
-    let saved = match part.persist(download_dir, &name).await {
+    let saved = match part.persist(download_dir, name).await {
         Ok(path) => path,
         Err(e) => {
             return reject(
@@ -271,12 +373,12 @@ async fn receive_file(
     write_message(
         stream,
         &Message::FileReceived {
-            transfer_id,
+            transfer_id: transfer_id.to_owned(),
             received_bytes: size,
         },
     )
     .await?;
-    Ok(())
+    Ok((saved, actual))
 }
 
 async fn next_message(stream: &mut TcpStream) -> Result<Message, ProtocolError> {
@@ -291,7 +393,11 @@ async fn next_message(stream: &mut TcpStream) -> Result<Message, ProtocolError> 
 }
 
 /// Tell the peer why we're hanging up, then hang up.
-async fn reject(stream: &mut TcpStream, code: ErrorCode, message: String) -> Result<(), BoxError> {
+async fn reject<T>(
+    stream: &mut TcpStream,
+    code: ErrorCode,
+    message: String,
+) -> Result<T, BoxError> {
     let _ = write_message(
         stream,
         &Message::Error {

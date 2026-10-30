@@ -121,6 +121,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receiver_reports_progress_and_where_it_saved() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        // Several chunks, so there's more than one progress event.
+        let content = vec![7u8; crate::transfer::CHUNK_SIZE * 3 + 5];
+        std::fs::write(src.path().join("big.bin"), &content).unwrap();
+        let (requests, mut pending) = tokio::sync::mpsc::channel(4);
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(server::run_with_events(
+            listener,
+            DeviceIdentity::new("Receiver"),
+            dest.path().to_owned(),
+            server::Approval::Ask(requests),
+            Some(events),
+        ));
+        let asked_id = tokio::spawn(async move {
+            let request = pending.recv().await.unwrap();
+            let _ = request.respond.send(true);
+            request.transfer_id
+        });
+
+        let mut conn = client::Connection::open(&addr.to_string(), &DeviceIdentity::new("S"))
+            .await
+            .unwrap();
+        let result = conn
+            .send_file(&src.path().join("big.bin"), &mut |_| {})
+            .await
+            .unwrap();
+        let client::FileResult::Delivered(outcome) = result else {
+            panic!("expected delivery, got {result:?}");
+        };
+        let id = asked_id.await.unwrap();
+
+        let mut log = Vec::new();
+        while let Some(event) = received.recv().await {
+            let done = matches!(event, server::ReceiveEvent::Saved { .. });
+            log.push(event);
+            if done {
+                break;
+            }
+        }
+        let size = content.len() as u64;
+        assert_eq!(
+            log.first(),
+            Some(&server::ReceiveEvent::Started {
+                transfer_id: id.clone(),
+                peer_name: "S".into(),
+                name: "big.bin".into(),
+                size,
+            })
+        );
+        let progress: Vec<u64> = log
+            .iter()
+            .filter_map(|e| match e {
+                server::ReceiveEvent::Progress {
+                    transfer_id,
+                    received,
+                } if *transfer_id == id => Some(*received),
+                _ => None,
+            })
+            .collect();
+        assert!(progress.len() >= 4, "{progress:?}");
+        assert!(progress.windows(2).all(|w| w[0] < w[1]), "{progress:?}");
+        assert_eq!(progress.last(), Some(&size));
+        assert_eq!(
+            log.last(),
+            Some(&server::ReceiveEvent::Saved {
+                transfer_id: id,
+                path: dest.path().join("big.bin"),
+                sha256: outcome.sha256,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn offer_is_declined_when_nobody_is_asking() {
         let src = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();

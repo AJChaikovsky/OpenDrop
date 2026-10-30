@@ -407,6 +407,7 @@ fn spawn_prompt() -> mpsc::Sender<FileRequest> {
             name,
             size,
             mut respond,
+            ..
         }) = pending.recv().await
         {
             if respond.is_closed() {
