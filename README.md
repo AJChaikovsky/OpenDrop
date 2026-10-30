@@ -3,9 +3,28 @@
 Cross-platform, AirDrop-style file sharing over the local network (macOS, Windows, Linux).
 No accounts, no cloud: every device runs the same app and talks directly to its peers.
 
-**Status:** Phase 1 done (Tasks 1-3). Devices find each other on the local network over mDNS
-and send each other messages and files over TCP, by device name or IP address. Files are
-verified with SHA-256 before they're saved.
+**Status:** Phase 1 done (Tasks 1-3), plus an MVP desktop app. Devices find each other on the
+local network over mDNS and send each other messages and files over TCP, by device name or IP
+address. Files are verified with SHA-256 before they're saved.
+
+## Desktop app
+
+`app/` is a Tauri 2 + React + TypeScript app on top of the same crate. It lists nearby
+devices, sends files you pick (click a device) or drag onto a device, asks before saving
+each incoming file (Accept / Decline, declined automatically after 60 s), and shows progress
+and speed on both ends. Received files go to `Downloads/OpenDrop`. It talks to the CLI too.
+
+You need Rust and Node 18+ (on Windows, WebView2, which Windows 11 ships with):
+
+```bash
+cd app
+npm install
+npm run tauri dev
+```
+
+`npm run tauri build` makes an installable app. `npm test` runs the UI tests and
+`cargo test -p opendrop-app` the app backend's. To run two copies on one machine, start the
+second with `OPENDROP_NAME` and `OPENDROP_DIR` set; it picks a free port if 45454 is taken.
 
 ## Try it
 
@@ -79,6 +98,9 @@ sending by IP still works.
 | `src/network/client.rs` | `Connection`: connects to a peer, sends texts and files |
 | `src/discovery/` | mDNS advertising, browsing and the discovered-peer table |
 | `src/transfer/` | Chunked streaming with SHA-256, temp files, safe file names |
+| `app/src-tauri/src/node.rs` | Desktop app backend: receive with approval, send, progress and speed events |
+| `app/src-tauri/src/lib.rs` | Tauri commands and event forwarding |
+| `app/src/` | React UI: device list, drop targets, accept dialog, transfers |
 
 ## Protocol (v1)
 
@@ -109,7 +131,8 @@ failure. Reads time out after 10 seconds so a stalled peer can't hold a connecti
 ### File transfer
 
 The receiver answers each `file_offer` only once its user has decided (the sender waits up
-to 70 seconds). After `file_accept`, the sender writes exactly `size` bytes of file content straight onto the
+to 70 seconds). The receiver can report progress and the saved path through
+`server::run_with_events`, which the desktop app uses. After `file_accept`, the sender writes exactly `size` bytes of file content straight onto the
 socket (unframed, in 64 KiB chunks), then a `file_done` frame. The receiver strips any
 directory parts and unsafe characters from `name` and streams the bytes into a hidden
 `.opendrop-*.part` file in the download folder, hashing as it goes. Only if its SHA-256
