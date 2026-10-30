@@ -169,6 +169,10 @@ pub struct Node {
     pair_prompts: PairPrompts,
     sink: EventSink,
     next_send_id: AtomicU64,
+    /// The runtime the node was started on, for work started from plain
+    /// (non-async) methods: Tauri runs sync commands on the main thread,
+    /// outside any runtime.
+    runtime: tokio::runtime::Handle,
 }
 
 impl Node {
@@ -278,6 +282,7 @@ impl Node {
             pair_prompts,
             sink,
             next_send_id: AtomicU64::new(1),
+            runtime: tokio::runtime::Handle::current(),
         }))
     }
 
@@ -360,13 +365,19 @@ impl Node {
             return Ok(false);
         }
         if let Ok(addrs) = self.addrs_of(device_id) {
-            let identity = self.identity.clone();
-            let paired = Arc::clone(&self.paired);
-            tokio::spawn(async move {
-                let _ = connect(&addrs, &identity, &paired).await;
-            });
+            self.notify_unpaired(addrs);
         }
         Ok(true)
+    }
+
+    /// Connect once in the background so a device we just unpaired sees our
+    /// `paired: false` and drops us too. Safe to call from any thread.
+    fn notify_unpaired(&self, addrs: Vec<SocketAddr>) {
+        let identity = self.identity.clone();
+        let paired = Arc::clone(&self.paired);
+        self.runtime.spawn(async move {
+            let _ = connect(&addrs, &identity, &paired).await;
+        });
     }
 
     /// Like [`Node::send_to_device`], to the first of `addrs` that answers.
@@ -987,6 +998,41 @@ mod tests {
         mac.send_to_addrs(&addr(&pc), &[file]).await.unwrap();
         assert!(mac.paired.get(&pc.identity.id).is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Tauri calls `unpair_device` on its main thread, outside any Tokio
+    /// runtime; the follow-up connection must still start (this used to
+    /// panic with "there is no reactor running") and the other device must
+    /// drop the pairing right away.
+    #[test]
+    fn unpair_notifies_the_peer_when_called_outside_the_runtime() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ((mac, mut mac_events), (pc, mut pc_events)) = runtime
+            .block_on(async { (node("Mac", dir.path()).await, node("PC", dir.path()).await) });
+        runtime.block_on(async {
+            mac.pair_with_addrs(&addr(&pc)).await.unwrap();
+            let (mac_pair, _, _) = pair_code(&mut mac_events).await;
+            let (pc_pair, _, _) = pair_code(&mut pc_events).await;
+            pc.respond_pair(&pc_pair, true);
+            mac.respond_pair(&mac_pair, true);
+            pair_done(&mut pc_events).await;
+            pair_done(&mut mac_events).await;
+        });
+
+        // Like the Tauri command: on this (non-runtime) thread.
+        assert!(pc.paired.remove(&mac.identity.id).unwrap());
+        let started = Instant::now();
+        pc.notify_unpaired(addr(&mac));
+        runtime.block_on(async {
+            while mac.paired.get(&pc.identity.id).is_some() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "Mac still paired"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
     }
 
     #[test]
