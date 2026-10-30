@@ -204,27 +204,64 @@ not bump the version separately.
 
 Each stage is usable and demoable on its own.
 
+**Rule: no stage starts until the previous one has passed its exit gate.** Every gate is a
+command or check with a pass/fail result, run and recorded (in the stage's PR description)
+before moving on. `cargo test` and `cargo clippy -- -D warnings` must be green at every
+gate, in addition to the stage-specific checks below.
+
 ### Stage 2.0: foundations
 - Stable device identity persisted in the config dir (the start of Phase 4).
 - `daemon/` with a transfer table, and the local control API. `listen` runs the daemon.
 
+**Exit gate:**
+- Restart test: start `listen`, record the device id, stop, start again. The id is identical
+  across 3 restarts, and peers see the same id (automated test over loopback).
+- Control API test: a client on the socket gets `list_devices` and `list_transfers` answers
+  in under 100 ms; a second OS user (CI: a socket with other permissions) is refused.
+- All Phase 1 tests still pass unchanged (no regression in send / receive).
+
 ### Stage 2.1: fetch without AI
 - `share/`, protocol v2, and `opendrop fetch "AJ's MacBook" q3-report.pdf` in the CLI.
-- Tests: share path checks (traversal, symlinks, unshared ids), fetch approve / decline /
-  timeout over loopback like the existing server tests, fetch_id spoofing rejected.
 - This proves the whole flow before any AI is involved.
+
+**Exit gate:**
+- Automated tests, all passing: share path checks (`../` traversal, absolute paths, symlinks
+  leaving a root, hidden files and unshared or stale `file_id`s each rejected), fetch
+  approve / decline / 60 s timeout over loopback, and a spoofed `fetch_id` (wrong device or
+  wrong size) falling back to the normal prompt.
+- End to end on one machine: two daemons on different ports, a 100 MB random file fetched,
+  SHA-256 of the copy equals the original.
+- End to end on two machines (Mac and one other OS): the same 100 MB fetch succeeds 5 out of
+  5 times.
 
 ### Stage 2.2: MCP server
 - `opendrop mcp` with the five read/request tools.
 - Setup docs for Claude Desktop and Claude Code (`claude mcp add opendrop -- opendrop mcp`).
-- Tests: tool calls against a daemon with fake peers; a scripted end-to-end demo with two
-  daemons on one machine on different ports.
-- Demo recording: ask the assistant for a file, approve on the other machine, the assistant
-  summarizes it.
+
+**Exit gate:**
+- MCP Inspector (or the `rmcp` test client) lists exactly the five tools with valid schemas,
+  and each returns the documented shape against a daemon with fake peers (automated test).
+- Scripted end-to-end: two daemons on one machine; the test drives `list_devices` →
+  `list_shared_files` → `request_file` → auto-approve → `get_transfer_status` and the file
+  arrives with a matching SHA-256. Also covers decline and cancel.
+- Real assistant run: in Claude Code or Claude Desktop, "get <file> from <device>" ends with
+  the assistant quoting a known sentence from the fetched text file, in 3 out of 3 attempts,
+  with approval given on the other device each time. Recorded as the demo.
+- Safety check: asking the assistant for an unshared file or a path ends in a refusal or
+  `not_shared`, with no transfer started (3 out of 3).
 
 ### Stage 2.3: reverse direction and polish
 - `send_file` tool, time-boxed folder grants, audit log view.
 - Pairing and an encrypted transport from Phase 4 before calling it secure.
+
+**Exit gate:**
+- `send_file` passes the same scripted end-to-end as Stage 2.2, reversed.
+- A grant expires on time: a fetch at minute 9 of a 10-minute grant goes through without a
+  prompt, one at minute 11 prompts (test with a fake clock).
+- Every list / request / approve / decline in the 2.2 and 2.3 test runs appears in the audit
+  log (count matches).
+- Unpaired device: `list_shared_files` and `request_file` are refused; a packet capture of a
+  transfer between paired devices shows no plaintext file content.
 
 ### Stage 3: option B
 See the next section. It starts only after Stage 2.2 works end to end.
@@ -335,13 +372,13 @@ same prompts and tests apply to both.
 
 ### Stages
 
-| Stage | Scope | Demo |
+| Stage | Scope | Exit gate (must pass before the next stage) |
 |---|---|---|
-| B1: relay skeleton | Accounts (email magic link), device registration with Phase 4 keys, WebSocket gateway, presence. Deploy to one container. | `opendrop relay login`; device shows as online in a web page. |
-| B2: inbox | `opendrop send-file --to assistant`, upload, TTL cleanup, `list_inbox`/`get_inbox_file` on a hosted MCP server with a test token. Test with the MCP Inspector. | File sent from the CLI shows up in the inspector. |
-| B3: OAuth and connectors | OAuth 2.1 server (authorization code + PKCE, dynamic client registration), add as a claude.ai custom connector and a ChatGPT app in developer mode. | Send a file from the laptop, ask Claude on the web to summarize it. |
-| B4: remote option A | Relay `list_shared_files` / `request_file` to devices. | From claude.ai: "get the PDF from my MacBook" while the Mac is on another network. |
-| B5: mobile sender | Share-sheet "Send to assistant" in the Tauri mobile app (iOS and Android). | Pick a photo on the phone, use it in a chat. |
+| B1: relay skeleton | Accounts (email magic link), device registration with Phase 4 keys, WebSocket gateway, presence. Deploy to one container. | `opendrop relay login` succeeds; the device shows online within 5 s of starting and offline within 30 s of stopping; a device with a forged key is refused (automated). |
+| B2: inbox | `opendrop send-file --to assistant`, upload, TTL cleanup, `list_inbox`/`get_inbox_file` on a hosted MCP server with a test token. Test with the MCP Inspector. | A 10 MB file sent from the CLI is returned by `get_inbox_file` in MCP Inspector with a matching SHA-256; it is gone after first read and, in a separate test, after the TTL (fake clock); another account's token cannot see it. |
+| B3: OAuth and connectors | OAuth 2.1 server (authorization code + PKCE, dynamic client registration), add as a claude.ai custom connector and a ChatGPT app in developer mode. | Connector added in claude.ai and in ChatGPT developer mode; in each, a sent text file is quoted back correctly 3 out of 3 times; an expired or revoked token gets 401. |
+| B4: remote option A | Relay `list_shared_files` / `request_file` to devices. | From claude.ai, with the Mac on a different network (e.g. phone hotspot), a fetch is approved on the Mac and the file content reaches the chat 3 out of 3 times; declining on the Mac ends with no file in the inbox. |
+| B5: mobile sender | Share-sheet "Send to assistant" in the Tauri mobile app (iOS and Android). | On a real iPhone and Android device, a photo shared via "Send to assistant" appears in `list_inbox` within 10 s and the assistant describes it in a chat, 3 out of 3 on each platform. |
 
 ### Before building, verify
 
