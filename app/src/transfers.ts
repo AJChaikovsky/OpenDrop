@@ -1,7 +1,7 @@
-// What the window shows: devices, incoming requests and transfers, updated
-// by one pure reducer so it can be tested without Tauri.
+// What the window shows: devices, incoming requests, pairing and transfers,
+// updated by one pure reducer so it can be tested without Tauri.
 
-import type { AppEvent, Device, IncomingRequest } from "./types";
+import type { AppEvent, Device, IncomingRequest, PairCode, PairStatus } from "./types";
 
 export type TransferStatus = "waiting" | "active" | "done" | "declined" | "failed";
 
@@ -26,11 +26,27 @@ export interface State {
   requests: IncomingRequest[];
   /** Newest first. */
   transfers: Transfer[];
+  /** The pairing code on screen; `confirmed` once we said it matches. */
+  pairing: (PairCode & { confirmed: boolean }) | null;
+  /** How the last pairing ended, until the next one starts. */
+  pairNotice: { text: string; ok: boolean } | null;
 }
 
-export const initialState: State = { devices: [], requests: [], transfers: [] };
+export const initialState: State = { devices: [], requests: [], transfers: [], pairing: null, pairNotice: null };
 
-export type Action = AppEvent | { kind: "set_devices"; devices: Device[] } | { kind: "answered"; transfer_id: string };
+export type Action =
+  | AppEvent
+  | { kind: "set_devices"; devices: Device[] }
+  | { kind: "answered"; transfer_id: string }
+  | { kind: "pair_answered"; pair_id: string; accept: boolean };
+
+const PAIR_TEXT: Record<PairStatus, (name: string) => string> = {
+  paired: (name) => `Paired with ${name}.`,
+  declined: (name) => `Not paired with ${name}: you cancelled.`,
+  declined_by_peer: (name) => `Not paired: ${name} said the codes don't match or cancelled.`,
+  timed_out: (name) => `Not paired with ${name}: nobody confirmed in time.`,
+  failed: (name) => `Pairing with ${name} failed.`,
+};
 
 export function reducer(state: State, action: Action): State {
   const update = (id: string, change: Partial<Transfer>): State => ({
@@ -91,6 +107,22 @@ export function reducer(state: State, action: Action): State {
     case "receive_failed":
     case "send_failed":
       return update(action.transfer_id, { status: "failed", detail: action.error });
+    case "pair_code":
+      return { ...state, pairing: { ...action, confirmed: false }, pairNotice: null };
+    case "pair_answered":
+      if (state.pairing?.pair_id !== action.pair_id) return state;
+      // After "matches" keep the code up until the other side answers.
+      return { ...state, pairing: action.accept ? { ...state.pairing, confirmed: true } : null };
+    case "pair_expired":
+      return state.pairing?.pair_id === action.pair_id ? { ...state, pairing: null } : state;
+    case "pair_done": {
+      const text = PAIR_TEXT[action.status](action.device_name) + (action.error ? ` (${action.error})` : "");
+      return {
+        ...state,
+        pairing: state.pairing?.device_id === action.device_id ? null : state.pairing,
+        pairNotice: { text, ok: action.status === "paired" },
+      };
+    }
   }
 }
 

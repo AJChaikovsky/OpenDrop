@@ -1,5 +1,6 @@
-//! The app's OpenDrop node: receives files (asking the UI first), finds peers
-//! and sends files to them, reporting everything as [`AppEvent`]s.
+//! The app's OpenDrop node: receives files (asking the UI first), finds peers,
+//! sends files to them and pairs with them, reporting everything as
+//! [`AppEvent`]s.
 //!
 //! Nothing here depends on Tauri, so it is tested on its own; `lib.rs` only
 //! forwards events to the window and commands to the node.
@@ -8,6 +9,8 @@ use opendrop::discovery::{Discovery, Peer, PeerEvent};
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::server::{self, Approval, FileRequest, ReceiveEvent};
 use opendrop::network::{BoxError, DeviceIdentity};
+use opendrop::pairing::store::PairedDevices;
+use opendrop::pairing::{PairOutcome, PairPrompt, PairPrompts, PairResult};
 use opendrop::protocol::PROTOCOL_VERSION;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -35,17 +38,33 @@ pub struct Device {
     /// Where we'd connect, e.g. `192.168.1.20:45454`.
     pub address: Option<String>,
     pub compatible: bool,
+    /// We have this device's key from an earlier pairing.
+    pub paired: bool,
 }
 
-impl From<&Peer> for Device {
-    fn from(peer: &Peer) -> Self {
+impl Device {
+    fn new(peer: &Peer, paired: &PairedDevices) -> Self {
         Self {
             id: peer.id.clone(),
             name: peer.name.clone(),
             address: peer.socket_addr().map(|a| a.to_string()),
             compatible: peer.protocol_version == PROTOCOL_VERSION,
+            paired: paired.get(&peer.id).is_some(),
         }
     }
+}
+
+/// How a pairing attempt ended, as the UI words it.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairStatus {
+    Paired,
+    /// Our user said no.
+    Declined,
+    /// The other device's user said no.
+    DeclinedByPeer,
+    TimedOut,
+    Failed,
 }
 
 /// Everything the UI needs to hear about. Serialized as
@@ -114,6 +133,27 @@ pub enum AppEvent {
         transfer_id: String,
         error: String,
     },
+    /// Show `code` and ask whether the other screen shows the same; answer
+    /// with [`Node::respond_pair`]. `incoming` if the other device asked.
+    PairCode {
+        pair_id: String,
+        device_id: String,
+        device_name: String,
+        code: String,
+        incoming: bool,
+    },
+    /// The code was withdrawn before we answered: the other side declined
+    /// or time ran out. A `PairDone` follows.
+    PairExpired {
+        pair_id: String,
+    },
+    /// A pairing attempt finished, whichever side started it.
+    PairDone {
+        device_id: String,
+        device_name: String,
+        status: PairStatus,
+        error: Option<String>,
+    },
 }
 
 pub type EventSink = Arc<dyn Fn(AppEvent) + Send + Sync>;
@@ -122,18 +162,27 @@ pub struct Node {
     pub identity: DeviceIdentity,
     pub port: u16,
     pub download_dir: PathBuf,
+    pub paired: Arc<PairedDevices>,
     discovery: Option<Discovery>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    pending_pairs: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    pair_prompts: PairPrompts,
     sink: EventSink,
     next_send_id: AtomicU64,
+    /// The runtime the node was started on, for work started from plain
+    /// (non-async) methods: Tauri runs sync commands on the main thread,
+    /// outside any runtime.
+    runtime: tokio::runtime::Handle,
 }
 
 impl Node {
     /// Listen on `port` (0 lets the OS pick), save accepted files in
-    /// `download_dir`, and with `discover` advertise and browse over mDNS.
-    /// Must be called from within a Tokio runtime.
+    /// `download_dir`, trust the devices in `paired`, and with `discover`
+    /// advertise and browse over mDNS. Must be called from within a Tokio
+    /// runtime.
     pub async fn start(
         identity: DeviceIdentity,
+        paired: Arc<PairedDevices>,
         port: u16,
         download_dir: PathBuf,
         discover: bool,
@@ -153,52 +202,87 @@ impl Node {
             sink.clone(),
         ));
         tokio::spawn(forward_receive_events(event_rx, sink.clone()));
-        tokio::spawn(server::run_with_events(
+        let pending_pairs = Arc::new(Mutex::new(HashMap::new()));
+        let (pair_prompts, prompt_rx) = mpsc::channel(4);
+        tokio::spawn(forward_pair_prompts(
+            prompt_rx,
+            Arc::clone(&pending_pairs),
+            sink.clone(),
+        ));
+        let (pair_results, mut result_rx) = mpsc::unbounded_channel::<PairResult>();
+        let results_sink = sink.clone();
+        tokio::spawn(async move {
+            while let Some(PairResult { peer, outcome }) = result_rx.recv().await {
+                results_sink(pair_done(&peer.id, &peer.name, outcome));
+            }
+        });
+        tokio::spawn(server::serve(
             listener,
-            identity.clone(),
-            download_dir.clone(),
-            Approval::Ask(requests),
-            Some(events),
+            server::Options {
+                events: Some(events),
+                paired: Arc::clone(&paired),
+                pair_prompts: Some(pair_prompts.clone()),
+                pair_results: Some(pair_results),
+                ..server::Options::new(
+                    identity.clone(),
+                    download_dir.clone(),
+                    Approval::Ask(requests),
+                )
+            },
         ));
 
         let discovery = if discover {
-            let discovery = Discovery::start(&identity, Some(port))?;
-            let mut changes = discovery.subscribe();
-            let sink = sink.clone();
-            tokio::spawn(async move {
-                // Every change resends the whole list: it is short, and the UI
-                // stays a plain render of the latest one.
-                let mut peers: HashMap<String, Peer> = HashMap::new();
-                loop {
-                    match changes.recv().await {
-                        Ok(PeerEvent::Found(p) | PeerEvent::Updated(p)) => {
-                            peers.insert(p.id.clone(), p);
-                        }
-                        Ok(PeerEvent::Lost(p)) => {
-                            peers.remove(&p.id);
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                    let list: Vec<Peer> = peers.values().cloned().collect();
-                    sink(AppEvent::Devices {
-                        devices: devices(&list),
-                    });
-                }
-            });
-            Some(discovery)
+            Some(Discovery::start(&identity, Some(port))?)
         } else {
             None
         };
+        // Every change to the nearby or paired devices resends the whole
+        // list: it is short, and the UI stays a plain render of the latest.
+        let mut nearby = discovery.as_ref().map(Discovery::subscribe);
+        let mut pairings = paired.subscribe();
+        let list_paired = Arc::clone(&paired);
+        let list_sink = sink.clone();
+        tokio::spawn(async move {
+            let mut peers: HashMap<String, Peer> = HashMap::new();
+            loop {
+                tokio::select! {
+                    change = async { nearby.as_mut().unwrap().recv().await }, if nearby.is_some() => {
+                        match change {
+                            Ok(PeerEvent::Found(p) | PeerEvent::Updated(p)) => {
+                                peers.insert(p.id.clone(), p);
+                            }
+                            Ok(PeerEvent::Lost(p)) => {
+                                peers.remove(&p.id);
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => nearby = None,
+                        }
+                    }
+                    change = pairings.recv() => {
+                        if let Err(broadcast::error::RecvError::Closed) = change {
+                            break;
+                        }
+                    }
+                }
+                let list: Vec<Peer> = peers.values().cloned().collect();
+                list_sink(AppEvent::Devices {
+                    devices: devices(&list, &list_paired),
+                });
+            }
+        });
 
         Ok(Arc::new(Self {
             identity,
             port,
             download_dir,
+            paired,
             discovery,
             pending,
+            pending_pairs,
+            pair_prompts,
             sink,
             next_send_id: AtomicU64::new(1),
+            runtime: tokio::runtime::Handle::current(),
         }))
     }
 
@@ -206,7 +290,7 @@ impl Node {
     pub fn devices(&self) -> Vec<Device> {
         self.discovery
             .as_ref()
-            .map_or_else(Vec::new, |d| devices(&d.peers()))
+            .map_or_else(Vec::new, |d| devices(&d.peers(), &self.paired))
     }
 
     /// Answer an [`AppEvent::IncomingRequest`]. Returns false if it had
@@ -224,12 +308,76 @@ impl Node {
         device_id: &str,
         paths: &[PathBuf],
     ) -> Result<Vec<String>, BoxError> {
+        let addrs = self.addrs_of(device_id)?;
+        self.send_to_addrs(&addrs, paths).await
+    }
+
+    fn addrs_of(&self, device_id: &str) -> Result<Vec<SocketAddr>, BoxError> {
         let peer = self
             .discovery
             .as_ref()
             .and_then(|d| d.peers().into_iter().find(|p| p.id == device_id))
             .ok_or("that device is no longer on the network")?;
-        self.send_to_addrs(&peer.socket_addrs(), paths).await
+        Ok(peer.socket_addrs())
+    }
+
+    /// Start pairing with the discovered device `device_id`. Both screens
+    /// get a `PairCode`; a `PairDone` reports how it ended.
+    pub async fn pair_device(&self, device_id: &str) -> Result<(), BoxError> {
+        let addrs = self.addrs_of(device_id)?;
+        self.pair_with_addrs(&addrs).await
+    }
+
+    /// Like [`Node::pair_device`], with the first of `addrs` that answers.
+    pub async fn pair_with_addrs(&self, addrs: &[SocketAddr]) -> Result<(), BoxError> {
+        let mut connection = connect(addrs, &self.identity, &self.paired).await?;
+        let (id, name) = (connection.peer.id.clone(), connection.peer.name.clone());
+        if connection.paired {
+            (self.sink)(pair_done(&id, &name, Ok(PairOutcome::Paired)));
+            return Ok(());
+        }
+        let identity = self.identity.clone();
+        let prompts = self.pair_prompts.clone();
+        let paired = Arc::clone(&self.paired);
+        let sink = self.sink.clone();
+        tokio::spawn(async move {
+            let outcome = connection
+                .pair(&identity, &prompts, &paired)
+                .await
+                .map_err(|e| e.to_string());
+            sink(pair_done(&id, &name, outcome));
+        });
+        Ok(())
+    }
+
+    /// Answer an [`AppEvent::PairCode`]: `true` if the codes match. Returns
+    /// false if it had already been withdrawn or answered.
+    pub fn respond_pair(&self, pair_id: &str, accept: bool) -> bool {
+        let respond = self.pending_pairs.lock().unwrap().remove(pair_id);
+        respond.is_some_and(|r| r.send(accept).is_ok())
+    }
+
+    /// Forget a paired device. If it is on the network, connect once so it
+    /// hears about it right away (the handshake carries our paired flag)
+    /// rather than at the next transfer. Returns whether it was paired.
+    pub fn unpair_device(&self, device_id: &str) -> Result<bool, BoxError> {
+        if !self.paired.remove(device_id)? {
+            return Ok(false);
+        }
+        if let Ok(addrs) = self.addrs_of(device_id) {
+            self.notify_unpaired(addrs);
+        }
+        Ok(true)
+    }
+
+    /// Connect once in the background so a device we just unpaired sees our
+    /// `paired: false` and drops us too. Safe to call from any thread.
+    fn notify_unpaired(&self, addrs: Vec<SocketAddr>) {
+        let identity = self.identity.clone();
+        let paired = Arc::clone(&self.paired);
+        self.runtime.spawn(async move {
+            let _ = connect(&addrs, &identity, &paired).await;
+        });
     }
 
     /// Like [`Node::send_to_device`], to the first of `addrs` that answers.
@@ -252,7 +400,7 @@ impl Node {
                 Ok((path.clone(), meta.len(), self.new_send_id()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut connection = connect(addrs, &self.identity).await?;
+        let mut connection = connect(addrs, &self.identity, &self.paired).await?;
         let ids = files.iter().map(|(_, _, id)| id.clone()).collect();
         let sink = self.sink.clone();
         tokio::spawn(async move {
@@ -303,8 +451,8 @@ impl Node {
     }
 }
 
-fn devices(peers: &[Peer]) -> Vec<Device> {
-    let mut devices: Vec<Device> = peers.iter().map(Device::from).collect();
+fn devices(peers: &[Peer], paired: &PairedDevices) -> Vec<Device> {
+    let mut devices: Vec<Device> = peers.iter().map(|p| Device::new(p, paired)).collect();
     devices.sort_by_key(|d| d.name.to_lowercase());
     devices
 }
@@ -316,11 +464,16 @@ fn file_name(path: &Path) -> String {
     )
 }
 
-async fn connect(addrs: &[SocketAddr], identity: &DeviceIdentity) -> Result<Connection, BoxError> {
+async fn connect(
+    addrs: &[SocketAddr],
+    identity: &DeviceIdentity,
+    paired: &PairedDevices,
+) -> Result<Connection, BoxError> {
     let mut last_error = String::from("the device advertised no address");
     for addr in addrs {
         let addr = addr.to_string();
-        match tokio::time::timeout(CONNECT_TIMEOUT, Connection::open(&addr, identity)).await {
+        let open = Connection::open_with(&addr, identity, paired);
+        match tokio::time::timeout(CONNECT_TIMEOUT, open).await {
             Ok(Ok(connection)) => return Ok(connection),
             Ok(Err(e)) => last_error = format!("{addr}: {e}"),
             Err(_) => last_error = format!("{addr}: no answer"),
@@ -370,6 +523,65 @@ async fn forward_requests(
                 _ = respond.closed() => {
                     pending.lock().unwrap().remove(&transfer_id);
                     sink(AppEvent::IncomingExpired { transfer_id });
+                }
+            }
+        });
+    }
+}
+
+fn pair_done(id: &str, name: &str, outcome: Result<PairOutcome, String>) -> AppEvent {
+    let (status, error) = match outcome {
+        Ok(PairOutcome::Paired) => (PairStatus::Paired, None),
+        Ok(PairOutcome::Declined { by_peer: false }) => (PairStatus::Declined, None),
+        Ok(PairOutcome::Declined { by_peer: true }) => (PairStatus::DeclinedByPeer, None),
+        Ok(PairOutcome::TimedOut) => (PairStatus::TimedOut, None),
+        Err(e) => (PairStatus::Failed, Some(e)),
+    };
+    AppEvent::PairDone {
+        device_id: id.to_owned(),
+        device_name: name.to_owned(),
+        status,
+        error,
+    }
+}
+
+/// Turn pairing codes (from either side's pairing) into UI events, and
+/// withdraw them when the pairing stops waiting.
+async fn forward_pair_prompts(
+    mut prompts: mpsc::Receiver<PairPrompt>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    sink: EventSink,
+) {
+    let mut next_id = 1u64;
+    while let Some(PairPrompt {
+        peer,
+        code,
+        incoming,
+        respond,
+    }) = prompts.recv().await
+    {
+        let pair_id = format!("pair-{next_id}");
+        next_id += 1;
+        let (guard_tx, guard_rx) = oneshot::channel::<bool>();
+        pending.lock().unwrap().insert(pair_id.clone(), guard_tx);
+        sink(AppEvent::PairCode {
+            pair_id: pair_id.clone(),
+            device_id: peer.id,
+            device_name: peer.name,
+            code,
+            incoming,
+        });
+        let pending = Arc::clone(&pending);
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            let mut respond = respond;
+            tokio::select! {
+                answer = guard_rx => {
+                    let _ = respond.send(answer.unwrap_or(false));
+                }
+                _ = respond.closed() => {
+                    pending.lock().unwrap().remove(&pair_id);
+                    sink(AppEvent::PairExpired { pair_id });
                 }
             }
         });
@@ -480,9 +692,16 @@ mod tests {
         let sink: EventSink = Arc::new(move |e| {
             let _ = tx.send(e);
         });
-        let node = Node::start(DeviceIdentity::new(name), 0, dir.to_owned(), false, sink)
-            .await
-            .unwrap();
+        let node = Node::start(
+            DeviceIdentity::new(name),
+            Arc::new(PairedDevices::in_memory()),
+            0,
+            dir.to_owned(),
+            false,
+            sink,
+        )
+        .await
+        .unwrap();
         (node, rx)
     }
 
@@ -659,6 +878,161 @@ mod tests {
             .unwrap();
         let nobody = sender.send_to_addrs(&[closed], &[file]).await;
         assert!(nobody.unwrap_err().to_string().contains("could not reach"));
+    }
+
+    /// Wait for a `PairCode` and return `(pair_id, code, incoming)`.
+    async fn pair_code(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> (String, String, bool) {
+        let log = until(rx, |e| matches!(e, AppEvent::PairCode { .. })).await;
+        let Some(AppEvent::PairCode {
+            pair_id,
+            code,
+            incoming,
+            ..
+        }) = log.last()
+        else {
+            panic!("{log:?}")
+        };
+        (pair_id.clone(), code.clone(), *incoming)
+    }
+
+    async fn pair_done(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> (String, PairStatus) {
+        let log = until(rx, |e| matches!(e, AppEvent::PairDone { .. })).await;
+        let Some(AppEvent::PairDone {
+            device_id, status, ..
+        }) = log.last()
+        else {
+            panic!("{log:?}")
+        };
+        (device_id.clone(), *status)
+    }
+
+    #[tokio::test]
+    async fn nodes_pair_when_both_users_confirm_the_same_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, mut mac_events) = node("Mac", dir.path()).await;
+        let (pc, mut pc_events) = node("PC", dir.path()).await;
+
+        mac.pair_with_addrs(&addr(&pc)).await.unwrap();
+        let (mac_pair, mac_code, mac_incoming) = pair_code(&mut mac_events).await;
+        let (pc_pair, pc_code, pc_incoming) = pair_code(&mut pc_events).await;
+        assert_eq!(mac_code, pc_code);
+        assert!(!mac_incoming && pc_incoming);
+        assert!(pc.respond_pair(&pc_pair, true));
+        assert!(mac.respond_pair(&mac_pair, true));
+        assert!(
+            !mac.respond_pair(&mac_pair, true),
+            "answering twice must not work"
+        );
+
+        assert_eq!(
+            pair_done(&mut mac_events).await,
+            (pc.identity.id.clone(), PairStatus::Paired)
+        );
+        assert_eq!(
+            pair_done(&mut pc_events).await,
+            (mac.identity.id.clone(), PairStatus::Paired)
+        );
+        assert!(mac.paired.get(&pc.identity.id).is_some());
+        assert!(pc.paired.get(&mac.identity.id).is_some());
+
+        // Pairing again is a no-op that reports the existing pairing.
+        mac.pair_with_addrs(&addr(&pc)).await.unwrap();
+        assert_eq!(pair_done(&mut mac_events).await.1, PairStatus::Paired);
+    }
+
+    #[tokio::test]
+    async fn a_decline_withdraws_the_other_code_and_pairs_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, mut mac_events) = node("Mac", dir.path()).await;
+        let (pc, mut pc_events) = node("PC", dir.path()).await;
+
+        mac.pair_with_addrs(&addr(&pc)).await.unwrap();
+        let (mac_pair, _, _) = pair_code(&mut mac_events).await;
+        let (pc_pair, _, _) = pair_code(&mut pc_events).await;
+        assert!(pc.respond_pair(&pc_pair, false));
+        // The Mac's code is withdrawn and the result reported, in either order.
+        let mut log = Vec::new();
+        let expired = AppEvent::PairExpired {
+            pair_id: mac_pair.clone(),
+        };
+        while !(log.contains(&expired)
+            && log.iter().any(|e| matches!(e, AppEvent::PairDone { .. })))
+        {
+            log.extend(until(&mut mac_events, |_| true).await);
+        }
+        assert!(log.iter().any(|e| matches!(
+            e,
+            AppEvent::PairDone {
+                status: PairStatus::DeclinedByPeer,
+                ..
+            }
+        )));
+        assert!(!mac.respond_pair(&mac_pair, true));
+        assert_eq!(pair_done(&mut pc_events).await.1, PairStatus::Declined);
+        assert!(mac.paired.list().is_empty() && pc.paired.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unpair_is_mirrored_on_the_next_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, mut mac_events) = node("Mac", dir.path()).await;
+        let (pc, mut pc_events) = node("PC", dir.path()).await;
+        mac.pair_with_addrs(&addr(&pc)).await.unwrap();
+        let (mac_pair, _, _) = pair_code(&mut mac_events).await;
+        let (pc_pair, _, _) = pair_code(&mut pc_events).await;
+        pc.respond_pair(&pc_pair, true);
+        mac.respond_pair(&mac_pair, true);
+        pair_done(&mut pc_events).await;
+        pair_done(&mut mac_events).await;
+
+        assert!(pc.unpair_device(&mac.identity.id).unwrap());
+        assert!(!pc.unpair_device(&mac.identity.id).unwrap());
+        // The device list is resent without the badge.
+        let log = until(&mut pc_events, |e| matches!(e, AppEvent::Devices { .. })).await;
+        assert!(matches!(log.last(), Some(AppEvent::Devices { .. })));
+
+        // Any next connection (here, a file) makes the Mac forget the PC too.
+        let file = dir.path().join("hi.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let started = Instant::now();
+        mac.send_to_addrs(&addr(&pc), &[file]).await.unwrap();
+        assert!(mac.paired.get(&pc.identity.id).is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Tauri calls `unpair_device` on its main thread, outside any Tokio
+    /// runtime; the follow-up connection must still start (this used to
+    /// panic with "there is no reactor running") and the other device must
+    /// drop the pairing right away.
+    #[test]
+    fn unpair_notifies_the_peer_when_called_outside_the_runtime() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ((mac, mut mac_events), (pc, mut pc_events)) = runtime
+            .block_on(async { (node("Mac", dir.path()).await, node("PC", dir.path()).await) });
+        runtime.block_on(async {
+            mac.pair_with_addrs(&addr(&pc)).await.unwrap();
+            let (mac_pair, _, _) = pair_code(&mut mac_events).await;
+            let (pc_pair, _, _) = pair_code(&mut pc_events).await;
+            pc.respond_pair(&pc_pair, true);
+            mac.respond_pair(&mac_pair, true);
+            pair_done(&mut pc_events).await;
+            pair_done(&mut mac_events).await;
+        });
+
+        // Like the Tauri command: on this (non-runtime) thread.
+        assert!(pc.paired.remove(&mac.identity.id).unwrap());
+        let started = Instant::now();
+        pc.notify_unpaired(addr(&mac));
+        runtime.block_on(async {
+            while mac.paired.get(&pc.identity.id).is_some() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "Mac still paired"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
     }
 
     #[test]

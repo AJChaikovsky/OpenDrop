@@ -182,7 +182,7 @@ async fn free_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
     ))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

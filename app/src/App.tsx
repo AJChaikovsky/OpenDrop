@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { tauriApi, type Api } from "./api";
 import { formatSize, formatSpeed, initialState, reducer, type Transfer } from "./transfers";
-import type { Device, IncomingRequest, Me } from "./types";
+import type { Device, IncomingRequest, Me, PairCode } from "./types";
 import "./App.css";
 
 /** Seconds the receiver has to answer; matches APPROVAL_TIMEOUT in the crate. */
 const ANSWER_SECONDS = 60;
+
+/** Seconds both users have to compare pairing codes; matches PAIRING_TIMEOUT. */
+export const PAIR_SECONDS = 60;
 
 export default function App({ api = tauriApi }: { api?: Api }) {
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -56,6 +59,29 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     api.respond(request.transfer_id, accept);
   };
 
+  const pair = async (device: Device) => {
+    setError(null);
+    try {
+      await api.pairDevice(device.id);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const unpair = async (device: Device) => {
+    setError(null);
+    try {
+      await api.unpairDevice(device.id);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const answerPair = (code: PairCode, accept: boolean) => {
+    dispatch({ kind: "pair_answered", pair_id: code.pair_id, accept });
+    api.respondPair(code.pair_id, accept);
+  };
+
   return (
     <main>
       <header>
@@ -63,6 +89,11 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         {me && (
           <p className="me">
             This device: <strong>{me.name}</strong> · files are saved to {me.download_dir}
+          </p>
+        )}
+        {me?.warning && (
+          <p className="warning" role="alert">
+            {me.warning}
           </p>
         )}
       </header>
@@ -74,7 +105,14 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         ) : (
           <ul className="devices">
             {state.devices.map((d) => (
-              <DeviceCard key={d.id} device={d} hovered={hovered === d.id} onPick={() => pickAndSend({ deviceId: d.id })} />
+              <DeviceCard
+                key={d.id}
+                device={d}
+                hovered={hovered === d.id}
+                onPick={() => pickAndSend({ deviceId: d.id })}
+                onPair={() => pair(d)}
+                onUnpair={() => unpair(d)}
+              />
             ))}
           </ul>
         )}
@@ -83,6 +121,11 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         {error && (
           <p className="error" role="alert">
             {error}
+          </p>
+        )}
+        {state.pairNotice && (
+          <p className={state.pairNotice.ok ? "notice ok" : "notice"} role="status">
+            {state.pairNotice.text}
           </p>
         )}
       </section>
@@ -98,8 +141,12 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         </section>
       )}
 
-      {state.requests[0] && (
-        <RequestDialog key={state.requests[0].transfer_id} request={state.requests[0]} onAnswer={answer} />
+      {state.pairing ? (
+        <PairDialog key={state.pairing.pair_id} pairing={state.pairing} onAnswer={answerPair} />
+      ) : (
+        state.requests[0] && (
+          <RequestDialog key={state.requests[0].transfer_id} request={state.requests[0]} onAnswer={answer} />
+        )
       )}
     </main>
   );
@@ -112,17 +159,106 @@ function deviceAt(x: number, y: number): string | null {
   return card?.dataset.deviceId ?? null;
 }
 
-function DeviceCard({ device, hovered, onPick }: { device: Device; hovered: boolean; onPick: () => void }) {
+function DeviceCard({
+  device,
+  hovered,
+  onPick,
+  onPair,
+  onUnpair,
+}: {
+  device: Device;
+  hovered: boolean;
+  onPick: () => void;
+  onPair: () => void;
+  onUnpair: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
   return (
-    <li data-device-id={device.id} className={hovered ? "device hovered" : "device"}>
-      <button onClick={onPick} disabled={!device.compatible} title={device.address ?? undefined}>
+    <li data-device-id={device.id} className={hovered ? "device hovered" : "device"} aria-label={device.name}>
+      <button className="device-main" onClick={onPick} disabled={!device.compatible} title={device.address ?? undefined}>
         <span className="avatar" aria-hidden>
           {device.name.slice(0, 1).toUpperCase()}
         </span>
         <span className="device-name">{device.name}</span>
         <span className="device-address">{device.compatible ? device.address ?? "no address" : "needs an update"}</span>
       </button>
+      {device.compatible && (
+        <div className="device-pairing">
+          {device.paired ? (
+            <>
+              <span className="badge">Paired</span>
+              <button
+                className="menu-button"
+                aria-label="Device menu"
+                aria-haspopup="menu"
+                aria-expanded={menuOpen}
+                onClick={() => setMenuOpen((open) => !open)}
+              >
+                ⋯
+              </button>
+              {menuOpen && (
+                <div className="menu" role="menu">
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      onUnpair();
+                    }}
+                  >
+                    Unpair
+                  </button>
+                </div>
+              )}
+            </>
+          ) : (
+            <button className="pair-button" onClick={onPair}>
+              Pair
+            </button>
+          )}
+        </div>
+      )}
     </li>
+  );
+}
+
+function PairDialog({
+  pairing,
+  onAnswer,
+}: {
+  pairing: PairCode & { confirmed: boolean };
+  onAnswer: (code: PairCode, accept: boolean) => void;
+}) {
+  const [left, setLeft] = useState(PAIR_SECONDS);
+  useEffect(() => {
+    const timer = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  // Out of time: give up on this side too (the other side does the same).
+  useEffect(() => {
+    if (left === 0 && !pairing.confirmed) onAnswer(pairing, false);
+  }, [left, pairing, onAnswer]);
+  const name = pairing.device_name;
+  return (
+    <div className="backdrop">
+      <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="pair-title">
+        <h2 id="pair-title">{pairing.incoming ? `${name} wants to pair` : `Pair with ${name}`}</h2>
+        <p>Check that {name} shows the same code:</p>
+        <p className="code" aria-label="Pairing code">
+          {pairing.code.slice(0, 3)} {pairing.code.slice(3)}
+        </p>
+        {pairing.confirmed ? (
+          <p className="countdown">Waiting for {name} to confirm…</p>
+        ) : (
+          <p className="countdown">Cancels automatically in {left}s</p>
+        )}
+        <div className="actions">
+          <button onClick={() => onAnswer(pairing, false)}>Cancel</button>
+          <button className="primary" onClick={() => onAnswer(pairing, true)} disabled={pairing.confirmed} autoFocus>
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
