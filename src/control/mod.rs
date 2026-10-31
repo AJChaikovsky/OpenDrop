@@ -30,6 +30,7 @@ pub use platform::Endpoint;
 use crate::daemon::{Daemon, DeviceInfo, Transfer};
 use crate::network::BoxError;
 use crate::protocol::{ProtocolError, read_frame, write_frame};
+use crate::share::SharedFile;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Weak};
@@ -45,8 +46,28 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Request {
     ListDevices,
     ListTransfers,
-    GetTransfer { transfer_id: String },
-    CancelTransfer { transfer_id: String },
+    GetTransfer {
+        transfer_id: String,
+    },
+    CancelTransfer {
+        transfer_id: String,
+    },
+    /// The files `device` (id, name or IP[:PORT]) shares with us.
+    ListShares {
+        device: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// Ask `device` for shared `file` (id, path or unique name). Answers at
+    /// once with the transfer id; poll `get_transfer` for the outcome.
+    Fetch {
+        device: String,
+        file: String,
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        via_assistant: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +84,14 @@ pub enum Response {
     },
     /// The cancel reached whoever runs the transfer; poll for `cancelled`.
     CancelRequested {
+        transfer_id: String,
+    },
+    Shares {
+        device_name: String,
+        files: Vec<SharedFile>,
+        truncated: bool,
+    },
+    FetchStarted {
         transfer_id: String,
     },
     Error {
@@ -85,6 +114,25 @@ pub async fn handle(daemon: &Daemon, request: Request) -> Response {
         },
         Request::CancelTransfer { transfer_id } => match daemon.transfers.cancel(&transfer_id) {
             Ok(()) => Response::CancelRequested { transfer_id },
+            Err(e) => error(e.to_string()),
+        },
+        Request::ListShares { device, query } => {
+            match daemon.list_shares(&device, query.as_deref()).await {
+                Ok((device_name, files, truncated)) => Response::Shares {
+                    device_name,
+                    files,
+                    truncated,
+                },
+                Err(e) => error(e.to_string()),
+            }
+        }
+        Request::Fetch {
+            device,
+            file,
+            reason,
+            via_assistant,
+        } => match daemon.fetch(&device, &file, &reason, via_assistant).await {
+            Ok(transfer_id) => Response::FetchStarted { transfer_id },
             Err(e) => error(e.to_string()),
         },
     }

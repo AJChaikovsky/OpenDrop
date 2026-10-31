@@ -106,6 +106,39 @@ Paired devices are stored in `paired-devices.json` next to the key. If that file
 `listen` warns and carries on with nothing paired (leaving the file alone), while `pair`,
 `devices` and `unpair` stop and say which file to fix or delete.
 
+### Sharing and fetching
+
+Instead of sending, a paired device can ask for a file. Nothing is shared until you say so:
+
+```bash
+cargo run -- share add ~/Documents/Reports   # on the owner (share list / share remove too)
+```
+
+Then, on the other device, with its own `listen` running (the file comes back to it):
+
+```bash
+cargo run -- files "AJ's MacBook"                       # what it shares with you
+cargo run -- fetch "AJ's MacBook" q3-report.pdf --reason "for the board deck"
+```
+
+The owner is asked every time, with the reason, and nobody answering within 60 seconds
+declines it:
+
+```text
+? Fetch request: "PC" (192.168.1.177) asks for your shared file "q3-report.pdf" (2.1 MB).
+  Reason given: "for the board deck"
+  Send it? [y/N] (within 60s):
+```
+
+A file can be named by its name, its path in the share (`Reports/2026/q3.pdf`) or its id
+from `files`. Only paired devices can list or fetch; `listen --allow-unpaired-fetch` lifts
+that for local demos. Hidden files, the download folder and anything a symlink would reach
+outside a shared folder are never shared. `--auto-accept` does not approve fetches.
+`opendrop transfers` lists what the running `listen` has sent and received; it and `files` /
+`fetch` reach it over a local socket (named pipe on Windows) only your user can open. If you
+pair with `opendrop pair` while `listen` is running, restart `listen` so it picks the
+pairing up.
+
 Options: `--port PORT` (default 45454), `--name NAME` (defaults to the hostname),
 `--dir DIR` (where `listen` saves files), `--config DIR` (key and paired devices),
 `--auto-accept` (`listen` takes files without
@@ -125,14 +158,18 @@ sending by IP still works.
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices` and `unpair` |
+| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch` and `transfers` |
+| `src/daemon/` | What `listen` and the app run: listener, discovery, transfer table, fetches |
+| `src/control/` | Local control API (Unix socket / named pipe) for the CLI and, later, the MCP server |
+| `src/share/` | Share allowlist, opaque file ids and safe path resolution |
 | `src/lib.rs` | Library root, so the Tauri app can reuse everything later |
 | `src/protocol/` | Message types, versioning, length-prefixed framing |
 | `src/identity.rs` | The device key pair, its file, and the device id derived from it |
 | `src/network/handshake.rs` | Signed handshake: proves each side holds its key |
 | `src/pairing/` | Pairing protocol and 6-digit code; `store.rs` keeps paired devices |
 | `src/network/server.rs` | Accepts connections, one Tokio task per peer |
-| `src/network/client.rs` | `Connection`: connects to a peer, sends texts and files |
+| `src/network/client.rs` | `Connection`: connects to a peer, sends texts and files, lists shares, requests fetches |
+| `src/network/fetch.rs` | Fetches this device started, which decide which offers skip the prompt |
 | `src/discovery/` | mDNS advertising, browsing and the discovered-peer table |
 | `src/transfer/` | Chunked streaming with SHA-256, temp files, safe file names |
 | `app/src-tauri/src/node.rs` | Desktop app backend: receive with approval, send, pair, progress and speed events |

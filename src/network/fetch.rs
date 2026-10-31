@@ -18,6 +18,8 @@ struct Expected {
 #[derive(Debug, Default)]
 pub struct PendingFetches {
     expected: Mutex<HashMap<String, Expected>>,
+    /// Transfer id of each claimed offer, to the fetch it answered.
+    claimed: Mutex<HashMap<String, String>>,
 }
 
 impl PendingFetches {
@@ -58,8 +60,19 @@ impl PendingFetches {
             return false;
         }
         let entry = expected.remove(fetch_id).expect("just checked");
+        // Recorded before anything is received, so progress for this
+        // transfer can be matched to the fetch from the first byte.
+        self.claimed
+            .lock()
+            .unwrap()
+            .insert(transfer_id.to_owned(), fetch_id.to_owned());
         let _ = entry.arrived.send(transfer_id.to_owned());
         true
+    }
+
+    /// The fetch an incoming transfer answers, if it was a claimed offer.
+    pub fn fetch_for(&self, transfer_id: &str) -> Option<String> {
+        self.claimed.lock().unwrap().get(transfer_id).cloned()
     }
 }
 
@@ -77,6 +90,8 @@ mod tests {
         assert!(arrived.try_recv().is_err());
         assert!(pending.claim("f1", "mac", 100, "t1"));
         assert_eq!(arrived.try_recv().unwrap(), "t1");
+        assert_eq!(pending.fetch_for("t1").as_deref(), Some("f1"));
+        assert_eq!(pending.fetch_for("t9"), None);
         assert!(!pending.claim("f1", "mac", 100, "t2"));
         let _later = pending.expect("f3", "mac", 1);
         pending.forget("f3");

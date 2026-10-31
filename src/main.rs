@@ -9,10 +9,12 @@
 //!   opendrop unpair <DEVICE>
 //!   opendrop transfers
 //!   opendrop share add|remove <PATH>, opendrop share list
+//!   opendrop files <DEVICE>
+//!   opendrop fetch <DEVICE> <FILE> [--reason TEXT]
 
 use opendrop::DEFAULT_PORT;
 use opendrop::control::{Client, Request, Response};
-use opendrop::daemon::{self, Daemon, Direction};
+use opendrop::daemon::{self, Daemon, Direction, Status};
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
 use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
@@ -39,6 +41,7 @@ OpenDrop networking prototype
 
 USAGE:
     opendrop listen [--port PORT] [--name NAME] [--dir DIR] [--auto-accept]
+                    [--allow-unpaired-fetch]
                                     advertise, receive messages and files
     opendrop peers [--wait SECONDS] list devices on this network
     opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
@@ -50,6 +53,10 @@ USAGE:
     opendrop share add <PATH>         let paired devices ask for files in PATH
     opendrop share list               what is shared, with file ids
     opendrop share remove <PATH>      stop sharing PATH
+    opendrop files <DEVICE>           files a paired device shares with you
+    opendrop fetch <DEVICE> <FILE> [--reason TEXT]
+                                    ask a device for a shared file (by name, path or id);
+                                    needs `listen` running here, the owner approves it
 
 Every command also takes --config DIR.
 
@@ -84,6 +91,8 @@ async fn main() -> ExitCode {
         .map(PathBuf::from)
         .unwrap_or_else(default_download_dir);
     let auto_accept = take_switch(&mut args, "--auto-accept");
+    let allow_unpaired_fetch = take_switch(&mut args, "--allow-unpaired-fetch");
+    let reason = take_flag(&mut args, "--reason").unwrap_or_default();
     let config_dir = take_flag(&mut args, "--config")
         .map(PathBuf::from)
         .unwrap_or_else(default_config_dir);
@@ -121,7 +130,9 @@ async fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["listen"] => listen(me, port, download_dir, auto_accept).await,
+        ["listen"] => listen(me, port, download_dir, auto_accept, allow_unpaired_fetch).await,
+        ["files", device] => files(&me, device).await,
+        ["fetch", device, file] => fetch(&me, device, file, &reason).await,
         ["peers"] => peers(&me, wait).await,
         ["send", target, message] => send(&me, target, message, wait).await,
         ["send-file", target, files @ ..] if !files.is_empty() => {
@@ -152,12 +163,19 @@ struct Me {
     config_dir: PathBuf,
 }
 
-async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> ExitCode {
+async fn listen(
+    me: Me,
+    port: u16,
+    download_dir: PathBuf,
+    auto_accept: bool,
+    allow_unpaired_fetch: bool,
+) -> ExitCode {
     let Me {
         identity,
         paired,
         config_dir,
     } = me;
+    let shares = Arc::new(Shares::new(&config_dir, Some(&download_dir)));
     let (file_prompts, pair_prompts) = spawn_prompt();
     let approval = if auto_accept {
         Approval::AcceptAll
@@ -169,6 +187,8 @@ async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> 
         paired: Arc::clone(&paired),
         pair_prompts: Some(pair_prompts),
         control: Some(config_dir),
+        shares: Some(Arc::clone(&shares)),
+        allow_unpaired_fetch,
         ..daemon::Options::new(identity, download_dir, approval)
     })
     .await
@@ -198,6 +218,23 @@ async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> 
     match paired.list().len() {
         0 => println!("No paired devices yet; others can pair with `opendrop pair`."),
         n => println!("{n} paired device(s); see `opendrop devices`."),
+    }
+    match shares.roots().map(|r| r.len()) {
+        Ok(0) => println!(
+            "Nothing shared; `opendrop share add <FOLDER>` lets paired devices ask for files."
+        ),
+        Ok(n) => println!(
+            "{n} shared folder(s)/file(s); paired devices can ask for them (you approve each one)."
+        ),
+        Err(e) => eprintln!("warning: {e}"),
+    }
+    if allow_unpaired_fetch {
+        println!("Unpaired devices may list and fetch shared files too (--allow-unpaired-fetch).");
+    }
+    if auto_accept {
+        println!(
+            "Note: --auto-accept doesn't approve fetches; you're still asked before sending a file."
+        );
     }
     match (daemon.discovery(), daemon.discovery_error()) {
         (Some(_), _) => {
@@ -483,6 +520,121 @@ fn share_remove(me: &Me, download_dir: &Path, path: &str) -> ExitCode {
     }
 }
 
+/// Ask the running daemon for a device's shared files.
+async fn files(me: &Me, device: &str) -> ExitCode {
+    let mut client = match Client::connect(&me.config_dir).await {
+        Ok(c) => c,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let request = Request::ListShares {
+        device: device.to_owned(),
+        query: None,
+    };
+    match client.call(&request).await {
+        Ok(Response::Shares {
+            device_name,
+            files,
+            truncated,
+        }) => {
+            if files.is_empty() {
+                println!("\"{device_name}\" shares no files with you.");
+            }
+            for file in &files {
+                println!(
+                    "  {}  {:>9}  {}",
+                    file.file_id,
+                    human_size(file.size),
+                    file.path
+                );
+            }
+            if truncated {
+                println!("  (more files than fit in one list; fetch the others by id)");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error { message }) => fail(&message),
+        Ok(other) => fail(&format!("unexpected answer: {other:?}")),
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+/// Fetch a shared file from `device` through the running daemon, waiting
+/// for the owner's approval and showing progress.
+async fn fetch(me: &Me, device: &str, file: &str, reason: &str) -> ExitCode {
+    let mut client = match Client::connect(&me.config_dir).await {
+        Ok(c) => c,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let request = Request::Fetch {
+        device: device.to_owned(),
+        file: file.to_owned(),
+        reason: reason.to_owned(),
+        via_assistant: false,
+    };
+    let id = match client.call(&request).await {
+        Ok(Response::FetchStarted { transfer_id }) => transfer_id,
+        Ok(Response::Error { message }) => return fail(&message),
+        Ok(other) => return fail(&format!("unexpected answer: {other:?}")),
+        Err(e) => return fail(&e.to_string()),
+    };
+    let mut bar: Option<Progress> = None;
+    loop {
+        let transfer = match client
+            .call(&Request::GetTransfer {
+                transfer_id: id.clone(),
+            })
+            .await
+        {
+            Ok(Response::Transfer { transfer }) => transfer,
+            Ok(other) => return fail(&format!("unexpected answer: {other:?}")),
+            Err(e) => return fail(&e.to_string()),
+        };
+        match transfer.status {
+            Status::AwaitingApproval if bar.is_none() => {
+                println!(
+                    "Asked \"{}\" for \"{}\" ({}). Waiting for them to approve (up to {}s)...",
+                    transfer.peer_name,
+                    transfer.name,
+                    human_size(transfer.size),
+                    APPROVAL_TIMEOUT.as_secs()
+                );
+                bar = Some(Progress::new(Path::new(&transfer.name), transfer.size));
+            }
+            Status::Transferring => {
+                if let Some(bar) = &mut bar
+                    && transfer.bytes > 0
+                {
+                    bar.update(transfer.bytes);
+                }
+            }
+            Status::Done => {
+                if let Some(bar) = &mut bar {
+                    bar.update(transfer.bytes);
+                    bar.finish("done, verified");
+                }
+                println!(
+                    "Saved to {} (SHA-256 {})",
+                    transfer
+                        .path
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    transfer.sha256.unwrap_or_default()
+                );
+                return ExitCode::SUCCESS;
+            }
+            Status::Declined | Status::Failed | Status::Cancelled => {
+                return fail(&format!(
+                    "fetch {:?}: {}",
+                    transfer.status,
+                    transfer.error.unwrap_or_default()
+                ));
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// What the running daemon (`listen` or the app) has sent and received.
 async fn transfers(me: &Me) -> ExitCode {
     let mut client = match Client::connect(&me.config_dir).await {
@@ -700,12 +852,25 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
             let (question, limit, mut respond) = tokio::select! {
-                Some(FileRequest { peer_name, peer_addr, name, size, respond, .. }) = files.recv() => (
-                    format!(
-                        "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
-                        peer_addr.ip(),
-                        human_size(size),
-                    ),
+                Some(FileRequest { peer_name, peer_addr, name, size, respond, fetch, .. }) = files.recv() => (
+                    match fetch {
+                        None => format!(
+                            "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
+                            peer_addr.ip(),
+                            human_size(size),
+                        ),
+                        Some(fetch) => format!(
+                            "Fetch request: \"{peer_name}\" ({}) asks for your shared file \"{name}\" ({}){}.{}\n  Send it?",
+                            peer_addr.ip(),
+                            human_size(size),
+                            if fetch.via_assistant { " on behalf of an AI assistant" } else { "" },
+                            if fetch.reason.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n  Reason given: \"{}\"", fetch.reason)
+                            },
+                        ),
+                    },
                     APPROVAL_TIMEOUT,
                     respond,
                 ),

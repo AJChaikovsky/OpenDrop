@@ -12,14 +12,18 @@ pub mod transfers;
 pub use transfers::{Direction, Status, Transfer, TransferTable};
 
 use crate::discovery::{Discovery, Peer};
+use crate::identity::random_bytes;
 use crate::network::client::{Connection, FileResult};
+use crate::network::fetch::PendingFetches;
 use crate::network::server::{self, Approval, FileRequest, ReceiveEvent, ReceiveEvents};
 use crate::network::{BoxError, DeviceIdentity};
 use crate::pairing::store::PairedDevices;
 use crate::pairing::{PairPrompts, PairResults};
+use crate::protocol::FetchDeclineReason;
 use crate::protocol::PROTOCOL_VERSION;
+use crate::share::{SharedFile, Shares};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
@@ -50,6 +54,10 @@ pub struct Options {
     pub discover: bool,
     /// Serve the local control API for this config dir (see `control`).
     pub control: Option<PathBuf>,
+    /// What paired devices may list and fetch. Without it nothing is shared.
+    pub shares: Option<Arc<Shares>>,
+    /// Let unpaired devices list and fetch too (local demos only).
+    pub allow_unpaired_fetch: bool,
 }
 
 impl Options {
@@ -65,6 +73,8 @@ impl Options {
             pair_results: None,
             discover: true,
             control: None,
+            shares: None,
+            allow_unpaired_fetch: false,
         }
     }
 }
@@ -104,6 +114,7 @@ pub struct Daemon {
     pub download_dir: PathBuf,
     pub paired: Arc<PairedDevices>,
     pub transfers: Arc<TransferTable>,
+    fetches: Arc<PendingFetches>,
     discovery: Option<Discovery>,
     discovery_error: Option<String>,
     control_error: Mutex<Option<String>>,
@@ -126,12 +137,15 @@ impl Daemon {
             pair_results,
             discover,
             control,
+            shares,
+            allow_unpaired_fetch,
         } = options;
         let listener = TcpListener::bind(("0.0.0.0", port))
             .await
             .map_err(|e| format!("could not listen on port {port}: {e}"))?;
         let port = listener.local_addr()?.port();
         let transfers = Arc::new(TransferTable::new());
+        let fetches = Arc::new(PendingFetches::new());
 
         let (requests, request_rx) = mpsc::channel(16);
         tokio::spawn(record_requests(
@@ -144,6 +158,7 @@ impl Daemon {
             event_rx,
             events,
             Arc::clone(&transfers),
+            Arc::clone(&fetches),
         ));
         let server = tokio::spawn(server::serve(
             listener,
@@ -152,6 +167,10 @@ impl Daemon {
                 paired: Arc::clone(&paired),
                 pair_prompts,
                 pair_results,
+                shares,
+                allow_unpaired_fetch,
+                fetches: Arc::clone(&fetches),
+                outgoing: Some(Arc::clone(&transfers)),
                 ..server::Options::new(
                     identity.clone(),
                     download_dir.clone(),
@@ -175,6 +194,7 @@ impl Daemon {
             download_dir,
             paired,
             transfers,
+            fetches,
             discovery,
             discovery_error,
             control_error: Mutex::new(None),
@@ -275,6 +295,94 @@ impl Daemon {
         Ok(id)
     }
 
+    /// Where `device` can be reached: an IP (default port), IP:PORT, or a
+    /// discovered device's id or name.
+    pub fn addresses_of(&self, device: &str) -> Result<Vec<SocketAddr>, BoxError> {
+        if let Ok(ip) = device.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, crate::DEFAULT_PORT)]);
+        }
+        if let Ok(addr) = device.parse::<SocketAddr>() {
+            return Ok(vec![addr]);
+        }
+        if let Some(peer) = self.find_peer(device) {
+            let addrs = peer.socket_addrs();
+            if addrs.is_empty() {
+                return Err(format!("\"{}\" advertised no usable address", peer.name).into());
+            }
+            return Ok(addrs);
+        }
+        let paired = self
+            .paired
+            .list()
+            .into_iter()
+            .any(|d| d.id == device || d.name.eq_ignore_ascii_case(device));
+        Err(if paired {
+            format!("\"{device}\" is paired but not on the network right now")
+        } else {
+            format!("no device named \"{device}\" on this network")
+        }
+        .into())
+    }
+
+    /// The files `device` shares with us, and whether the list was cut
+    /// short. Returns the device's name too.
+    pub async fn list_shares(
+        &self,
+        device: &str,
+        query: Option<&str>,
+    ) -> Result<(String, Vec<SharedFile>, bool), BoxError> {
+        let addrs = self.addresses_of(device)?;
+        let mut connection = connect(&addrs, &self.identity, &self.paired).await?;
+        let (files, truncated) = connection.list_shares(query).await?;
+        Ok((connection.peer.name.clone(), files, truncated))
+    }
+
+    /// Ask `device` for shared file `file` (its id, path in the share, or
+    /// unique name). Returns the transfer id at once: the row waits for the
+    /// owner's approval, then follows the file in. The owner's user sees
+    /// `reason` (and whether an assistant asked).
+    pub async fn fetch(
+        &self,
+        device: &str,
+        file: &str,
+        reason: &str,
+        via_assistant: bool,
+    ) -> Result<String, BoxError> {
+        let addrs = self.addresses_of(device)?;
+        let mut connection = connect(&addrs, &self.identity, &self.paired).await?;
+        let (files, truncated) = connection.list_shares(None).await?;
+        let wanted = pick_shared_file(&files, file, truncated, &connection.peer.name)?;
+        let fetch_id = format!("fetch-{}", &crate::transfer::hex(&random_bytes())[..16]);
+        let (row, cancelled) = self.transfers.begin_with_id(
+            fetch_id.clone(),
+            Transfer::new(
+                Direction::Receive,
+                Some(connection.peer.id.clone()),
+                connection.peer.name.clone(),
+                wanted.name.clone(),
+                wanted.size,
+            ),
+        );
+        let arrived = self
+            .fetches
+            .expect(&fetch_id, &connection.peer.id, wanted.size);
+        tokio::spawn(run_fetch(
+            Arc::clone(&self.transfers),
+            Arc::clone(&self.fetches),
+            connection,
+            FetchPlan {
+                fetch_id,
+                file_id: wanted.file_id,
+                reason: reason.to_owned(),
+                via_assistant,
+                reply_port: self.port,
+            },
+            arrived,
+            cancelled,
+        ));
+        Ok(row)
+    }
+
     /// Wait until the listener stops (it only does on an accept error).
     pub async fn wait(&self) -> std::io::Result<()> {
         let server = self.server.lock().unwrap().take();
@@ -295,6 +403,108 @@ impl Drop for Daemon {
         if let Some(control) = self.control.lock().unwrap().take() {
             control.abort();
         }
+    }
+}
+
+/// The shared file `query` names: its id, its path in the share, or its
+/// name if only one file has it.
+fn pick_shared_file(
+    files: &[SharedFile],
+    query: &str,
+    truncated: bool,
+    owner: &str,
+) -> Result<SharedFile, BoxError> {
+    if let Some(file) = files.iter().find(|f| f.file_id == query || f.path == query) {
+        return Ok(file.clone());
+    }
+    let named: Vec<&SharedFile> = files
+        .iter()
+        .filter(|f| f.name.eq_ignore_ascii_case(query))
+        .collect();
+    match named.as_slice() {
+        [file] => Ok((*file).clone()),
+        [] if truncated => Err(format!(
+            "\"{owner}\" shares too many files to list them all and \"{query}\" wasn't among those listed; use its id or path"
+        )
+        .into()),
+        [] => Err(format!("\"{owner}\" doesn't share a file named \"{query}\"").into()),
+        several => Err(format!(
+            "\"{owner}\" shares several files named \"{query}\"; use a path: {}",
+            several
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into()),
+    }
+}
+
+/// What a fetch asks the owner for.
+struct FetchPlan {
+    fetch_id: String,
+    file_id: String,
+    reason: String,
+    via_assistant: bool,
+    reply_port: u16,
+}
+
+/// How long after the owner's yes its offer may take to arrive.
+const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ask for the file and wait for the owner's answer; once it accepts, the
+/// file arrives at our listener, whose events finish the row.
+async fn run_fetch(
+    transfers: Arc<TransferTable>,
+    fetches: Arc<PendingFetches>,
+    mut connection: Connection,
+    plan: FetchPlan,
+    arrived: oneshot::Receiver<String>,
+    cancelled: oneshot::Receiver<()>,
+) {
+    let id = plan.fetch_id.clone();
+    let ask = connection.request_fetch(
+        &plan.fetch_id,
+        &plan.file_id,
+        &plan.reason,
+        plan.via_assistant,
+        plan.reply_port,
+    );
+    let answer = tokio::select! {
+        answer = ask => answer,
+        _ = cancelled => {
+            fetches.forget(&id);
+            transfers.finish(&id, Status::Cancelled, None);
+            return;
+        }
+    };
+    let declined = |reason: &str| {
+        fetches.forget(&id);
+        transfers.finish(&id, Status::Declined, Some(reason.to_owned()));
+    };
+    match answer {
+        Ok(Ok(())) => {}
+        Ok(Err(FetchDeclineReason::Declined)) => return declined("the owner declined"),
+        Ok(Err(FetchDeclineReason::Timeout)) => {
+            return declined("the owner didn't answer in time");
+        }
+        Ok(Err(FetchDeclineReason::NotShared)) => return declined("that file is no longer shared"),
+        Ok(Err(FetchDeclineReason::NotPaired)) => {
+            return declined("only paired devices can fetch; pair first");
+        }
+        Err(e) => {
+            fetches.forget(&id);
+            return transfers.finish(&id, Status::Failed, Some(e.to_string()));
+        }
+    }
+    drop(connection);
+    if tokio::time::timeout(OFFER_TIMEOUT, arrived).await.is_err() {
+        fetches.forget(&id);
+        transfers.finish(
+            &id,
+            Status::Failed,
+            Some("approved, but the file never arrived (is a firewall blocking incoming connections?)".into()),
+        );
     }
 }
 
@@ -413,8 +623,15 @@ async fn record_receive_events(
     mut events: mpsc::UnboundedReceiver<ReceiveEvent>,
     forward: Option<ReceiveEvents>,
     transfers: Arc<TransferTable>,
+    fetches: Arc<PendingFetches>,
 ) {
     while let Some(event) = events.recv().await {
+        // A file answering one of our fetches updates the fetch's row.
+        let row = |transfer_id: &String| {
+            fetches
+                .fetch_for(transfer_id)
+                .unwrap_or(transfer_id.clone())
+        };
         match &event {
             ReceiveEvent::Started {
                 transfer_id,
@@ -422,6 +639,7 @@ async fn record_receive_events(
                 name,
                 size,
             } => {
+                let transfer_id = &row(transfer_id);
                 if transfers.get(transfer_id).is_none() {
                     transfers.begin_with_id(
                         transfer_id.clone(),
@@ -439,19 +657,19 @@ async fn record_receive_events(
             ReceiveEvent::Progress {
                 transfer_id,
                 received,
-            } => transfers.update(transfer_id, |t| t.bytes = *received),
+            } => transfers.update(&row(transfer_id), |t| t.bytes = *received),
             ReceiveEvent::Saved {
                 transfer_id,
                 path,
                 sha256,
-            } => transfers.update(transfer_id, |t| {
+            } => transfers.update(&row(transfer_id), |t| {
                 t.bytes = t.size;
                 t.path = Some(path.clone());
                 t.sha256 = Some(sha256.clone());
                 t.status = Status::Done;
             }),
             ReceiveEvent::Failed { transfer_id, error } => {
-                transfers.finish(transfer_id, Status::Failed, Some(error.clone()))
+                transfers.finish(&row(transfer_id), Status::Failed, Some(error.clone()))
             }
         }
         if let Some(forward) = &forward {
