@@ -10,6 +10,7 @@ pub mod identity;
 pub mod network;
 pub mod pairing;
 pub mod protocol;
+pub mod share;
 pub mod transfer;
 
 /// Default TCP port an OpenDrop device listens on.

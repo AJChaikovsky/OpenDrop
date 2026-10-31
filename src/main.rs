@@ -8,6 +8,7 @@
 //!   opendrop devices [--wait SECONDS]
 //!   opendrop unpair <DEVICE>
 //!   opendrop transfers
+//!   opendrop share add|remove <PATH>, opendrop share list
 
 use opendrop::DEFAULT_PORT;
 use opendrop::control::{Client, Request, Response};
@@ -19,6 +20,7 @@ use opendrop::network::server::{Approval, FileRequest};
 use opendrop::network::{APPROVAL_TIMEOUT, DeviceIdentity};
 use opendrop::pairing::store::PairedDevices;
 use opendrop::pairing::{PAIRING_TIMEOUT, PairOutcome, PairPrompt, PairPrompts};
+use opendrop::share::{SharedFile, Shares};
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -45,6 +47,9 @@ USAGE:
     opendrop devices [--wait SECONDS] list nearby and paired devices
     opendrop unpair <DEVICE>          forget a paired device
     opendrop transfers                transfers seen by the running `listen`
+    opendrop share add <PATH>         let paired devices ask for files in PATH
+    opendrop share list               what is shared, with file ids
+    opendrop share remove <PATH>      stop sharing PATH
 
 Every command also takes --config DIR.
 
@@ -125,6 +130,9 @@ async fn main() -> ExitCode {
         ["pair", target] => pair(&me, target, wait).await,
         ["devices"] => devices(&me, wait).await,
         ["transfers"] => transfers(&me).await,
+        ["share", "add", path] => share_add(&me, &download_dir, path),
+        ["share", "list"] => share_list(&me, &download_dir),
+        ["share", "remove", path] => share_remove(&me, &download_dir, path),
         ["unpair", target] => unpair(&me, target),
         ["help"] | ["--help"] | ["-h"] => {
             println!("{USAGE}");
@@ -403,6 +411,76 @@ async fn devices(me: &Me, wait: Duration) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+fn shares(me: &Me, download_dir: &Path) -> Shares {
+    Shares::new(&me.config_dir, Some(download_dir))
+}
+
+fn share_add(me: &Me, download_dir: &Path, path: &str) -> ExitCode {
+    let shares = shares(me, download_dir);
+    let root = match shares.add(Path::new(path)) {
+        Ok(root) => root,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let count = shares
+        .list(None)
+        .map(|files| {
+            files
+                .iter()
+                .filter(|f| shared_from(&shares, f, &root))
+                .count()
+        })
+        .unwrap_or(0);
+    println!(
+        "Sharing {} ({count} file(s)) with paired devices. Each request still asks you first.",
+        root.display()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Whether `file` comes from shared root `root`.
+fn shared_from(shares: &Shares, file: &SharedFile, root: &Path) -> bool {
+    shares
+        .resolve(&file.file_id)
+        .is_ok_and(|r| r.disk_path.starts_with(root))
+}
+
+fn share_list(me: &Me, download_dir: &Path) -> ExitCode {
+    let shares = shares(me, download_dir);
+    let (roots, files) = match (shares.roots(), shares.list(None)) {
+        (Ok(roots), Ok(files)) => (roots, files),
+        (Err(e), _) | (_, Err(e)) => return fail(&e.to_string()),
+    };
+    if roots.is_empty() {
+        println!("Nothing is shared. Share a folder with `opendrop share add <FOLDER>`.");
+        return ExitCode::SUCCESS;
+    }
+    println!("Shared with paired devices:");
+    for root in &roots {
+        println!("  {}", root.display());
+    }
+    println!("\n{} file(s):", files.len());
+    for file in &files {
+        println!(
+            "  {}  {:>9}  {}",
+            file.file_id,
+            human_size(file.size),
+            file.path
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn share_remove(me: &Me, download_dir: &Path, path: &str) -> ExitCode {
+    match shares(me, download_dir).remove(Path::new(path)) {
+        Ok(true) => {
+            println!("Stopped sharing {path}.");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => fail(&format!("{path} is not shared (see `opendrop share list`)")),
+        Err(e) => fail(&e.to_string()),
+    }
 }
 
 /// What the running daemon (`listen` or the app) has sent and received.
