@@ -27,7 +27,9 @@ use windows as platform;
 
 pub use platform::Endpoint;
 
+use crate::daemon::transfers::CancelError;
 use crate::daemon::{Daemon, DeviceInfo, Transfer};
+use crate::error::{ErrorCode, code_of};
 use crate::network::BoxError;
 use crate::protocol::{ProtocolError, read_frame, write_frame};
 use crate::share::SharedFile;
@@ -96,6 +98,9 @@ pub enum Response {
     },
     Error {
         message: String,
+        /// Set when the failure is one a client may act on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<ErrorCode>,
     },
 }
 
@@ -110,10 +115,15 @@ pub async fn handle(daemon: &Daemon, request: Request) -> Response {
         },
         Request::GetTransfer { transfer_id } => match daemon.transfers.get(&transfer_id) {
             Some(transfer) => Response::Transfer { transfer },
-            None => error(format!("no transfer {transfer_id}")),
+            None => unknown_transfer(&transfer_id),
         },
         Request::CancelTransfer { transfer_id } => match daemon.transfers.cancel(&transfer_id) {
             Ok(()) => Response::CancelRequested { transfer_id },
+            Err(CancelError::NotFound) => unknown_transfer(&transfer_id),
+            Err(e @ CancelError::AlreadyFinished(_)) => Response::Error {
+                message: e.to_string(),
+                code: Some(ErrorCode::AlreadyFinished),
+            },
             Err(e) => error(e.to_string()),
         },
         Request::ListShares { device, query } => {
@@ -123,7 +133,7 @@ pub async fn handle(daemon: &Daemon, request: Request) -> Response {
                     files,
                     truncated,
                 },
-                Err(e) => error(e.to_string()),
+                Err(e) => failed(&e),
             }
         }
         Request::Fetch {
@@ -133,13 +143,31 @@ pub async fn handle(daemon: &Daemon, request: Request) -> Response {
             via_assistant,
         } => match daemon.fetch(&device, &file, &reason, via_assistant).await {
             Ok(transfer_id) => Response::FetchStarted { transfer_id },
-            Err(e) => error(e.to_string()),
+            Err(e) => failed(&e),
         },
     }
 }
 
 fn error(message: String) -> Response {
-    Response::Error { message }
+    Response::Error {
+        message,
+        code: None,
+    }
+}
+
+/// `e` as an answer, keeping its code if it has one.
+fn failed(e: &BoxError) -> Response {
+    Response::Error {
+        message: e.to_string(),
+        code: code_of(e),
+    }
+}
+
+fn unknown_transfer(transfer_id: &str) -> Response {
+    Response::Error {
+        message: format!("no transfer {transfer_id}"),
+        code: Some(ErrorCode::UnknownTransfer),
+    }
 }
 
 /// Serve one client connection until it hangs up (or the daemon stops).

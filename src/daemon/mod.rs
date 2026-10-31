@@ -12,6 +12,7 @@ pub mod transfers;
 pub use transfers::{Direction, Status, Transfer, TransferTable};
 
 use crate::discovery::{Discovery, Peer};
+use crate::error::{ErrorCode, coded};
 use crate::identity::random_bytes;
 use crate::network::client::{Connection, FileResult};
 use crate::network::fetch::PendingFetches;
@@ -317,11 +318,16 @@ impl Daemon {
             .into_iter()
             .any(|d| d.id == device || d.name.eq_ignore_ascii_case(device));
         Err(if paired {
-            format!("\"{device}\" is paired but not on the network right now")
+            coded(
+                ErrorCode::DeviceOffline,
+                format!("\"{device}\" is paired but not on the network right now"),
+            )
         } else {
-            format!("no device named \"{device}\" on this network")
-        }
-        .into())
+            coded(
+                ErrorCode::UnknownDevice,
+                format!("no device named \"{device}\" on this network"),
+            )
+        })
     }
 
     /// The files `device` shares with us, and whether the list was cut
@@ -423,20 +429,27 @@ fn pick_shared_file(
         .collect();
     match named.as_slice() {
         [file] => Ok((*file).clone()),
-        [] if truncated => Err(format!(
-            "\"{owner}\" shares too many files to list them all and \"{query}\" wasn't among those listed; use its id or path"
-        )
-        .into()),
-        [] => Err(format!("\"{owner}\" doesn't share a file named \"{query}\"").into()),
-        several => Err(format!(
-            "\"{owner}\" shares several files named \"{query}\"; use a path: {}",
-            several
-                .iter()
-                .map(|f| f.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .into()),
+        [] if truncated => Err(coded(
+            ErrorCode::NotShared,
+            format!(
+                "\"{owner}\" shares too many files to list them all and \"{query}\" wasn't among those listed; use its id or path"
+            ),
+        )),
+        [] => Err(coded(
+            ErrorCode::NotShared,
+            format!("\"{owner}\" doesn't share a file named \"{query}\""),
+        )),
+        several => Err(coded(
+            ErrorCode::AmbiguousFile,
+            format!(
+                "\"{owner}\" shares several files named \"{query}\"; use a path: {}",
+                several
+                    .iter()
+                    .map(|f| f.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
     }
 }
 
