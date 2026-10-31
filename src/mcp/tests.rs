@@ -497,3 +497,183 @@ fn file_uris_work_for_every_os() {
     assert_eq!(mime_of("Photo.JPG"), "image/jpeg");
     assert_eq!(mime_of("no-extension"), "application/octet-stream");
 }
+
+/// Files left in a download folder, temp files included.
+fn files_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pseudo-random bytes (xorshift), so nothing compresses or dedupes.
+fn random_bytes(len: usize, mut seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        out.extend_from_slice(&seed.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// The file_id of shared `name`, found the way an assistant would.
+async fn file_id_of(client: &McpClient, rig: &Rig, name: &str) -> String {
+    let listed = success(
+        &call(
+            client,
+            "list_shared_files",
+            json!({"device": rig.owner_address()}),
+        )
+        .await,
+    );
+    listed["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == name)
+        .unwrap_or_else(|| panic!("{name} not listed: {listed}"))["file_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn request(client: &McpClient, rig: &Rig, file_id: &str) -> String {
+    let started = success(
+        &call(
+            client,
+            "request_file",
+            json!({"device": rig.owner_address(), "file_id": file_id, "reason": "e2e"}),
+        )
+        .await,
+    );
+    assert_eq!(started["state"], "awaiting_approval");
+    started["transfer_id"].as_str().unwrap().to_owned()
+}
+
+/// Issue #23 acceptance: two real daemons, driven only through MCP the way
+/// an assistant would, with the owner's approvals scripted. Approve: the
+/// file arrives and its SHA-256 matches. Decline: `declined`, nothing
+/// written. Cancel mid-transfer: `cancelled`, no `.part` left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scripted_end_to_end_through_mcp() {
+    let started = std::time::Instant::now();
+    let big = random_bytes(64 * 1024 * 1024, 0x9e37_79b9_7f4a_7c15);
+    let mut rig = rig(&big).await;
+    let original = crate::transfer::sha256_hex(&big);
+    let client = connect(&rig.requester_config).await;
+    let downloads = rig.requester.download_dir.clone();
+
+    // list_devices: the owner is there, paired and compatible.
+    let devices = success(&call(&client, "list_devices", json!({})).await);
+    let mac = devices["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "Mac")
+        .unwrap_or_else(|| panic!("owner not listed: {devices}"))
+        .clone();
+    assert_eq!(mac["paired"], true);
+    assert_eq!(mac["compatible"], true);
+
+    // 1. Approve: list -> request -> approve -> status until done.
+    let report = file_id_of(&client, &rig, "q3-report.pdf").await;
+    let id = request(&client, &rig, &report).await;
+    let fetch = answer_next(&mut rig.asked, true).await.unwrap();
+    assert!(fetch.via_assistant);
+    let mut status = Value::Null;
+    for _ in 0..6 {
+        status = success(
+            &call(
+                &client,
+                "get_transfer_status",
+                json!({"transfer_id": id, "wait_seconds": 10}),
+            )
+            .await,
+        );
+        if status["state"] == "done" {
+            break;
+        }
+    }
+    assert_eq!(status["state"], "done", "{status}");
+    let saved = PathBuf::from(status["path"].as_str().unwrap());
+    let copy = crate::transfer::sha256_hex(&std::fs::read(&saved).unwrap());
+    println!("approved: original {original}, copy {copy}");
+    assert_eq!(copy, original);
+    assert_eq!(status["sha256"], original.as_str());
+    assert_eq!(status["bytes"], big.len() as u64);
+    std::fs::remove_file(&saved).unwrap();
+
+    // 2. Decline: declined, and nothing written.
+    let notes = file_id_of(&client, &rig, "notes.txt").await;
+    let id = request(&client, &rig, &notes).await;
+    answer_next(&mut rig.asked, false).await;
+    let status = success(
+        &call(
+            &client,
+            "get_transfer_status",
+            json!({"transfer_id": id, "wait_seconds": 10}),
+        )
+        .await,
+    );
+    assert_eq!(status["state"], "declined", "{status}");
+    assert!(status.get("path").is_none(), "{status}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(files_in(&downloads), Vec::<String>::new());
+
+    // 3. Cancel mid-transfer: cancelled, and no .part file left.
+    let id = request(&client, &rig, &report).await;
+    answer_next(&mut rig.asked, true).await;
+    let mut seen = Value::Null;
+    for _ in 0..2000 {
+        seen = success(&call(&client, "get_transfer_status", json!({"transfer_id": id})).await);
+        if seen["state"] == "transferring" && seen["bytes"].as_u64().unwrap() > 0 {
+            break;
+        }
+        assert!(
+            !seen["state"].as_str().unwrap().ends_with("done"),
+            "finished before it could be cancelled: {seen}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(seen["state"], "transferring", "{seen}");
+    let cancelled = success(&call(&client, "cancel_transfer", json!({"transfer_id": id})).await);
+    println!(
+        "cancelled after {} of {} bytes: {cancelled}",
+        seen["bytes"], seen["total"]
+    );
+    assert_eq!(cancelled["state"], "cancelled", "{cancelled}");
+    // The receive stops and cleans up right after the row turns cancelled.
+    let mut left = files_in(&downloads);
+    for _ in 0..100 {
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        left = files_in(&downloads);
+    }
+    assert_eq!(left, Vec::<String>::new(), "files left behind");
+    let status = success(&call(&client, "get_transfer_status", json!({"transfer_id": id})).await);
+    assert_eq!(status["state"], "cancelled", "stays cancelled: {status}");
+    // The owner's side ended too, without delivering.
+    let mut owner_row = None;
+    for _ in 0..100 {
+        owner_row = rig.owner.transfers.list().into_iter().last();
+        if owner_row.as_ref().is_some_and(|t| t.status.is_final()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let owner_row = owner_row.unwrap();
+    assert_ne!(owner_row.status, Status::Done, "{owner_row:?}");
+    assert!(owner_row.status.is_final(), "{owner_row:?}");
+
+    let elapsed = started.elapsed();
+    println!("scripted end-to-end took {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
+}
