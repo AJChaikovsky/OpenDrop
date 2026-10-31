@@ -9,11 +9,12 @@
 //!   opendrop unpair <DEVICE>
 
 use opendrop::DEFAULT_PORT;
+use opendrop::daemon::{self, Daemon};
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
 use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::server::{Approval, FileRequest};
-use opendrop::network::{APPROVAL_TIMEOUT, DeviceIdentity, server};
+use opendrop::network::{APPROVAL_TIMEOUT, DeviceIdentity};
 use opendrop::pairing::store::PairedDevices;
 use opendrop::pairing::{PAIRING_TIMEOUT, PairOutcome, PairPrompt, PairPrompts};
 use std::collections::HashMap;
@@ -24,7 +25,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 /// How long `peers` and `send <DEVICE>` browse before giving up.
@@ -137,45 +137,57 @@ struct Me {
 
 async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> ExitCode {
     let Me { identity, paired } = me;
-    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
-        Ok(l) => l,
-        Err(e) => return fail(&format!("could not listen on port {port}: {e}")),
+    let (file_prompts, pair_prompts) = spawn_prompt();
+    let approval = if auto_accept {
+        Approval::AcceptAll
+    } else {
+        Approval::Ask(file_prompts)
+    };
+    let daemon = match Daemon::start(daemon::Options {
+        port,
+        paired: Arc::clone(&paired),
+        pair_prompts: Some(pair_prompts),
+        ..daemon::Options::new(identity, download_dir, approval)
+    })
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => return fail(&e.to_string()),
     };
     // With --port 0 the OS picks one; advertise what we actually got.
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    let port = daemon.port;
     println!(
         "\"{}\" ({}) listening on port {port}",
-        identity.name, identity.id
+        daemon.identity.name, daemon.identity.id
     );
     match local_ip() {
         Some(ip) => println!("Other devices can reach this one at {ip}:{port}"),
         None => println!("Could not detect this device's LAN IP; check your network settings"),
     }
-    println!("Received files are saved to {}", download_dir.display());
-    let (file_prompts, pair_prompts) = spawn_prompt();
-    let approval = if auto_accept {
+    println!(
+        "Received files are saved to {}",
+        daemon.download_dir.display()
+    );
+    if auto_accept {
         println!("Accepting every incoming file without asking (--auto-accept).");
-        Approval::AcceptAll
     } else {
         println!("You'll be asked before any incoming file is saved.");
-        Approval::Ask(file_prompts)
-    };
+    }
     match paired.list().len() {
         0 => println!("No paired devices yet; others can pair with `opendrop pair`."),
         n => println!("{n} paired device(s); see `opendrop devices`."),
     }
-    let discovery = match Discovery::start(&identity, Some(port)) {
-        Ok(d) => {
-            println!("Advertising on the local network; nearby devices will appear below.");
-            Some(d)
+    match (daemon.discovery(), daemon.discovery_error()) {
+        (Some(_), _) => {
+            println!("Advertising on the local network; nearby devices will appear below.")
         }
-        Err(e) => {
-            eprintln!("warning: mDNS discovery unavailable ({e}); peers must use the IP above");
-            None
-        }
-    };
+        (None, error) => eprintln!(
+            "warning: mDNS discovery unavailable ({}); peers must use the IP above",
+            error.unwrap_or("turned off")
+        ),
+    }
     println!("Press Ctrl+C to stop.\n");
-    if let Some(discovery) = &discovery {
+    if let Some(discovery) = daemon.discovery() {
         let mut events = discovery.subscribe();
         let paired = Arc::clone(&paired);
         tokio::spawn(async move {
@@ -204,11 +216,7 @@ async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> 
     }
 
     tokio::select! {
-        result = server::serve(listener, server::Options {
-            paired,
-            pair_prompts: Some(pair_prompts),
-            ..server::Options::new(identity, download_dir, approval)
-        }) => match result {
+        result = daemon.wait() => match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&format!("server stopped: {e}")),
         },

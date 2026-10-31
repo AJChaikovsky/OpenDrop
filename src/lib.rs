@@ -3,6 +3,7 @@
 //! The library holds all networking logic so the CLI (`main.rs`) today, and the
 //! Tauri desktop app later, can reuse it without changes.
 
+pub mod daemon;
 pub mod discovery;
 pub mod identity;
 pub mod network;
