@@ -168,7 +168,13 @@ Keys, nonces and signatures travel as lowercase hex.
 | `file_decline` | server reply to `file_offer`; connection stays open | `transfer_id` |
 | `file_done` | client, after the raw bytes | `transfer_id`, `sha256` (lowercase hex) |
 | `file_received` | server, once verified and saved | `transfer_id`, `received_bytes` |
-| `error` | either, then close | `code` (`unsupported_version`, `unexpected_message`, `bad_message`, `file_rejected`, `checksum_mismatch`, `storage_error`, `identity_mismatch`, `pairing_failed`), `message` |
+| `share_list_request` | requester to owner (paired only) | `query` (optional, matches paths ignoring case) |
+| `share_list` | owner reply | `files: [{file_id, name, path, size, modified}]`, cut to fit one frame, `truncated` |
+| `fetch_request` | requester to owner | `fetch_id`, `file_id`, `reason`, `via_assistant`, `reply_port` |
+| `fetch_accepted` | owner reply, once its user said yes | `fetch_id` |
+| `fetch_declined` | owner reply | `fetch_id`, `reason` (`declined`, `timeout`, `not_shared`, `not_paired`) |
+| `fetch_offer` | owner to requester, on a new connection | like `file_offer`, plus `fetch_id` |
+| `error` | either, then close | `code` (`unsupported_version`, `unexpected_message`, `bad_message`, `file_rejected`, `checksum_mismatch`, `storage_error`, `identity_mismatch`, `pairing_failed`, `not_paired`), `message` |
 
 A peer with a different `version` gets an `unsupported_version` error rather than a parse
 failure. Reads time out after 10 seconds so a stalled peer can't hold a connection open.
@@ -204,6 +210,20 @@ directory parts and unsafe characters from `name` and streams the bytes into a h
 matches `file_done` is the file synced and renamed into place, then confirmed with
 `file_received`. On a mismatch, a dropped connection or a stall, the temp file is deleted.
 Several files (and texts) can be sent over one connection, one after another.
+
+### Fetching
+
+Fetching flips the flow: the device that wants a file asks for it. A paired requester can
+list the owner's shared files (`share_list_request`); files are named by opaque `file_id`s,
+never paths. A `fetch_request` names one id, the requester's stated reason, and the port of
+its own listener. The owner's user is asked (with the reason, and whether an AI assistant
+asked); after 60 seconds without an answer the request is declined with `timeout`. On a yes
+the owner replies `fetch_accepted`, connects back to the requester's address on
+`reply_port`, checks in the handshake that it reached the same device, and sends the file
+with the usual transfer sequence, opening with `fetch_offer` instead of `file_offer`. The
+requester takes a `fetch_offer` without asking only if its `fetch_id`, the sending device and
+the size all match a fetch it started; anything else gets the normal accept prompt. Fetches
+reuse the SHA-256 check and `.part` handling of ordinary transfers.
 
 ## Discovery
 

@@ -523,6 +523,8 @@ async fn forward_requests(
             name,
             size,
             respond,
+            // The app has no fetch wording yet; it asks as for any file.
+            fetch: _,
         } = request;
         // The server drops its end after APPROVAL_TIMEOUT or if the sender
         // hangs up; we notice by holding a watch on it.

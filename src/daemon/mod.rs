@@ -82,6 +82,21 @@ pub struct DeviceInfo {
     pub compatible: bool,
 }
 
+impl DeviceInfo {
+    /// A discovered device. Peers speaking another protocol version are
+    /// listed, but as incompatible.
+    pub fn nearby(peer: &Peer, paired: &PairedDevices) -> Self {
+        Self {
+            device_id: peer.id.clone(),
+            name: peer.name.clone(),
+            address: peer.socket_addr().map(|a| a.to_string()),
+            online: true,
+            paired: paired.get(&peer.id).is_some(),
+            compatible: peer.protocol_version == PROTOCOL_VERSION,
+        }
+    }
+}
+
 pub struct Daemon {
     pub identity: DeviceIdentity,
     /// The port actually listened on.
@@ -207,14 +222,7 @@ impl Daemon {
             .map_or_else(Vec::new, Discovery::peers);
         let mut devices: Vec<DeviceInfo> = nearby
             .iter()
-            .map(|peer| DeviceInfo {
-                device_id: peer.id.clone(),
-                name: peer.name.clone(),
-                address: peer.socket_addr().map(|a| a.to_string()),
-                online: true,
-                paired: self.paired.get(&peer.id).is_some(),
-                compatible: peer.protocol_version == PROTOCOL_VERSION,
-            })
+            .map(|peer| DeviceInfo::nearby(peer, &self.paired))
             .collect();
         for device in self.paired.list() {
             if nearby.iter().all(|p| p.id != device.id) {
@@ -330,11 +338,16 @@ async fn record_requests(
     transfers: Arc<TransferTable>,
 ) {
     while let Some(request) = requests.recv().await {
+        // A fetch request asks us to send one of our files.
+        let (direction, peer_id) = match &request.fetch {
+            Some(fetch) => (Direction::Send, Some(fetch.peer_id.clone())),
+            None => (Direction::Receive, None),
+        };
         let (row, cancelled) = transfers.begin_with_id(
             request.transfer_id.clone(),
             Transfer::new(
-                Direction::Receive,
-                None,
+                direction,
+                peer_id,
                 request.peer_name.clone(),
                 request.name.clone(),
                 request.size,
@@ -350,9 +363,12 @@ async fn record_requests(
                 name,
                 size,
                 mut respond,
+                fetch,
             } = request;
             let accept = match approval {
-                Approval::AcceptAll => true,
+                // Auto-accept takes files in; sending one away always needs
+                // a yes.
+                Approval::AcceptAll => fetch.is_none(),
                 Approval::Ask(ask) => {
                     let (answer_tx, answer) = oneshot::channel();
                     let forwarded = FileRequest {
@@ -362,6 +378,7 @@ async fn record_requests(
                         name,
                         size,
                         respond: answer_tx,
+                        fetch,
                     };
                     if ask.send(forwarded).await.is_err() {
                         false

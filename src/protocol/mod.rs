@@ -111,8 +111,62 @@ pub enum Message {
         transfer_id: String,
         received_bytes: u64,
     },
+    /// Requester asks which files the owner shares (only paired devices
+    /// may), optionally only those whose path contains `query`.
+    ShareListRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// The owner's shared files, cut to fit one frame (`truncated` if any
+    /// were left out).
+    ShareList {
+        files: Vec<SharedFile>,
+        truncated: bool,
+    },
+    /// Requester asks for one shared file. On approval the owner connects
+    /// back to the requester's listener on `reply_port` and sends it with a
+    /// `fetch_offer` carrying the same `fetch_id`.
+    FetchRequest {
+        fetch_id: String,
+        file_id: String,
+        /// Shown to the owner, e.g. why an assistant wants the file.
+        reason: String,
+        via_assistant: bool,
+        reply_port: u16,
+    },
+    /// The owner's user approved; a `fetch_offer` follows on a new
+    /// connection.
+    FetchAccepted { fetch_id: String },
+    FetchDeclined {
+        fetch_id: String,
+        reason: FetchDeclineReason,
+    },
+    /// A `file_offer` answering a fetch. The requester takes it without
+    /// asking only if `fetch_id`, the sending device and `size` all match a
+    /// fetch it started; anything else is treated like a plain offer.
+    FetchOffer {
+        transfer_id: String,
+        name: String,
+        size: u64,
+        fetch_id: String,
+    },
     /// Something went wrong; the sender closes the connection afterwards.
     Error { code: ErrorCode, message: String },
+}
+
+pub use crate::share::SharedFile;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchDeclineReason {
+    /// The owner's user said no.
+    Declined,
+    /// Nobody answered within the approval timeout.
+    Timeout,
+    /// The id doesn't name a currently shared file.
+    NotShared,
+    /// Only paired devices may fetch.
+    NotPaired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +187,8 @@ pub enum ErrorCode {
     IdentityMismatch,
     /// The pairing commitment didn't match the revealed nonce.
     PairingFailed,
+    /// Only paired devices may do this (list shares).
+    NotPaired,
 }
 
 /// Serde for fixed-size byte arrays as lowercase hex strings.
@@ -220,6 +276,39 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
+}
+
+/// A `share_list` holding as many of `files` (in order) as fit in one
+/// frame, with `truncated` set if some had to be left out.
+pub fn share_list_within_frame(mut files: Vec<SharedFile>) -> Message {
+    let fits = |n: usize, files: &[SharedFile]| {
+        encode(&Message::ShareList {
+            files: files[..n].to_vec(),
+            truncated: n < files.len(),
+        })
+        .is_ok()
+    };
+    if !fits(files.len(), &files) {
+        // Largest prefix that fits: fits(lo) holds, fits(hi) doesn't.
+        let (mut lo, mut hi) = (0, files.len());
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if fits(mid, &files) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        files.truncate(lo);
+        return Message::ShareList {
+            files,
+            truncated: true,
+        };
+    }
+    Message::ShareList {
+        files,
+        truncated: false,
+    }
 }
 
 /// Write one framed message.
@@ -334,6 +423,105 @@ mod tests {
         for m in &msgs {
             assert_eq!(&read_message(&mut b).await.unwrap(), m);
         }
+    }
+
+    fn shared(i: usize) -> SharedFile {
+        SharedFile {
+            file_id: format!("f_{i:032x}"),
+            name: format!("report-{i}.pdf"),
+            path: format!("Reports/2026/report-{i}.pdf"),
+            size: i as u64 * 1000,
+            modified: 1_790_000_000 + i as u64,
+        }
+    }
+
+    /// Issue #20 acceptance: every new message round-trips through the
+    /// framing code.
+    #[tokio::test]
+    async fn fetch_messages_round_trip() {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        let msgs = [
+            Message::ShareListRequest { query: None },
+            Message::ShareListRequest {
+                query: Some("q3".into()),
+            },
+            Message::ShareList {
+                files: vec![shared(1), shared(2)],
+                truncated: false,
+            },
+            Message::FetchRequest {
+                fetch_id: "fetch-1".into(),
+                file_id: shared(1).file_id,
+                reason: "User asked for the Q3 report".into(),
+                via_assistant: true,
+                reply_port: 45454,
+            },
+            Message::FetchAccepted {
+                fetch_id: "fetch-1".into(),
+            },
+            Message::FetchDeclined {
+                fetch_id: "fetch-1".into(),
+                reason: FetchDeclineReason::Timeout,
+            },
+            Message::FetchOffer {
+                transfer_id: "t9".into(),
+                name: "report-1.pdf".into(),
+                size: 1000,
+                fetch_id: "fetch-1".into(),
+            },
+            Message::Error {
+                code: ErrorCode::NotPaired,
+                message: "pair first".into(),
+            },
+        ];
+        for m in &msgs {
+            write_message(&mut a, m).await.unwrap();
+        }
+        for m in &msgs {
+            assert_eq!(&read_message(&mut b).await.unwrap(), m);
+        }
+        let frame = encode(&Message::FetchDeclined {
+            fetch_id: "x".into(),
+            reason: FetchDeclineReason::NotShared,
+        })
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"version": 2, "type": "fetch_declined", "fetch_id": "x", "reason": "not_shared"})
+        );
+    }
+
+    /// Issue #20 acceptance: a share list too big for one frame is cut to
+    /// fit and marked `truncated`; one that fits is sent whole.
+    #[test]
+    fn share_list_is_cut_to_fit_one_frame() {
+        let small = share_list_within_frame((0..10).map(shared).collect());
+        assert!(
+            matches!(&small, Message::ShareList { files, truncated: false } if files.len() == 10)
+        );
+
+        let message = share_list_within_frame((0..5000).map(shared).collect());
+        let Message::ShareList { files, truncated } = &message else {
+            panic!("{message:?}");
+        };
+        assert!(*truncated);
+        let frame = encode(&message).unwrap();
+        assert!(frame.len() - 4 <= MAX_FRAME_LEN as usize);
+        // As many as fit: one more would not.
+        let one_more = Message::ShareList {
+            files: (0..files.len() + 1).map(shared).collect(),
+            truncated: true,
+        };
+        assert!(matches!(
+            encode(&one_more),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+        println!("{} of 5000 files fit in one frame", files.len());
+        assert_eq!(
+            files[..],
+            (0..files.len()).map(shared).collect::<Vec<_>>()[..]
+        );
     }
 
     #[test]
