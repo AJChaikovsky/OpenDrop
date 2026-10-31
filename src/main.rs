@@ -7,9 +7,11 @@
 //!   opendrop pair <DEVICE|IP[:PORT]>
 //!   opendrop devices [--wait SECONDS]
 //!   opendrop unpair <DEVICE>
+//!   opendrop transfers
 
 use opendrop::DEFAULT_PORT;
-use opendrop::daemon::{self, Daemon};
+use opendrop::control::{Client, Request, Response};
+use opendrop::daemon::{self, Daemon, Direction};
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
 use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
@@ -42,6 +44,7 @@ USAGE:
     opendrop pair <DEVICE|IP[:PORT]>  pair with a device (both screens show a code)
     opendrop devices [--wait SECONDS] list nearby and paired devices
     opendrop unpair <DEVICE>          forget a paired device
+    opendrop transfers                transfers seen by the running `listen`
 
 Every command also takes --config DIR.
 
@@ -101,7 +104,11 @@ async fn main() -> ExitCode {
         eprintln!("warning: {error}");
         eprintln!("warning: carrying on with no paired devices; changes won't be saved");
     }
-    let me = Me { identity, paired };
+    let me = Me {
+        identity,
+        paired,
+        config_dir,
+    };
 
     match args
         .iter()
@@ -117,6 +124,7 @@ async fn main() -> ExitCode {
         }
         ["pair", target] => pair(&me, target, wait).await,
         ["devices"] => devices(&me, wait).await,
+        ["transfers"] => transfers(&me).await,
         ["unpair", target] => unpair(&me, target),
         ["help"] | ["--help"] | ["-h"] => {
             println!("{USAGE}");
@@ -133,10 +141,15 @@ async fn main() -> ExitCode {
 struct Me {
     identity: DeviceIdentity,
     paired: Arc<PairedDevices>,
+    config_dir: PathBuf,
 }
 
 async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> ExitCode {
-    let Me { identity, paired } = me;
+    let Me {
+        identity,
+        paired,
+        config_dir,
+    } = me;
     let (file_prompts, pair_prompts) = spawn_prompt();
     let approval = if auto_accept {
         Approval::AcceptAll
@@ -147,6 +160,7 @@ async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> 
         port,
         paired: Arc::clone(&paired),
         pair_prompts: Some(pair_prompts),
+        control: Some(config_dir),
         ..daemon::Options::new(identity, download_dir, approval)
     })
     .await
@@ -185,6 +199,11 @@ async fn listen(me: Me, port: u16, download_dir: PathBuf, auto_accept: bool) -> 
             "warning: mDNS discovery unavailable ({}); peers must use the IP above",
             error.unwrap_or("turned off")
         ),
+    }
+    if let Some(error) = daemon.control_error() {
+        eprintln!(
+            "warning: local control API unavailable ({error}); `opendrop transfers` won't reach this device"
+        );
     }
     println!("Press Ctrl+C to stop.\n");
     if let Some(discovery) = daemon.discovery() {
@@ -382,6 +401,45 @@ async fn devices(me: &Me, wait: Duration) -> ExitCode {
             "{:<13}\"{}\" ({}) not on the network right now",
             "Paired", device.name, device.id
         );
+    }
+    ExitCode::SUCCESS
+}
+
+/// What the running daemon (`listen` or the app) has sent and received.
+async fn transfers(me: &Me) -> ExitCode {
+    let mut client = match Client::connect(&me.config_dir).await {
+        Ok(c) => c,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let transfers = match client.call(&Request::ListTransfers).await {
+        Ok(Response::Transfers { transfers }) => transfers,
+        Ok(other) => return fail(&format!("unexpected answer: {other:?}")),
+        Err(e) => return fail(&e.to_string()),
+    };
+    if transfers.is_empty() {
+        println!("No transfers since the daemon started.");
+    }
+    for t in transfers {
+        let arrow = match t.direction {
+            Direction::Send => "to",
+            Direction::Receive => "from",
+        };
+        let mut line = format!(
+            "{:<10} {:<18} \"{}\" {arrow} \"{}\"  {} / {}",
+            t.transfer_id,
+            format!("{:?}", t.status),
+            t.name,
+            t.peer_name,
+            human_size(t.bytes),
+            human_size(t.size),
+        );
+        if let Some(path) = &t.path {
+            line.push_str(&format!("  -> {}", path.display()));
+        }
+        if let Some(error) = &t.error {
+            line.push_str(&format!("  ({error})"));
+        }
+        println!("{line}");
     }
     ExitCode::SUCCESS
 }

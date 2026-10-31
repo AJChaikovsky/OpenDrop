@@ -232,9 +232,27 @@ where
     Ok(())
 }
 
-/// Read one framed message. Returns `ConnectionClosed` if the peer hung up
+/// Write one frame holding `payload` as is. The control API uses this for
+/// its own message set.
+pub async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let len = u32::try_from(payload.len())
+        .ok()
+        .filter(|&n| n <= MAX_FRAME_LEN)
+        .ok_or(ProtocolError::FrameTooLarge(payload.len() as u32))?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Read one frame's payload. Returns `ConnectionClosed` if the peer hung up
 /// before sending any bytes of a new frame.
-pub async fn read_message<R>(reader: &mut R) -> Result<Message, ProtocolError>
+pub async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, ProtocolError>
 where
     R: AsyncRead + Unpin,
 {
@@ -252,6 +270,16 @@ where
     }
     let mut payload = vec![0u8; len as usize];
     reader.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+/// Read one framed message. Returns `ConnectionClosed` if the peer hung up
+/// before sending any bytes of a new frame.
+pub async fn read_message<R>(reader: &mut R) -> Result<Message, ProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
+    let payload = read_frame(reader).await?;
 
     // Check the version before interpreting the rest, so a future v2 peer
     // gets a clear "unsupported version" instead of a confusing parse error.

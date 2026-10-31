@@ -292,3 +292,24 @@ fn damaged_store_is_reported_and_listen_keeps_running() {
         b"\x00garbage{{{"
     );
 }
+
+/// `opendrop transfers` reaches the running `listen` over the control API.
+#[test]
+fn transfers_asks_the_running_listener() {
+    let config = tempfile::tempdir().unwrap();
+    let downloads = tempfile::tempdir().unwrap();
+    let out = run(config.path(), &["transfers"], "");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("start `opendrop listen` first"),
+        "{out:?}"
+    );
+    let listener = Listener::start(config.path(), "Desk", 0, downloads.path());
+    let out = run(config.path(), &["transfers"], "");
+    listener.stop();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "No transfers since the daemon started."
+    );
+}

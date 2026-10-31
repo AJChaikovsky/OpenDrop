@@ -48,6 +48,8 @@ pub struct Options {
     pub pair_results: Option<PairResults>,
     /// Advertise and browse over mDNS.
     pub discover: bool,
+    /// Serve the local control API for this config dir (see `control`).
+    pub control: Option<PathBuf>,
 }
 
 impl Options {
@@ -62,6 +64,7 @@ impl Options {
             pair_prompts: None,
             pair_results: None,
             discover: true,
+            control: None,
         }
     }
 }
@@ -88,6 +91,8 @@ pub struct Daemon {
     pub transfers: Arc<TransferTable>,
     discovery: Option<Discovery>,
     discovery_error: Option<String>,
+    control_error: Mutex<Option<String>>,
+    control: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
     server: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
 }
 
@@ -105,6 +110,7 @@ impl Daemon {
             pair_prompts,
             pair_results,
             discover,
+            control,
         } = options;
         let listener = TcpListener::bind(("0.0.0.0", port))
             .await
@@ -148,7 +154,7 @@ impl Daemon {
         } else {
             (None, None)
         };
-        Ok(Arc::new(Self {
+        let daemon = Arc::new(Self {
             identity,
             port,
             download_dir,
@@ -156,12 +162,36 @@ impl Daemon {
             transfers,
             discovery,
             discovery_error,
+            control_error: Mutex::new(None),
+            control: Mutex::new(None),
             server: Mutex::new(Some(server)),
-        }))
+        });
+        if let Some(config_dir) = control {
+            let endpoint = crate::control::Endpoint::for_config_dir(&config_dir);
+            // Bind before returning, so a client started right after us
+            // finds the endpoint. Like mDNS, a failure here is reported but
+            // doesn't stop the device from receiving files.
+            let (bound_tx, bound) = oneshot::channel();
+            let task = tokio::spawn(crate::control::serve_ready(
+                Arc::downgrade(&daemon),
+                endpoint,
+                bound_tx,
+            ));
+            *daemon.control.lock().unwrap() = Some(task);
+            if let Ok(Err(e)) = bound.await {
+                *daemon.control_error.lock().unwrap() = Some(e);
+            }
+        }
+        Ok(daemon)
     }
 
     pub fn discovery(&self) -> Option<&Discovery> {
         self.discovery.as_ref()
+    }
+
+    /// Why the control API isn't running, if it was asked for and failed.
+    pub fn control_error(&self) -> Option<String> {
+        self.control_error.lock().unwrap().clone()
     }
 
     /// Why mDNS isn't running, if it was asked for and failed to start.
@@ -253,6 +283,9 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         if let Some(server) = self.server.lock().unwrap().take() {
             server.abort();
+        }
+        if let Some(control) = self.control.lock().unwrap().take() {
+            control.abort();
         }
     }
 }
