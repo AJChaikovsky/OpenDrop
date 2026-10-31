@@ -148,25 +148,39 @@ pub async fn run_with_events(
 pub async fn serve(listener: TcpListener, options: Options) -> std::io::Result<()> {
     let options = Arc::new(options);
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (mut stream, peer_addr) = listener.accept().await?;
         let options = Arc::clone(&options);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer_addr, &options).await {
+            if let Err(e) = handle_connection(&mut stream, peer_addr, &options).await {
                 eprintln!("[{peer_addr}] connection ended with error: {e}");
+                close_after_error(stream).await;
             }
         });
     }
 }
 
+/// Hang up without losing the error we just sent. Closing a socket that
+/// still has unread bytes from the peer (say, an offer it sent without
+/// waiting for our reply) makes the OS send a reset, and Windows then
+/// throws away data the peer hasn't read yet, our error included. So
+/// finish our side first and discard what the peer still sends, briefly.
+async fn close_after_error(mut stream: TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = stream.shutdown().await;
+    let mut sink = [0u8; 4096];
+    let drain = async { while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {} };
+    let _ = timeout(std::time::Duration::from_secs(1), drain).await;
+}
+
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: &mut TcpStream,
     peer_addr: SocketAddr,
     options: &Options,
 ) -> Result<(), BoxError> {
     let download_dir = options.download_dir.as_path();
     let approval = &options.approval;
     let events = options.events.as_ref();
-    let peer = handshake::accept(&mut stream, &options.identity, &options.paired).await?;
+    let peer = handshake::accept(stream, &options.identity, &options.paired).await?;
     let peer_name = peer.peer.name.clone();
     println!(
         "[{peer_addr}] connected: \"{peer_name}\" ({}){}",
@@ -175,11 +189,11 @@ async fn handle_connection(
     );
 
     loop {
-        match next_message(&mut stream).await {
+        match next_message(stream).await {
             Ok(Message::Text { body }) => {
                 println!("[{peer_addr}] {peer_name}: {body}");
                 write_message(
-                    &mut stream,
+                    stream,
                     &Message::TextAck {
                         received_bytes: body.len(),
                     },
@@ -192,7 +206,7 @@ async fn handle_connection(
                 size,
             }) => {
                 receive_file(
-                    &mut stream,
+                    stream,
                     download_dir,
                     approval,
                     events,
@@ -206,7 +220,7 @@ async fn handle_connection(
             }
             Ok(Message::PairRequest { commitment }) => {
                 let result = pairing::respond(
-                    &mut stream,
+                    stream,
                     &options.identity,
                     &peer.peer,
                     peer.nonces,
@@ -230,7 +244,7 @@ async fn handle_connection(
             }
             Ok(other) => {
                 return reject(
-                    &mut stream,
+                    stream,
                     ErrorCode::UnexpectedMessage,
                     format!("unexpected {other:?}"),
                 )
@@ -241,7 +255,7 @@ async fn handle_connection(
                 return Ok(());
             }
             Err(ProtocolError::Json(e)) => {
-                return reject(&mut stream, ErrorCode::BadMessage, e.to_string()).await;
+                return reject(stream, ErrorCode::BadMessage, e.to_string()).await;
             }
             Err(e) => return Err(e.into()),
         }
