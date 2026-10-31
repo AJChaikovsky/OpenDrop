@@ -18,11 +18,28 @@ export interface Me {
   warning: string | null;
 }
 
+/** What a request for one of our shared files adds. */
+export interface FetchDetails {
+  /** The requester's reason, in its own words (may be empty). */
+  reason: string;
+  /** The requester says an AI assistant asked for the file. */
+  via_assistant: boolean;
+}
+
 export type PairStatus = "paired" | "declined" | "declined_by_peer" | "timed_out" | "failed";
 
 export type AppEvent =
   | { kind: "devices"; devices: Device[] }
-  | { kind: "incoming_request"; transfer_id: string; peer_name: string; peer_ip: string; name: string; size: number }
+  | {
+      kind: "incoming_request";
+      transfer_id: string;
+      peer_name: string;
+      peer_ip: string;
+      name: string;
+      size: number;
+      /** Set when the peer asks for one of our shared files instead. */
+      fetch: FetchDetails | null;
+    }
   | { kind: "incoming_expired"; transfer_id: string }
   | { kind: "receive_started"; transfer_id: string; peer_name: string; name: string; size: number }
   | { kind: "receive_progress"; transfer_id: string; bytes: number; size: number; bytes_per_sec: number }

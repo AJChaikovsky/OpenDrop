@@ -24,7 +24,7 @@
 //! before any bytes are written; accepted files land in the download folder.
 
 use super::client::{Connection, FileResult};
-use super::fetch::PendingFetches;
+use super::fetch::{Claim, PendingFetches};
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
 use crate::daemon::{Direction, Status, Transfer, TransferTable};
 use crate::pairing::store::PairedDevices;
@@ -419,6 +419,7 @@ async fn handle_connection(
                     transfer_id,
                     &name,
                     size,
+                    None,
                 )
                 .await?;
             }
@@ -430,23 +431,30 @@ async fn handle_connection(
             }) => {
                 // Only an offer answering a fetch we started skips the prompt;
                 // a wrong device or size falls back to the usual question.
-                let claimed = options
-                    .fetches
-                    .claim(&fetch_id, &peer.peer.id, size, &transfer_id);
+                let (approval, stop) =
+                    match options
+                        .fetches
+                        .claim(&fetch_id, &peer.peer.id, size, &transfer_id)
+                    {
+                        Claim::Ours(stop) => (&Approval::AcceptAll, Some(stop)),
+                        Claim::NotOurs => (approval, None),
+                        Claim::Cancelled => {
+                            println!("[{peer_addr}] refused \"{name}\": that fetch was cancelled");
+                            write_message(stream, &Message::FileDecline { transfer_id }).await?;
+                            return Ok(());
+                        }
+                    };
                 receive_file(
                     stream,
                     download_dir,
-                    if claimed {
-                        &Approval::AcceptAll
-                    } else {
-                        approval
-                    },
+                    approval,
                     events,
                     &peer_name,
                     peer_addr,
                     transfer_id,
                     &name,
                     size,
+                    stop,
                 )
                 .await?;
             }
@@ -550,6 +558,7 @@ async fn receive_file(
     transfer_id: String,
     offered_name: &str,
     size: u64,
+    stop: Option<oneshot::Receiver<()>>,
 ) -> Result<(), BoxError> {
     let Some(name) = sanitize_file_name(offered_name) else {
         return reject(
@@ -600,6 +609,7 @@ async fn receive_file(
         &transfer_id,
         &name,
         size,
+        stop,
     )
     .await;
     emit(match &result {
@@ -618,6 +628,7 @@ async fn receive_file(
 
 /// The accepted half of [`receive_file`]: tell the sender to go ahead, then
 /// stream, verify and save. Returns where the file was saved and its SHA-256.
+#[allow(clippy::too_many_arguments)]
 async fn save_file(
     stream: &mut TcpStream,
     download_dir: &Path,
@@ -626,6 +637,7 @@ async fn save_file(
     transfer_id: &str,
     name: &str,
     size: u64,
+    stop: Option<oneshot::Receiver<()>>,
 ) -> Result<(PathBuf, String), BoxError> {
     let mut part = match PartFile::create(download_dir).await {
         Ok(part) => part,
@@ -647,14 +659,33 @@ async fn save_file(
     .await?;
     println!("[{peer_addr}] receiving \"{name}\" ({size} bytes)");
 
-    // The temp file is deleted if anything below fails.
-    let actual = copy_hashed(stream, part.file(), size, &mut |received| {
+    // The temp file is deleted if anything below fails. Stopping (our
+    // user cancelled the fetch) hangs up on the sender mid-file.
+    let mut on_progress = |received| {
         emit(ReceiveEvent::Progress {
             transfer_id: transfer_id.to_owned(),
             received,
         })
-    })
-    .await?;
+    };
+    let stopped = async move {
+        let stopped = match stop {
+            Some(stop) => stop.await.is_ok(),
+            None => false,
+        };
+        if !stopped {
+            std::future::pending::<()>().await;
+        }
+    };
+    let copied = tokio::select! {
+        actual = copy_hashed(stream, part.file(), size, &mut on_progress) => Some(actual),
+        () = stopped => None,
+    };
+    let Some(actual) = copied else {
+        println!("[{peer_addr}] stopped receiving \"{name}\": cancelled");
+        part.discard().await;
+        return Err("cancelled".into());
+    };
+    let actual = actual?;
     let expected = match next_message(stream).await {
         Ok(Message::FileDone {
             transfer_id: id,

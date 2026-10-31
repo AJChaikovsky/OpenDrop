@@ -12,6 +12,7 @@ pub mod transfers;
 pub use transfers::{Direction, Status, Transfer, TransferTable};
 
 use crate::discovery::{Discovery, Peer};
+use crate::error::{ErrorCode, coded};
 use crate::identity::random_bytes;
 use crate::network::client::{Connection, FileResult};
 use crate::network::fetch::PendingFetches;
@@ -317,11 +318,16 @@ impl Daemon {
             .into_iter()
             .any(|d| d.id == device || d.name.eq_ignore_ascii_case(device));
         Err(if paired {
-            format!("\"{device}\" is paired but not on the network right now")
+            coded(
+                ErrorCode::DeviceOffline,
+                format!("\"{device}\" is paired but not on the network right now"),
+            )
         } else {
-            format!("no device named \"{device}\" on this network")
-        }
-        .into())
+            coded(
+                ErrorCode::UnknownDevice,
+                format!("no device named \"{device}\" on this network"),
+            )
+        })
     }
 
     /// The files `device` shares with us, and whether the list was cut
@@ -423,20 +429,27 @@ fn pick_shared_file(
         .collect();
     match named.as_slice() {
         [file] => Ok((*file).clone()),
-        [] if truncated => Err(format!(
-            "\"{owner}\" shares too many files to list them all and \"{query}\" wasn't among those listed; use its id or path"
-        )
-        .into()),
-        [] => Err(format!("\"{owner}\" doesn't share a file named \"{query}\"").into()),
-        several => Err(format!(
-            "\"{owner}\" shares several files named \"{query}\"; use a path: {}",
-            several
-                .iter()
-                .map(|f| f.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .into()),
+        [] if truncated => Err(coded(
+            ErrorCode::NotShared,
+            format!(
+                "\"{owner}\" shares too many files to list them all and \"{query}\" wasn't among those listed; use its id or path"
+            ),
+        )),
+        [] => Err(coded(
+            ErrorCode::NotShared,
+            format!("\"{owner}\" doesn't share a file named \"{query}\""),
+        )),
+        several => Err(coded(
+            ErrorCode::AmbiguousFile,
+            format!(
+                "\"{owner}\" shares several files named \"{query}\"; use a path: {}",
+                several
+                    .iter()
+                    .map(|f| f.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
     }
 }
 
@@ -453,14 +466,16 @@ struct FetchPlan {
 const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Ask for the file and wait for the owner's answer; once it accepts, the
-/// file arrives at our listener, whose events finish the row.
+/// file arrives at our listener, whose events finish the row. A cancel at
+/// any point stops it: before the answer by hanging up, after it by
+/// refusing the offer or cutting the receive short.
 async fn run_fetch(
     transfers: Arc<TransferTable>,
     fetches: Arc<PendingFetches>,
     mut connection: Connection,
     plan: FetchPlan,
     arrived: oneshot::Receiver<String>,
-    cancelled: oneshot::Receiver<()>,
+    mut cancelled: oneshot::Receiver<()>,
 ) {
     let id = plan.fetch_id.clone();
     let ask = connection.request_fetch(
@@ -472,7 +487,7 @@ async fn run_fetch(
     );
     let answer = tokio::select! {
         answer = ask => answer,
-        _ = cancelled => {
+        _ = &mut cancelled => {
             fetches.forget(&id);
             transfers.finish(&id, Status::Cancelled, None);
             return;
@@ -498,13 +513,28 @@ async fn run_fetch(
         }
     }
     drop(connection);
-    if tokio::time::timeout(OFFER_TIMEOUT, arrived).await.is_err() {
-        fetches.forget(&id);
-        transfers.finish(
-            &id,
-            Status::Failed,
-            Some("approved, but the file never arrived (is a firewall blocking incoming connections?)".into()),
-        );
+    // Marked cancelled before the receive is stopped, so the receive's
+    // failure doesn't overwrite it.
+    let cancel = || {
+        transfers.finish(&id, Status::Cancelled, None);
+        fetches.cancel(&id);
+    };
+    tokio::select! {
+        arrival = tokio::time::timeout(OFFER_TIMEOUT, arrived) => {
+            if arrival.is_err() {
+                fetches.forget(&id);
+                return transfers.finish(
+                    &id,
+                    Status::Failed,
+                    Some("approved, but the file never arrived (is a firewall blocking incoming connections?)".into()),
+                );
+            }
+        }
+        Ok(()) = &mut cancelled => return cancel(),
+    }
+    // Arriving: the table drops our cancel handle once the row ends.
+    if cancelled.await.is_ok() {
+        cancel();
     }
 }
 
