@@ -3,11 +3,14 @@
 //! The library holds all networking logic so the CLI (`main.rs`) today, and the
 //! Tauri desktop app later, can reuse it without changes.
 
+pub mod control;
+pub mod daemon;
 pub mod discovery;
 pub mod identity;
 pub mod network;
 pub mod pairing;
 pub mod protocol;
+pub mod share;
 pub mod transfer;
 
 /// Default TCP port an OpenDrop device listens on.

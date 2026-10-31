@@ -2,6 +2,7 @@
 //! connecting side (`client`). Every device runs both.
 
 pub mod client;
+pub mod fetch;
 pub mod handshake;
 pub mod server;
 
@@ -28,6 +29,9 @@ pub struct PeerIdentity {
     /// Proven during the handshake: the peer holds the matching private key.
     pub public_key: [u8; 32],
 }
+
+#[cfg(test)]
+mod fetch_tests;
 
 #[cfg(test)]
 mod tests {

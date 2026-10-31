@@ -292,3 +292,143 @@ fn damaged_store_is_reported_and_listen_keeps_running() {
         b"\x00garbage{{{"
     );
 }
+
+/// `opendrop transfers` reaches the running `listen` over the control API.
+#[test]
+fn transfers_asks_the_running_listener() {
+    let config = tempfile::tempdir().unwrap();
+    let downloads = tempfile::tempdir().unwrap();
+    let out = run(config.path(), &["transfers"], "");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("start `opendrop listen` first"),
+        "{out:?}"
+    );
+    let listener = Listener::start(config.path(), "Desk", 0, downloads.path());
+    let out = run(config.path(), &["transfers"], "");
+    listener.stop();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "No transfers since the daemon started."
+    );
+}
+
+/// Pseudo-random bytes (xorshift), so a file can't compress or dedupe.
+fn random_bytes(len: usize, mut seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        out.extend_from_slice(&seed.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Two `listen` daemons on one machine, paired: the Mac shares a folder,
+/// the PC runs `opendrop fetch`, the Mac's user approves, and the copy's
+/// SHA-256 equals the original's.
+fn fetch_end_to_end(size: usize) {
+    let root = tempfile::tempdir().unwrap();
+    let (pc_config, mac_config) = (root.path().join("pc"), root.path().join("mac"));
+    let (pc_downloads, mac_downloads) = (root.path().join("pc-dl"), root.path().join("mac-dl"));
+    let shared = root.path().join("Reports");
+    std::fs::create_dir(&shared).unwrap();
+    let content = random_bytes(size, 0x9e37_79b9_7f4a_7c15);
+    std::fs::write(shared.join("random.bin"), &content).unwrap();
+    let expected = opendrop::transfer::sha256_hex(&content);
+    drop(content);
+    let shared_arg = shared.to_str().unwrap();
+    let out = run(&mac_config, &["share", "add", shared_arg], "");
+    assert!(out.status.success(), "{}", text(&out));
+
+    // Pair first (from the PC's config), then start the PC's listener so it
+    // loads the pairing.
+    let mac_port = free_port();
+    let mac_target = format!("127.0.0.1:{mac_port}");
+    let mut mac = Listener::start(&mac_config, "Mac", mac_port, &mac_downloads);
+    let pairing = std::thread::spawn({
+        let pc_config = pc_config.clone();
+        let mac_target = mac_target.clone();
+        move || run(&pc_config, &["pair", &mac_target, "--name", "PC"], "y\n")
+    });
+    mac.wait_for("Pairing code:");
+    mac.answer("y");
+    let paired = pairing.join().unwrap();
+    assert!(paired.status.success(), "{}", text(&paired));
+    mac.wait_for("Paired");
+    let pc = Listener::start(&pc_config, "PC", 0, &pc_downloads);
+
+    let listed = run(&pc_config, &["files", &mac_target], "");
+    assert!(listed.status.success(), "{}", text(&listed));
+    assert!(
+        text(&listed).contains("Reports/random.bin"),
+        "{}",
+        text(&listed)
+    );
+
+    let started = std::time::Instant::now();
+    let fetching = std::thread::spawn({
+        let pc_config = pc_config.clone();
+        move || {
+            run(
+                &pc_config,
+                &[
+                    "fetch",
+                    &mac_target,
+                    "random.bin",
+                    "--reason",
+                    "end-to-end test",
+                ],
+                "",
+            )
+        }
+    });
+    let prompt = mac.wait_for("Fetch request");
+    assert!(prompt.contains("\"PC\""), "{prompt}");
+    assert!(prompt.contains("\"random.bin\""), "{prompt}");
+    mac.wait_for("Reason given: \"end-to-end test\"");
+    mac.answer("y");
+    let fetched = fetching.join().unwrap();
+    let elapsed = started.elapsed();
+    let output = text(&fetched);
+    assert!(fetched.status.success(), "{output}");
+    let copy = pc_downloads.join("random.bin");
+    let actual = opendrop::transfer::sha256_hex(&std::fs::read(&copy).unwrap());
+    println!(
+        "fetched {} bytes in {elapsed:?}; original {expected}, copy {actual}",
+        size
+    );
+    assert_eq!(actual, expected);
+    assert!(output.contains(&expected), "{output}");
+
+    // Both daemons recorded it, done.
+    let transfers = text(&run(&pc_config, &["transfers"], ""));
+    assert!(
+        transfers.contains("Done") && transfers.contains("random.bin"),
+        "{transfers}"
+    );
+    let transfers = text(&run(&mac_config, &["transfers"], ""));
+    assert!(
+        transfers.contains("Done") && transfers.contains("\"random.bin\" to \"PC\""),
+        "{transfers}"
+    );
+    pc.stop();
+    mac.stop();
+}
+
+#[test]
+fn fetch_a_file_end_to_end() {
+    fetch_end_to_end(3 * 1024 * 1024 + 17);
+}
+
+/// Exit gate for issue #11 / #21: a 100 MB random file between two daemons
+/// on one machine. Slow in debug builds:
+/// `cargo test --release --test cli -- --ignored --nocapture fetch_100mb`.
+#[test]
+#[ignore]
+fn fetch_100mb_end_to_end() {
+    fetch_end_to_end(100 * 1024 * 1024);
+}

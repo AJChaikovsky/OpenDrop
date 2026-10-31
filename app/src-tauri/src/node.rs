@@ -5,9 +5,10 @@
 //! Nothing here depends on Tauri, so it is tested on its own; `lib.rs` only
 //! forwards events to the window and commands to the node.
 
+use opendrop::daemon::{self, Daemon, Direction, Status, Transfer};
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
 use opendrop::network::client::{Connection, FileResult};
-use opendrop::network::server::{self, Approval, FileRequest, ReceiveEvent};
+use opendrop::network::server::{Approval, FileRequest, ReceiveEvent};
 use opendrop::network::{BoxError, DeviceIdentity};
 use opendrop::pairing::store::PairedDevices;
 use opendrop::pairing::{PairOutcome, PairPrompt, PairPrompts, PairResult};
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -163,7 +165,9 @@ pub struct Node {
     pub port: u16,
     pub download_dir: PathBuf,
     pub paired: Arc<PairedDevices>,
-    discovery: Option<Discovery>,
+    /// Listener, discovery and the transfer table, shared with the CLI's
+    /// `listen`.
+    pub daemon: Arc<Daemon>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     pending_pairs: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     pair_prompts: PairPrompts,
@@ -188,11 +192,6 @@ impl Node {
         discover: bool,
         sink: EventSink,
     ) -> Result<Arc<Self>, BoxError> {
-        let listener = TcpListener::bind(("0.0.0.0", port))
-            .await
-            .map_err(|e| format!("could not listen on port {port}: {e}"))?;
-        let port = listener.local_addr()?.port();
-
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (requests, request_rx) = mpsc::channel(16);
         let (events, event_rx) = mpsc::unbounded_channel();
@@ -216,29 +215,28 @@ impl Node {
                 results_sink(pair_done(&peer.id, &peer.name, outcome));
             }
         });
-        tokio::spawn(server::serve(
-            listener,
-            server::Options {
-                events: Some(events),
-                paired: Arc::clone(&paired),
-                pair_prompts: Some(pair_prompts.clone()),
-                pair_results: Some(pair_results),
-                ..server::Options::new(
-                    identity.clone(),
-                    download_dir.clone(),
-                    Approval::Ask(requests),
-                )
-            },
-        ));
-
-        let discovery = if discover {
-            Some(Discovery::start(&identity, Some(port))?)
-        } else {
-            None
-        };
+        let daemon = Daemon::start(daemon::Options {
+            port,
+            events: Some(events),
+            paired: Arc::clone(&paired),
+            pair_prompts: Some(pair_prompts.clone()),
+            pair_results: Some(pair_results),
+            discover,
+            ..daemon::Options::new(
+                identity.clone(),
+                download_dir.clone(),
+                Approval::Ask(requests),
+            )
+        })
+        .await?;
+        if let Some(error) = daemon.discovery_error() {
+            return Err(error.into());
+        }
+        let port = daemon.port;
+        let discovery = daemon.discovery();
         // Every change to the nearby or paired devices resends the whole
         // list: it is short, and the UI stays a plain render of the latest.
-        let mut nearby = discovery.as_ref().map(Discovery::subscribe);
+        let mut nearby = discovery.map(Discovery::subscribe);
         let mut pairings = paired.subscribe();
         let list_paired = Arc::clone(&paired);
         let list_sink = sink.clone();
@@ -276,7 +274,7 @@ impl Node {
             port,
             download_dir,
             paired,
-            discovery,
+            daemon,
             pending,
             pending_pairs,
             pair_prompts,
@@ -288,8 +286,8 @@ impl Node {
 
     /// Devices discovered so far.
     pub fn devices(&self) -> Vec<Device> {
-        self.discovery
-            .as_ref()
+        self.daemon
+            .discovery()
             .map_or_else(Vec::new, |d| devices(&d.peers(), &self.paired))
     }
 
@@ -314,8 +312,8 @@ impl Node {
 
     fn addrs_of(&self, device_id: &str) -> Result<Vec<SocketAddr>, BoxError> {
         let peer = self
-            .discovery
-            .as_ref()
+            .daemon
+            .discovery()
             .and_then(|d| d.peers().into_iter().find(|p| p.id == device_id))
             .ok_or("that device is no longer on the network")?;
         Ok(peer.socket_addrs())
@@ -403,8 +401,20 @@ impl Node {
         let mut connection = connect(addrs, &self.identity, &self.paired).await?;
         let ids = files.iter().map(|(_, _, id)| id.clone()).collect();
         let sink = self.sink.clone();
+        let table = Arc::clone(&self.daemon.transfers);
         tokio::spawn(async move {
             for (path, size, id) in files {
+                // The app has no cancel button yet, so the handle goes unused.
+                let _ = table.begin_with_id(
+                    id.clone(),
+                    Transfer::new(
+                        Direction::Send,
+                        Some(connection.peer.id.clone()),
+                        connection.peer.name.clone(),
+                        file_name(&path),
+                        size,
+                    ),
+                );
                 sink(AppEvent::SendWaiting {
                     transfer_id: id.clone(),
                     device_name: connection.peer.name.clone(),
@@ -414,8 +424,13 @@ impl Node {
                 let mut meter = Meter::new(size);
                 let progress_sink = sink.clone();
                 let progress_id = id.clone();
+                let progress_table = Arc::clone(&table);
                 let result = connection
                     .send_file(&path, &mut |sent| {
+                        progress_table.update(&progress_id, |t| {
+                            t.status = Status::Transferring;
+                            t.bytes = sent;
+                        });
                         if let Some(bytes_per_sec) = meter.update(sent) {
                             progress_sink(AppEvent::SendProgress {
                                 transfer_id: progress_id.clone(),
@@ -427,12 +442,23 @@ impl Node {
                     })
                     .await;
                 match result {
-                    Ok(FileResult::Delivered(outcome)) => sink(AppEvent::SendDone {
-                        transfer_id: id,
-                        sha256: outcome.sha256,
-                    }),
-                    Ok(FileResult::Declined) => sink(AppEvent::SendDeclined { transfer_id: id }),
+                    Ok(FileResult::Delivered(outcome)) => {
+                        table.update(&id, |t| {
+                            t.bytes = outcome.size;
+                            t.sha256 = Some(outcome.sha256.clone());
+                            t.status = Status::Done;
+                        });
+                        sink(AppEvent::SendDone {
+                            transfer_id: id,
+                            sha256: outcome.sha256,
+                        })
+                    }
+                    Ok(FileResult::Declined) => {
+                        table.finish(&id, Status::Declined, None);
+                        sink(AppEvent::SendDeclined { transfer_id: id })
+                    }
                     Err(e) => {
+                        table.finish(&id, Status::Failed, Some(e.to_string()));
                         // The connection is unusable now; fail the rest too.
                         sink(AppEvent::SendFailed {
                             transfer_id: id,
@@ -497,6 +523,8 @@ async fn forward_requests(
             name,
             size,
             respond,
+            // The app has no fetch wording yet; it asks as for any file.
+            fetch: _,
         } = request;
         // The server drops its end after APPROVAL_TIMEOUT or if the sender
         // hangs up; we notice by holding a watch on it.

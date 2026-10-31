@@ -106,6 +106,39 @@ Paired devices are stored in `paired-devices.json` next to the key. If that file
 `listen` warns and carries on with nothing paired (leaving the file alone), while `pair`,
 `devices` and `unpair` stop and say which file to fix or delete.
 
+### Sharing and fetching
+
+Instead of sending, a paired device can ask for a file. Nothing is shared until you say so:
+
+```bash
+cargo run -- share add ~/Documents/Reports   # on the owner (share list / share remove too)
+```
+
+Then, on the other device, with its own `listen` running (the file comes back to it):
+
+```bash
+cargo run -- files "AJ's MacBook"                       # what it shares with you
+cargo run -- fetch "AJ's MacBook" q3-report.pdf --reason "for the board deck"
+```
+
+The owner is asked every time, with the reason, and nobody answering within 60 seconds
+declines it:
+
+```text
+? Fetch request: "PC" (192.168.1.177) asks for your shared file "q3-report.pdf" (2.1 MB).
+  Reason given: "for the board deck"
+  Send it? [y/N] (within 60s):
+```
+
+A file can be named by its name, its path in the share (`Reports/2026/q3.pdf`) or its id
+from `files`. Only paired devices can list or fetch; `listen --allow-unpaired-fetch` lifts
+that for local demos. Hidden files, the download folder and anything a symlink would reach
+outside a shared folder are never shared. `--auto-accept` does not approve fetches.
+`opendrop transfers` lists what the running `listen` has sent and received; it and `files` /
+`fetch` reach it over a local socket (named pipe on Windows) only your user can open. If you
+pair with `opendrop pair` while `listen` is running, restart `listen` so it picks the
+pairing up.
+
 Options: `--port PORT` (default 45454), `--name NAME` (defaults to the hostname),
 `--dir DIR` (where `listen` saves files), `--config DIR` (key and paired devices),
 `--auto-accept` (`listen` takes files without
@@ -125,14 +158,18 @@ sending by IP still works.
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices` and `unpair` |
+| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch` and `transfers` |
+| `src/daemon/` | What `listen` and the app run: listener, discovery, transfer table, fetches |
+| `src/control/` | Local control API (Unix socket / named pipe) for the CLI and, later, the MCP server |
+| `src/share/` | Share allowlist, opaque file ids and safe path resolution |
 | `src/lib.rs` | Library root, so the Tauri app can reuse everything later |
 | `src/protocol/` | Message types, versioning, length-prefixed framing |
 | `src/identity.rs` | The device key pair, its file, and the device id derived from it |
 | `src/network/handshake.rs` | Signed handshake: proves each side holds its key |
 | `src/pairing/` | Pairing protocol and 6-digit code; `store.rs` keeps paired devices |
 | `src/network/server.rs` | Accepts connections, one Tokio task per peer |
-| `src/network/client.rs` | `Connection`: connects to a peer, sends texts and files |
+| `src/network/client.rs` | `Connection`: connects to a peer, sends texts and files, lists shares, requests fetches |
+| `src/network/fetch.rs` | Fetches this device started, which decide which offers skip the prompt |
 | `src/discovery/` | mDNS advertising, browsing and the discovered-peer table |
 | `src/transfer/` | Chunked streaming with SHA-256, temp files, safe file names |
 | `app/src-tauri/src/node.rs` | Desktop app backend: receive with approval, send, pair, progress and speed events |
@@ -168,7 +205,13 @@ Keys, nonces and signatures travel as lowercase hex.
 | `file_decline` | server reply to `file_offer`; connection stays open | `transfer_id` |
 | `file_done` | client, after the raw bytes | `transfer_id`, `sha256` (lowercase hex) |
 | `file_received` | server, once verified and saved | `transfer_id`, `received_bytes` |
-| `error` | either, then close | `code` (`unsupported_version`, `unexpected_message`, `bad_message`, `file_rejected`, `checksum_mismatch`, `storage_error`, `identity_mismatch`, `pairing_failed`), `message` |
+| `share_list_request` | requester to owner (paired only) | `query` (optional, matches paths ignoring case) |
+| `share_list` | owner reply | `files: [{file_id, name, path, size, modified}]`, cut to fit one frame, `truncated` |
+| `fetch_request` | requester to owner | `fetch_id`, `file_id`, `reason`, `via_assistant`, `reply_port` |
+| `fetch_accepted` | owner reply, once its user said yes | `fetch_id` |
+| `fetch_declined` | owner reply | `fetch_id`, `reason` (`declined`, `timeout`, `not_shared`, `not_paired`) |
+| `fetch_offer` | owner to requester, on a new connection | like `file_offer`, plus `fetch_id` |
+| `error` | either, then close | `code` (`unsupported_version`, `unexpected_message`, `bad_message`, `file_rejected`, `checksum_mismatch`, `storage_error`, `identity_mismatch`, `pairing_failed`, `not_paired`), `message` |
 
 A peer with a different `version` gets an `unsupported_version` error rather than a parse
 failure. Reads time out after 10 seconds so a stalled peer can't hold a connection open.
@@ -204,6 +247,20 @@ directory parts and unsafe characters from `name` and streams the bytes into a h
 matches `file_done` is the file synced and renamed into place, then confirmed with
 `file_received`. On a mismatch, a dropped connection or a stall, the temp file is deleted.
 Several files (and texts) can be sent over one connection, one after another.
+
+### Fetching
+
+Fetching flips the flow: the device that wants a file asks for it. A paired requester can
+list the owner's shared files (`share_list_request`); files are named by opaque `file_id`s,
+never paths. A `fetch_request` names one id, the requester's stated reason, and the port of
+its own listener. The owner's user is asked (with the reason, and whether an AI assistant
+asked); after 60 seconds without an answer the request is declined with `timeout`. On a yes
+the owner replies `fetch_accepted`, connects back to the requester's address on
+`reply_port`, checks in the handshake that it reached the same device, and sends the file
+with the usual transfer sequence, opening with `fetch_offer` instead of `file_offer`. The
+requester takes a `fetch_offer` without asking only if its `fetch_id`, the sending device and
+the size all match a fetch it started; anything else gets the normal accept prompt. Fetches
+reuse the SHA-256 check and `.part` handling of ordinary transfers.
 
 ## Discovery
 

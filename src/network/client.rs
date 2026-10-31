@@ -3,7 +3,7 @@
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity, handshake};
 use crate::pairing::store::PairedDevices;
 use crate::pairing::{self, PairOutcome, PairPrompts};
-use crate::protocol::{Message, read_message, write_message};
+use crate::protocol::{FetchDeclineReason, Message, SharedFile, read_message, write_message};
 use crate::transfer::{copy_hashed, sanitize_file_name};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -120,6 +120,77 @@ impl Connection {
         path: &Path,
         progress: &mut (dyn FnMut(u64) + Send),
     ) -> Result<FileResult, BoxError> {
+        self.offer(path, None, progress).await
+    }
+
+    /// [`Connection::send_file`] in answer to the peer's fetch `fetch_id`
+    /// (a `fetch_offer`, which the peer takes without asking its user).
+    pub async fn send_fetched(
+        &mut self,
+        path: &Path,
+        fetch_id: &str,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<FileResult, BoxError> {
+        self.offer(path, Some(fetch_id), progress).await
+    }
+
+    /// The files the peer shares with us (if we're paired), and whether the
+    /// list was cut short.
+    pub async fn list_shares(
+        &mut self,
+        query: Option<&str>,
+    ) -> Result<(Vec<SharedFile>, bool), BoxError> {
+        write_message(
+            &mut self.stream,
+            &Message::ShareListRequest {
+                query: query.map(str::to_owned),
+            },
+        )
+        .await?;
+        match recv(&mut self.stream).await? {
+            Message::ShareList { files, truncated } => Ok((files, truncated)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Ask the peer for shared file `file_id`. Waits while its user decides;
+    /// on `Ok(Ok(()))` the file is on its way to our listener on
+    /// `reply_port` as a `fetch_offer` with this `fetch_id`.
+    pub async fn request_fetch(
+        &mut self,
+        fetch_id: &str,
+        file_id: &str,
+        reason: &str,
+        via_assistant: bool,
+        reply_port: u16,
+    ) -> Result<Result<(), FetchDeclineReason>, BoxError> {
+        write_message(
+            &mut self.stream,
+            &Message::FetchRequest {
+                fetch_id: fetch_id.to_owned(),
+                file_id: file_id.to_owned(),
+                reason: reason.to_owned(),
+                via_assistant,
+                reply_port,
+            },
+        )
+        .await?;
+        match recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT).await? {
+            Message::FetchAccepted { fetch_id: id } if id == fetch_id => Ok(Ok(())),
+            Message::FetchDeclined {
+                fetch_id: id,
+                reason,
+            } if id == fetch_id => Ok(Err(reason)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn offer(
+        &mut self,
+        path: &Path,
+        fetch_id: Option<&str>,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<FileResult, BoxError> {
         let mut file = tokio::fs::File::open(path)
             .await
             .map_err(|e| format!("could not open {}: {e}", path.display()))?;
@@ -135,15 +206,20 @@ impl Connection {
             .ok_or_else(|| format!("{} has no usable file name", path.display()))?;
         let transfer_id = new_transfer_id();
 
-        write_message(
-            &mut self.stream,
-            &Message::FileOffer {
+        let offer = match fetch_id {
+            None => Message::FileOffer {
                 transfer_id: transfer_id.clone(),
                 name: name.clone(),
                 size,
             },
-        )
-        .await?;
+            Some(fetch_id) => Message::FetchOffer {
+                transfer_id: transfer_id.clone(),
+                name: name.clone(),
+                size,
+                fetch_id: fetch_id.to_owned(),
+            },
+        };
+        write_message(&mut self.stream, &offer).await?;
         // The receiver may be asking its user, so allow for that on top of
         // the usual network delay.
         match recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT).await? {
