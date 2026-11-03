@@ -301,6 +301,13 @@ fn unexpected(message: Message) -> BoxError {
             error::ErrorCode::NotPaired,
             format!("peer refused (NotPaired): {message}"),
         ),
+        Message::Error {
+            code: ErrorCode::RateLimited,
+            message,
+        } => coded(
+            error::ErrorCode::RateLimited,
+            format!("peer refused (RateLimited): {message}"),
+        ),
         Message::Error { code, message } => format!("peer refused ({code:?}): {message}").into(),
         other => format!("unexpected reply from peer: {other:?}").into(),
     }

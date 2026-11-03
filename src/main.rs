@@ -234,7 +234,11 @@ async fn listen(
         Err(e) => eprintln!("warning: {e}"),
     }
     if allow_unpaired_fetch {
-        println!("Unpaired devices may list and fetch shared files too (--allow-unpaired-fetch).");
+        eprintln!(
+            "WARNING: --allow-unpaired-fetch is on. Any device on this network, verified or not, \
+             can list your shared files and ask for them (you still approve each one). \
+             Use it only for local demos."
+        );
     }
     if auto_accept {
         println!(

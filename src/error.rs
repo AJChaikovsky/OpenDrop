@@ -25,6 +25,8 @@ pub enum ErrorCode {
     UnknownTransfer,
     /// The transfer already ended, so there is nothing to cancel.
     AlreadyFinished,
+    /// The other device refused: too many requests in the last minute.
+    RateLimited,
 }
 
 /// An error carrying an [`ErrorCode`].

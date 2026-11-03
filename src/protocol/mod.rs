@@ -196,6 +196,8 @@ pub enum ErrorCode {
     PairingFailed,
     /// Only paired devices may do this (list shares).
     NotPaired,
+    /// Too many requests of this kind; try again in a minute.
+    RateLimited,
 }
 
 /// Serde for fixed-size byte arrays as lowercase hex strings.

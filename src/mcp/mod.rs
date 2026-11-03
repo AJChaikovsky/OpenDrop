@@ -199,6 +199,7 @@ fn code_name(code: ErrorCode) -> &'static str {
         ErrorCode::AmbiguousFile => "ambiguous_file",
         ErrorCode::UnknownTransfer => "unknown_transfer",
         ErrorCode::AlreadyFinished => "already_finished",
+        ErrorCode::RateLimited => "rate_limited",
     }
 }
 

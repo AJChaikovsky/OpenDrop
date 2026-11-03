@@ -273,3 +273,37 @@ async fn listing_and_fetching_need_pairing_and_a_shared_id() {
     // The connection is still usable afterwards.
     assert_eq!(conn.send_text("still here").await.unwrap(), 10);
 }
+
+/// Issue #28: a device that lists shares too often is refused for a while.
+#[tokio::test]
+async fn listing_too_often_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shares = Shares::new(&tmp.path().join("config"), None);
+    let friend = DeviceIdentity::new("PC");
+    let other = DeviceIdentity::new("Laptop");
+    let owner = node(
+        "Mac",
+        &tmp.path().join("dl"),
+        Some(shares),
+        paired_with(&[&friend, &other]),
+    )
+    .await;
+    let store = paired_with(&[&owner.identity]);
+    let mut conn = client::Connection::open_with(&owner.addr, &friend, &store)
+        .await
+        .unwrap();
+    for _ in 0..limit::LIST_PER_MINUTE {
+        conn.list_shares(None).await.unwrap();
+    }
+    let refused = conn.list_shares(None).await.unwrap_err();
+    assert_eq!(
+        crate::error::code_of(&refused),
+        Some(crate::error::ErrorCode::RateLimited),
+        "{refused}"
+    );
+    // Another paired device isn't affected.
+    let mut conn = client::Connection::open_with(&owner.addr, &other, &store)
+        .await
+        .unwrap();
+    conn.list_shares(None).await.unwrap();
+}

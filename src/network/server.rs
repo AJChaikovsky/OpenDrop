@@ -25,6 +25,7 @@
 
 use super::client::{Connection, FileResult};
 use super::fetch::{Claim, PendingFetches};
+use super::limit::RateLimit;
 use super::secure::SecureStream;
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
 use crate::daemon::{Direction, Status, Transfer, TransferTable};
@@ -138,6 +139,8 @@ pub struct Options {
     pub fetches: Arc<PendingFetches>,
     /// Where to record files we send in answer to fetches, if anywhere.
     pub outgoing: Option<Arc<TransferTable>>,
+    /// How often each device may list our shares.
+    pub list_limit: Arc<RateLimit>,
 }
 
 impl Options {
@@ -154,6 +157,7 @@ impl Options {
             allow_unpaired_fetch: false,
             fetches: Arc::new(PendingFetches::new()),
             outgoing: None,
+            list_limit: Arc::new(RateLimit::listings()),
         }
     }
 }
@@ -477,6 +481,15 @@ async fn handle_connection(
                         stream,
                         ErrorCode::NotPaired,
                         "only paired devices can see shared files".into(),
+                    )
+                    .await;
+                }
+                if !options.list_limit.allow(&peer.peer.id) {
+                    println!("[{peer_addr}] {peer_name} is listing too often; refused");
+                    return reject(
+                        stream,
+                        ErrorCode::RateLimited,
+                        "too many share listings; try again in a minute".into(),
                     )
                     .await;
                 }

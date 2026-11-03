@@ -4,6 +4,7 @@
 pub mod client;
 pub mod fetch;
 pub mod handshake;
+pub mod limit;
 pub mod secure;
 pub mod server;
 
