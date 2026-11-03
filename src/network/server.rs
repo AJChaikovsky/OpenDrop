@@ -656,6 +656,17 @@ async fn receive_file(
 
 /// The accepted half of [`receive_file`]: tell the sender to go ahead, then
 /// stream, verify and save. Returns where the file was saved and its SHA-256.
+/// Resolves when `stop` fires; never, if there's no stop or its sender
+/// went away without firing.
+async fn stop_signal(stop: &mut Option<oneshot::Receiver<()>>) {
+    if let Some(rx) = stop
+        && rx.await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn save_file(
     stream: &mut Secure<'_>,
@@ -695,18 +706,10 @@ async fn save_file(
             received,
         })
     };
-    let stopped = async move {
-        let stopped = match stop {
-            Some(stop) => stop.await.is_ok(),
-            None => false,
-        };
-        if !stopped {
-            std::future::pending::<()>().await;
-        }
-    };
+    let mut stop = stop;
     let copied = tokio::select! {
         actual = copy_hashed(stream, part.file(), size, &mut on_progress) => Some(actual),
-        () = stopped => None,
+        () = stop_signal(&mut stop) => None,
     };
     let Some(actual) = copied else {
         println!("[{peer_addr}] stopped receiving \"{name}\": cancelled");
@@ -729,6 +732,13 @@ async fn save_file(
         }
         Err(e) => return Err(e.into()),
     };
+    // A cancel that came in as the last bytes did still wins: don't keep a
+    // file the user no longer wants.
+    if stop.as_mut().is_some_and(|s| s.try_recv().is_ok()) {
+        println!("[{peer_addr}] stopped receiving \"{name}\": cancelled");
+        part.discard().await;
+        return Err("cancelled".into());
+    }
     if !actual.eq_ignore_ascii_case(&expected) {
         return reject(
             stream,

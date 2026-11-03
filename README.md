@@ -215,7 +215,7 @@ path to the binary (Claude Desktop doesn't search your `PATH`), and restart Clau
 ```
 
 On Windows the command is `"C:\\Users\\you\\.cargo\\bin\\opendrop.exe"`. The tools menu (the
-slider icon under the message box) then lists `opendrop` with five tools.
+slider icon under the message box) then lists `opendrop` with six tools.
 
 **Try it:**
 
@@ -230,11 +230,13 @@ slider icon under the message box) then lists `opendrop` with five tools.
 | `list_shared_files` | What a device shares: `file_id`, name, path in the share, size, type |
 | `request_file` | Asks the owner for one shared file, with a reason; returns a `transfer_id` at once |
 | `get_transfer_status` | `awaiting_approval` → `transferring` → `done` (or `declined`, `failed`, `cancelled`); can wait up to 30 s. When done: the saved path, and small text files or images inline |
+| `send_file` | Sends a file from this computer to a paired device, whose user accepts it as usual; returns a `transfer_id` at once |
 | `cancel_transfer` | Stops a request or a transfer under way |
 
 Errors come back as tool errors with a code the assistant can act on: `daemon_not_running`
 (start `opendrop listen` or the app), `unknown_device`, `device_offline`, `not_paired`,
-`not_shared`, `ambiguous_file`, `unknown_transfer`, `rate_limited`. There is no way to ask for a path: a
+`not_shared`, `ambiguous_file`, `unknown_transfer`, `rate_limited`, and for `send_file`
+`path_not_allowed` (relative, hidden, or OpenDrop's own keys) and `not_a_file`. There is no way to ask for a path: a
 request for anything not in the share list ends in `not_shared` with nothing sent. If you
 start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp --config DIR`.
 
@@ -245,7 +247,7 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 | `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch`, `transfers` and `mcp` |
 | `src/daemon/` | What `listen` and the app run: listener, discovery, transfer table, fetches |
 | `src/control/` | Local control API (Unix socket / named pipe) for the CLI, the app and the MCP server |
-| `src/mcp/` | `opendrop mcp`: the MCP server and its five tools |
+| `src/mcp/` | `opendrop mcp`: the MCP server and its six tools |
 | `src/share/` | Share allowlist, opaque file ids and safe path resolution |
 | `src/lib.rs` | Library root, so the Tauri app can reuse everything later |
 | `src/protocol/` | Message types, versioning, length-prefixed framing |

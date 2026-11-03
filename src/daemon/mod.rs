@@ -273,18 +273,43 @@ impl Daemon {
     /// transfer table. Returns the transfer id at once; the send runs in the
     /// background and can be cancelled through the table.
     pub async fn send_file(&self, addrs: &[SocketAddr], path: &Path) -> Result<String, BoxError> {
-        let meta =
-            std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if !meta.is_file() {
-            return Err(format!("{} is not a file", path.display()).into());
-        }
+        let size = file_size(path)?;
         let connection = connect(addrs, &self.identity, &self.paired).await?;
+        Ok(self.start_send(connection, path, size))
+    }
+
+    /// Send `path` to `device` (id, name or IP[:PORT]), like
+    /// [`send_file`](Self::send_file). With `paired_only`, a device we
+    /// aren't paired with is refused with `not_paired` before anything is
+    /// offered.
+    pub async fn send_to(
+        &self,
+        device: &str,
+        path: &Path,
+        paired_only: bool,
+    ) -> Result<String, BoxError> {
+        let size = file_size(path)?;
+        let addrs = self.addresses_of(device)?;
+        let connection = connect(&addrs, &self.identity, &self.paired).await?;
+        if paired_only && !connection.paired {
+            return Err(coded(
+                ErrorCode::NotPaired,
+                format!(
+                    "\"{}\" isn't paired with this device; pair first",
+                    connection.peer.name
+                ),
+            ));
+        }
+        Ok(self.start_send(connection, path, size))
+    }
+
+    fn start_send(&self, connection: Connection, path: &Path, size: u64) -> String {
         let (id, cancelled) = self.transfers.begin(Transfer::new(
             Direction::Send,
             Some(connection.peer.id.clone()),
             connection.peer.name.clone(),
             file_name(path),
-            meta.len(),
+            size,
         ));
         tokio::spawn(run_send(
             Arc::clone(&self.transfers),
@@ -293,7 +318,7 @@ impl Daemon {
             path.to_owned(),
             cancelled,
         ));
-        Ok(id)
+        id
     }
 
     /// Where `device` can be reached: an IP (default port), IP:PORT, or a
@@ -410,6 +435,16 @@ impl Drop for Daemon {
             control.abort();
         }
     }
+}
+
+/// The size of regular file `path`, or why it can't be sent.
+fn file_size(path: &Path) -> Result<u64, BoxError> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a file", path.display()).into());
+    }
+    Ok(meta.len())
 }
 
 /// The shared file `query` names: its id, its path in the share, or its

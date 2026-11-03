@@ -512,7 +512,8 @@ fn mcp_server_answers_over_stdio() {
             "get_transfer_status",
             "list_devices",
             "list_shared_files",
-            "request_file"
+            "request_file",
+            "send_file"
         ]
     );
 

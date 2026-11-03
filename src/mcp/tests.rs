@@ -150,10 +150,10 @@ pub(super) async fn answer_next(
     request.fetch
 }
 
-/// Issue #22 acceptance: exactly the five tools, each with a valid input
+/// Issue #22 acceptance: exactly the tools (five from #22, plus send_file from #29), each with a valid input
 /// schema and the documented read-only annotations.
 #[tokio::test]
-async fn lists_exactly_five_tools_with_valid_schemas() {
+async fn lists_exactly_six_tools_with_valid_schemas() {
     let rig = rig(b"pdf").await;
     let client = connect(&rig.requester_config).await;
     let tools = client.list_all_tools().await.unwrap();
@@ -167,7 +167,8 @@ async fn lists_exactly_five_tools_with_valid_schemas() {
             "get_transfer_status",
             "list_devices",
             "list_shared_files",
-            "request_file"
+            "request_file",
+            "send_file"
         ]
     );
     for tool in &tools {
@@ -187,7 +188,10 @@ async fn lists_exactly_five_tools_with_valid_schemas() {
             tool.name
         );
         let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
-        let expected = !matches!(tool.name.as_ref(), "request_file" | "cancel_transfer");
+        let expected = !matches!(
+            tool.name.as_ref(),
+            "request_file" | "cancel_transfer" | "send_file"
+        );
         assert_eq!(read_only, Some(expected), "{} read_only_hint", tool.name);
     }
     let required = |name: &str| -> Vec<String> {
@@ -215,6 +219,7 @@ async fn lists_exactly_five_tools_with_valid_schemas() {
             tool.name
         );
     }
+    assert_eq!(required("send_file"), ["path", "peer"]);
     assert_eq!(required("get_transfer_status"), ["transfer_id"]);
     assert_eq!(required("cancel_transfer"), ["transfer_id"]);
     let tools_json = serde_json::to_string(&tools).unwrap();
@@ -695,4 +700,26 @@ async fn scripted_end_to_end_through_mcp() {
     let elapsed = started.elapsed();
     println!("scripted end-to-end took {elapsed:?}");
     assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
+}
+
+/// What the other device's user was asked.
+pub(super) struct Asked {
+    pub name: String,
+    pub verified: bool,
+}
+
+/// Answer the next request (an incoming file or a fetch) and say what it was.
+pub(super) async fn answer_next_request(
+    asked: &mut mpsc::Receiver<FileRequest>,
+    accept: bool,
+) -> Asked {
+    let request = tokio::time::timeout(Duration::from_secs(10), asked.recv())
+        .await
+        .expect("the other device's user was asked")
+        .unwrap();
+    request.respond.send(accept).unwrap();
+    Asked {
+        name: request.name,
+        verified: request.verified,
+    }
 }

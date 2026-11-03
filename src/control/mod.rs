@@ -70,6 +70,15 @@ pub enum Request {
         #[serde(default)]
         via_assistant: bool,
     },
+    /// Send local file `path` to `device`; the receiver approves it as
+    /// usual. Answers at once with the transfer id. With `paired_only`,
+    /// devices we aren't paired with are refused (`not_paired`).
+    Send {
+        device: String,
+        path: std::path::PathBuf,
+        #[serde(default)]
+        paired_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +103,9 @@ pub enum Response {
         truncated: bool,
     },
     FetchStarted {
+        transfer_id: String,
+    },
+    SendStarted {
         transfer_id: String,
     },
     Error {
@@ -143,6 +155,14 @@ pub async fn handle(daemon: &Daemon, request: Request) -> Response {
             via_assistant,
         } => match daemon.fetch(&device, &file, &reason, via_assistant).await {
             Ok(transfer_id) => Response::FetchStarted { transfer_id },
+            Err(e) => failed(&e),
+        },
+        Request::Send {
+            device,
+            path,
+            paired_only,
+        } => match daemon.send_to(&device, &path, paired_only).await {
+            Ok(transfer_id) => Response::SendStarted { transfer_id },
             Err(e) => failed(&e),
         },
     }
