@@ -538,11 +538,33 @@ pub fn mime_of(name: &str) -> &'static str {
 /// Serve MCP on stdin/stdout until the client hangs up. Nothing else may
 /// write to stdout while this runs.
 pub async fn serve_stdio(config_dir: &Path) -> Result<(), crate::network::BoxError> {
+    let input = Traced(tokio::io::stdin());
     let service = OpenDropMcp::for_config_dir(config_dir)
-        .serve(rmcp::transport::stdio())
+        .serve((input, tokio::io::stdout()))
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Stdin that copies each tool call it reads to stderr, which MCP clients
+/// keep as the server's log, so a call that reaches us in an unexpected
+/// shape can be seen as it arrived. Other messages are not logged.
+struct Traced<R>(R);
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Traced<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
+        let read = String::from_utf8_lossy(&buf.filled()[before..]);
+        for line in read.lines().filter(|l| l.contains("\"tools/call\"")) {
+            eprintln!("opendrop mcp received: {line}");
+        }
+        poll
+    }
 }
 
 #[cfg(test)]
