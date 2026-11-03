@@ -16,7 +16,7 @@
 use opendrop::DEFAULT_PORT;
 use opendrop::control::{Client, Request, Response};
 use opendrop::daemon::{self, Daemon, Direction, Status};
-use opendrop::discovery::{Discovery, Peer, PeerEvent};
+use opendrop::discovery::{Discovery, Peer, PeerEvent, same_name};
 use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::server::{Approval, FileRequest};
@@ -694,7 +694,7 @@ fn unpair(me: &Me, target: &str) -> ExitCode {
         .paired
         .list()
         .into_iter()
-        .filter(|d| d.id == target || d.name.eq_ignore_ascii_case(target))
+        .filter(|d| d.id == target || same_name(&d.name, target))
         .collect();
     let device = match matches.as_slice() {
         [device] => device,

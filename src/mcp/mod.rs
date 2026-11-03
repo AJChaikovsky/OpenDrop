@@ -57,7 +57,8 @@ pub struct OpenDropMcp {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeviceArgs {
-    /// The device's id or name, as list_devices shows it (names ignore case).
+    /// The device's id or name, as list_devices shows it (names ignore case
+    /// and apostrophes).
     pub device: String,
     /// Only files whose name contains this text (optional).
     #[serde(default)]

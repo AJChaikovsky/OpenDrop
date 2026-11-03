@@ -11,7 +11,7 @@ pub mod transfers;
 
 pub use transfers::{Direction, Status, Transfer, TransferTable};
 
-use crate::discovery::{Discovery, Peer};
+use crate::discovery::{Discovery, Peer, same_name};
 use crate::error::{ErrorCode, coded};
 use crate::identity::random_bytes;
 use crate::network::client::{Connection, FileResult};
@@ -316,7 +316,7 @@ impl Daemon {
             .paired
             .list()
             .into_iter()
-            .any(|d| d.id == device || d.name.eq_ignore_ascii_case(device));
+            .any(|d| d.id == device || same_name(&d.name, device));
         Err(if paired {
             coded(
                 ErrorCode::DeviceOffline,

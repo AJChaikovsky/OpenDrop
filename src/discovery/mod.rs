@@ -72,8 +72,24 @@ impl Peer {
     /// Whether `query` names this peer: its device id, or its display name
     /// ignoring case.
     pub fn matches(&self, query: &str) -> bool {
-        self.id == query || self.name.eq_ignore_ascii_case(query)
+        self.id == query || same_name(&self.name, query)
     }
+}
+
+/// Whether `a` and `b` name the same device, the way people type names:
+/// ignoring case, spacing and apostrophes, so `AJs macbook air` finds
+/// `AJ’s MacBook Air` (macOS names use the curly ’).
+pub fn same_name(a: &str, b: &str) -> bool {
+    fn key(name: &str) -> String {
+        name.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '’' | '‘' | '`' | '´' | 'ʼ'))
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    key(a) == key(b)
 }
 
 /// A change to the set of discovered peers.
@@ -313,6 +329,21 @@ fn truncate(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_match_however_the_apostrophe_is_typed() {
+        let mac = "AJ’s MacBook Air (2)";
+        for typed in [
+            "AJ’s MacBook Air (2)",
+            "AJ's MacBook Air (2)",
+            "AJs MacBook Air (2)",
+            "aj's  macbook air (2)",
+        ] {
+            assert!(same_name(mac, typed), "{typed}");
+        }
+        assert!(!same_name(mac, "AJ's MacBook Air"));
+        assert!(!same_name(mac, "AJ's MacBook Pro (2)"));
+    }
 
     fn peer(id: &str, name: &str) -> Peer {
         Peer {
