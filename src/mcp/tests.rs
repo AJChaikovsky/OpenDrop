@@ -202,8 +202,19 @@ async fn lists_exactly_five_tools_with_valid_schemas() {
         required
     };
     assert_eq!(required("list_devices"), Vec::<String>::new());
-    assert_eq!(required("list_shared_files"), ["device"]);
-    assert_eq!(required("request_file"), ["device", "file_id", "reason"]);
+    assert_eq!(required("list_shared_files"), ["peer"]);
+    assert_eq!(required("request_file"), ["file_id", "peer", "reason"]);
+    for tool in &tools {
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object);
+        assert!(
+            !properties.is_some_and(|p| p.contains_key("device")),
+            "{}: Claude Desktop's remote-devices relay removes a `device` argument",
+            tool.name
+        );
+    }
     assert_eq!(required("get_transfer_status"), ["transfer_id"]);
     assert_eq!(required("cancel_transfer"), ["transfer_id"]);
     let tools_json = serde_json::to_string(&tools).unwrap();
@@ -238,7 +249,7 @@ async fn each_tool_returns_the_documented_shape() {
         &call(
             &client,
             "list_shared_files",
-            json!({"device": rig.owner_address()}),
+            json!({"peer": rig.owner_address()}),
         )
         .await,
     );
@@ -262,7 +273,7 @@ async fn each_tool_returns_the_documented_shape() {
         &call(
             &client,
             "list_shared_files",
-            json!({"device": rig.owner_address(), "query": "q3"}),
+            json!({"peer": rig.owner_address(), "query": "q3"}),
         )
         .await,
     );
@@ -341,7 +352,7 @@ async fn each_tool_returns_the_documented_shape() {
             &call(
                 &client,
                 "request_file",
-                json!({"device": rig.owner_address(), "file_id": file["file_id"], "reason": "test"}),
+                json!({"peer": rig.owner_address(), "file_id": file["file_id"], "reason": "test"}),
             )
             .await,
         )["transfer_id"]
@@ -380,7 +391,7 @@ async fn each_tool_returns_the_documented_shape() {
         &call(
             &client,
             "request_file",
-            json!({"device": rig.owner_address(), "file_id": notes["file_id"], "reason": "x"}),
+            json!({"peer": rig.owner_address(), "file_id": notes["file_id"], "reason": "x"}),
         )
         .await,
     )["transfer_id"]
@@ -399,9 +410,12 @@ async fn failures_are_tool_errors_not_crashes() {
     let client = connect(&rig.requester_config).await;
     let owner = rig.owner_address();
 
+    let unknown = call(&client, "list_shared_files", json!({"peer": "Nobody"})).await;
+    assert_eq!(error_code(&unknown), "unknown_device");
+    // The old argument name still works.
     let unknown = call(&client, "list_shared_files", json!({"device": "Nobody"})).await;
     assert_eq!(error_code(&unknown), "unknown_device");
-    let offline = call(&client, "list_shared_files", json!({"device": "Mac"})).await;
+    let offline = call(&client, "list_shared_files", json!({"peer": "Mac"})).await;
     assert_eq!(error_code(&offline), "device_offline");
 
     for file_id in [
@@ -413,7 +427,7 @@ async fn failures_are_tool_errors_not_crashes() {
         let refused = call(
             &client,
             "request_file",
-            json!({"device": owner, "file_id": file_id, "reason": "x"}),
+            json!({"peer": owner, "file_id": file_id, "reason": "x"}),
         )
         .await;
         assert_eq!(error_code(&refused), "not_shared", "{file_id}");
@@ -441,7 +455,7 @@ async fn failures_are_tool_errors_not_crashes() {
 
     // Missing arguments are refused by the server, which stays up.
     let mut params = CallToolRequestParams::new("request_file");
-    params = params.with_arguments(json!({"device": owner}).as_object().unwrap().clone());
+    params = params.with_arguments(json!({"peer": owner}).as_object().unwrap().clone());
     match client.call_tool(params).await {
         Err(_) => {}
         Ok(result) => assert_eq!(result.is_error, Some(true), "{result:?}"),
@@ -463,12 +477,12 @@ async fn failures_are_tool_errors_not_crashes() {
     .await
     .unwrap();
     let stranger = connect(&stranger_config).await;
-    let refused = call(&stranger, "list_shared_files", json!({"device": owner})).await;
+    let refused = call(&stranger, "list_shared_files", json!({"peer": owner})).await;
     assert_eq!(error_code(&refused), "not_paired");
     let refused = call(
         &stranger,
         "request_file",
-        json!({"device": owner, "file_id": "notes.txt", "reason": "x"}),
+        json!({"peer": owner, "file_id": "notes.txt", "reason": "x"}),
     )
     .await;
     assert_eq!(error_code(&refused), "not_paired");
@@ -533,7 +547,7 @@ async fn file_id_of(client: &McpClient, rig: &Rig, name: &str) -> String {
         &call(
             client,
             "list_shared_files",
-            json!({"device": rig.owner_address()}),
+            json!({"peer": rig.owner_address()}),
         )
         .await,
     );
@@ -553,7 +567,7 @@ async fn request(client: &McpClient, rig: &Rig, file_id: &str) -> String {
         &call(
             client,
             "request_file",
-            json!({"device": rig.owner_address(), "file_id": file_id, "reason": "e2e"}),
+            json!({"peer": rig.owner_address(), "file_id": file_id, "reason": "e2e"}),
         )
         .await,
     );

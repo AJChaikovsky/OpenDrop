@@ -40,8 +40,8 @@ const POLL: Duration = Duration::from_millis(200);
 
 const INSTRUCTIONS: &str = "\
 OpenDrop gets files from the user's other devices on the same network \
-(laptops, desktops). Typical flow: list_devices -> list_shared_files(device) -> \
-request_file(device, file_id, reason) -> get_transfer_status(transfer_id) until \
+(laptops, desktops). Typical flow: list_devices -> list_shared_files(peer) -> \
+request_file(peer, file_id, reason) -> get_transfer_status(transfer_id) until \
 the state is done, declined, failed or cancelled. The device's owner approves \
 every request on that device, so a request can wait up to 60 seconds. Only \
 files the owner chose to share can be listed or requested; there is no way to \
@@ -55,11 +55,15 @@ pub struct OpenDropMcp {
     tool_router: ToolRouter<Self>,
 }
 
+/// Tool arguments name the device `peer`, not `device`: Claude Desktop's
+/// remote-devices relay takes a `device` argument for itself and removes it
+/// before the call reaches us. `device` is still accepted.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeviceArgs {
     /// The device's id or name, as list_devices shows it (names ignore case
     /// and apostrophes).
-    pub device: String,
+    #[serde(alias = "device")]
+    pub peer: String,
     /// Only files whose name contains this text (optional).
     #[serde(default)]
     pub query: Option<String>,
@@ -68,7 +72,8 @@ pub struct DeviceArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestFileArgs {
     /// The device's id or name, as list_devices shows it.
-    pub device: String,
+    #[serde(alias = "device")]
+    pub peer: String,
     /// The file_id from list_shared_files.
     pub file_id: String,
     /// One sentence the owner sees when approving, saying why you want the
@@ -303,7 +308,7 @@ impl OpenDropMcp {
         Parameters(args): Parameters<DeviceArgs>,
     ) -> CallToolResult {
         let request = Request::ListShares {
-            device: args.device,
+            device: args.peer,
             query: args.query.filter(|q| !q.is_empty()),
         };
         match self.call(request).await {
@@ -339,7 +344,7 @@ impl OpenDropMcp {
         Parameters(args): Parameters<RequestFileArgs>,
     ) -> CallToolResult {
         let request = Request::Fetch {
-            device: args.device,
+            device: args.peer,
             file: args.file_id,
             reason: args.reason,
             via_assistant: true,
