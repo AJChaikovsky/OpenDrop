@@ -24,6 +24,9 @@ export interface FetchDetails {
   reason: string;
   /** The requester says an AI assistant asked for the file. */
   via_assistant: boolean;
+  /** The folder the user may let this device fetch from for 10 minutes
+   * without asking, along with a yes. */
+  grant_folder: string | null;
 }
 
 export type PairStatus = "paired" | "declined" | "declined_by_peer" | "timed_out" | "failed";

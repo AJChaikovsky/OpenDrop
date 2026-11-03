@@ -8,6 +8,7 @@
 use opendrop::daemon::{self, Daemon, Direction, Status, Transfer};
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
 use opendrop::network::client::{Connection, FileResult};
+use opendrop::network::grants::GrantOffer;
 use opendrop::network::server::{Approval, FileRequest, ReceiveEvent};
 use opendrop::network::{BoxError, DeviceIdentity};
 use opendrop::pairing::store::PairedDevices;
@@ -77,6 +78,9 @@ pub struct FetchDetails {
     pub reason: String,
     /// The requester says an AI assistant asked for the file.
     pub via_assistant: bool,
+    /// The folder the user may let this device fetch from for 10 minutes
+    /// without asking, along with a yes.
+    pub grant_folder: Option<String>,
 }
 
 /// Everything the UI needs to hear about. Serialized as
@@ -183,6 +187,8 @@ pub struct Node {
     /// `listen`.
     pub daemon: Arc<Daemon>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    /// Folder grants the open fetch requests offer.
+    grant_offers: Arc<Mutex<HashMap<String, GrantOffer>>>,
     pending_pairs: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     pair_prompts: PairPrompts,
     sink: EventSink,
@@ -226,11 +232,13 @@ impl Node {
             .as_deref()
             .map(|config| Arc::new(Shares::new(config, Some(&download_dir))));
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let grant_offers = Arc::new(Mutex::new(HashMap::new()));
         let (requests, request_rx) = mpsc::channel(16);
         let (events, event_rx) = mpsc::unbounded_channel();
         tokio::spawn(forward_requests(
             request_rx,
             Arc::clone(&pending),
+            Arc::clone(&grant_offers),
             sink.clone(),
         ));
         tokio::spawn(forward_receive_events(event_rx, sink.clone()));
@@ -311,6 +319,7 @@ impl Node {
             paired,
             daemon,
             pending,
+            grant_offers,
             pending_pairs,
             pair_prompts,
             sink,
@@ -326,11 +335,23 @@ impl Node {
             .map_or_else(Vec::new, |d| devices(&d.peers(), &self.paired))
     }
 
-    /// Answer an [`AppEvent::IncomingRequest`]. Returns false if it had
-    /// already expired or been answered.
-    pub fn respond(&self, transfer_id: &str, accept: bool) -> bool {
+    /// Answer an [`AppEvent::IncomingRequest`]. With `allow_folder`, a yes
+    /// to a fetch also lets that device fetch from the file's folder for 10
+    /// minutes without asking. Returns false if it had already expired or
+    /// been answered.
+    pub fn respond(&self, transfer_id: &str, accept: bool, allow_folder: bool) -> bool {
         let respond = self.pending.lock().unwrap().remove(transfer_id);
-        respond.is_some_and(|r| r.send(accept).is_ok())
+        let offer = self.grant_offers.lock().unwrap().remove(transfer_id);
+        let Some(respond) = respond else {
+            return false;
+        };
+        if accept
+            && allow_folder
+            && let Some(offer) = offer
+        {
+            offer.accept();
+        }
+        respond.send(accept).is_ok()
     }
 
     /// Send `paths` to the discovered device `device_id`, one after another
@@ -548,6 +569,7 @@ async fn connect(
 async fn forward_requests(
     mut requests: mpsc::Receiver<FileRequest>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    grant_offers: Arc<Mutex<HashMap<String, GrantOffer>>>,
     sink: EventSink,
 ) {
     while let Some(request) = requests.recv().await {
@@ -561,6 +583,14 @@ async fn forward_requests(
             respond,
             fetch,
         } = request;
+        let grant = fetch.as_ref().and_then(|f| f.grant.clone());
+        let grant_folder = grant.as_ref().map(|g| g.folder.display().to_string());
+        if let Some(grant) = grant {
+            grant_offers
+                .lock()
+                .unwrap()
+                .insert(transfer_id.clone(), grant);
+        }
         // The server drops its end after APPROVAL_TIMEOUT or if the sender
         // hangs up; we notice by holding a watch on it.
         let (guard_tx, guard_rx) = oneshot::channel::<bool>();
@@ -578,9 +608,11 @@ async fn forward_requests(
             fetch: fetch.map(|f| FetchDetails {
                 reason: f.reason,
                 via_assistant: f.via_assistant,
+                grant_folder,
             }),
         });
         let pending = Arc::clone(&pending);
+        let grant_offers = Arc::clone(&grant_offers);
         let sink = sink.clone();
         tokio::spawn(async move {
             let mut respond = respond;
@@ -590,6 +622,7 @@ async fn forward_requests(
                 }
                 _ = respond.closed() => {
                     pending.lock().unwrap().remove(&transfer_id);
+                    grant_offers.lock().unwrap().remove(&transfer_id);
                     sink(AppEvent::IncomingExpired { transfer_id });
                 }
             }
@@ -882,9 +915,11 @@ mod tests {
             &Some(FetchDetails {
                 reason: "To summarize your notes".into(),
                 via_assistant: true,
+                grant_folder: Some(docs.canonicalize().unwrap().display().to_string()),
             })
         );
-        assert!(owner.respond(transfer_id, true));
+        // Yes, and let it fetch from that folder for 10 minutes.
+        assert!(owner.respond(transfer_id, true, true));
 
         let mut row = None;
         for _ in 0..500 {
@@ -897,6 +932,35 @@ mod tests {
         let row = row.expect("fetch finished");
         assert_eq!(row.status, Status::Done, "{row:?}");
         assert_eq!(row.sha256.as_deref(), Some(sha256_hex(&content).as_str()));
+
+        // The grant covers a second fetch from the folder: no prompt.
+        let again = requester
+            .fetch(
+                &format!("127.0.0.1:{}", owner.port),
+                "notes.txt",
+                "Again",
+                true,
+            )
+            .await
+            .unwrap();
+        let mut row = None;
+        for _ in 0..500 {
+            row = requester
+                .transfers
+                .get(&again)
+                .filter(|t| t.status.is_final());
+            if row.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(row.expect("second fetch finished").status, Status::Done);
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::IncomingRequest { .. }),
+                "asked again despite the grant: {event:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -939,9 +1003,9 @@ mod tests {
             ("Sender", "photo.jpg", content.len() as u64)
         );
         assert!(std::fs::read_dir(dest.path()).unwrap().next().is_none());
-        assert!(receiver.respond(transfer_id, true));
+        assert!(receiver.respond(transfer_id, true, false));
         assert!(
-            !receiver.respond(transfer_id, true),
+            !receiver.respond(transfer_id, true, false),
             "answering twice must not work"
         );
 
@@ -1015,7 +1079,7 @@ mod tests {
         let AppEvent::IncomingRequest { transfer_id, .. } = &asked[0] else {
             panic!()
         };
-        assert!(receiver.respond(transfer_id, false));
+        assert!(receiver.respond(transfer_id, false, false));
 
         let slog = until(&mut sent, |e| {
             matches!(e, AppEvent::SendDeclined { .. } | AppEvent::SendDone { .. })

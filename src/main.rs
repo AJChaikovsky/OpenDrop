@@ -869,9 +869,9 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
-            let (question, limit, mut respond) = tokio::select! {
+            let (question, limit, mut respond, grant) = tokio::select! {
                 Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, .. }) = files.recv() => (
-                    format!("{}{}", if verified { "" } else { "[unverified device] " }, match fetch {
+                    format!("{}{}", if verified { "" } else { "[unverified device] " }, match &fetch {
                         None => format!(
                             "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
                             peer_addr.ip(),
@@ -891,6 +891,7 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                     }),
                     APPROVAL_TIMEOUT,
                     respond,
+                    fetch.and_then(|f| f.grant),
                 ),
                 Some(PairPrompt { peer, code, incoming, respond }) = pairs.recv() => (
                     format!(
@@ -904,13 +905,21 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                     ),
                     PAIRING_TIMEOUT,
                     respond,
+                    None,
                 ),
                 else => break,
             };
             if respond.is_closed() {
                 continue; // Timed out or the sender hung up while queued.
             }
-            print!("\n? {question} [y/N] (within {}s): ", limit.as_secs());
+            match &grant {
+                Some(grant) => print!(
+                    "\n? {question} [y/N/a] (within {}s; a = yes, and let it fetch from {} for 10 minutes without asking): ",
+                    limit.as_secs(),
+                    grant.folder.display()
+                ),
+                None => print!("\n? {question} [y/N] (within {}s): ", limit.as_secs()),
+            }
             let _ = std::io::stdout().flush();
             let answer = tokio::select! {
                 line = lines.next_line() => line.ok().flatten(),
@@ -919,7 +928,17 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                     continue;
                 }
             };
-            let _ = respond.send(is_yes(answer));
+            let always = answer
+                .as_deref()
+                .is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "a" | "always"));
+            if let Some(grant) = grant.filter(|_| always) {
+                grant.accept();
+                println!(
+                    "  For 10 minutes, it can fetch from {} without asking.",
+                    grant.folder.display()
+                );
+            }
+            let _ = respond.send(always || is_yes(answer));
         }
     });
     (file_requests, pair_requests)

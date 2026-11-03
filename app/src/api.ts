@@ -16,7 +16,9 @@ export interface Api {
   me(): Promise<Me>;
   devices(): Promise<Device[]>;
   sendFiles(target: { deviceId?: string; address?: string }, paths: string[]): Promise<string[]>;
-  respond(transferId: string, accept: boolean): Promise<boolean>;
+  /** `allowFolder`: with a yes to a fetch, let that device fetch from the
+   * file's folder for 10 minutes without asking. */
+  respond(transferId: string, accept: boolean, allowFolder?: boolean): Promise<boolean>;
   pairDevice(deviceId: string): Promise<void>;
   respondPair(pairId: string, accept: boolean): Promise<boolean>;
   unpairDevice(deviceId: string): Promise<boolean>;
@@ -30,7 +32,8 @@ export const tauriApi: Api = {
   devices: () => invoke("devices"),
   sendFiles: (target, paths) =>
     invoke("send_files", { deviceId: target.deviceId ?? null, address: target.address ?? null, paths }),
-  respond: (transferId, accept) => invoke("respond", { transferId, accept }),
+  respond: (transferId, accept, allowFolder) =>
+    invoke("respond", { transferId, accept, allowFolder: allowFolder ?? false }),
   pairDevice: (deviceId) => invoke("pair_device", { deviceId }),
   respondPair: (pairId, accept) => invoke("respond_pair", { pairId, accept }),
   unpairDevice: (deviceId) => invoke("unpair_device", { deviceId }),

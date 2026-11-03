@@ -80,14 +80,19 @@ describe("App", () => {
     expect(dialog).toHaveTextContent("report.pdf");
     expect(dialog).toHaveTextContent("2.1 MB");
     await userEvent.click(within(dialog).getByRole("button", { name: "Accept" }));
-    expect(api.respond).toHaveBeenCalledWith("t1", true);
+    expect(api.respond).toHaveBeenCalledWith("t1", true, false);
     // The next request takes its place.
     await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Decline" }));
-    expect(api.respond).toHaveBeenCalledWith("t2", false);
+    expect(api.respond).toHaveBeenCalledWith("t2", false, false);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  const fetchRequest = (transfer_id: string, reason: string, via_assistant: boolean): AppEvent => ({
+  const fetchRequest = (
+    transfer_id: string,
+    reason: string,
+    via_assistant: boolean,
+    grant_folder: string | null = null,
+  ): AppEvent => ({
     kind: "incoming_request",
     transfer_id,
     peer_name: "AJ-PC",
@@ -95,7 +100,31 @@ describe("App", () => {
     verified: true,
     name: "q3-report.pdf",
     size: 2_100_000,
-    fetch: { reason, via_assistant },
+    fetch: { reason, via_assistant, grant_folder },
+  });
+
+  it("can approve a file request with a 10-minute grant for its folder", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("button", { name: /AJ-PC/ });
+    emit(fetchRequest("g1", "why", true, "/Users/aj/Reports"));
+    let dialog = screen.getByRole("dialog", { name: "File request" });
+    const grant = within(dialog).getByRole("checkbox", {
+      name: "Also let AJ-PC fetch from /Users/aj/Reports for 10 minutes without asking",
+    });
+    expect(grant).not.toBeChecked();
+    await userEvent.click(grant);
+    await userEvent.click(within(dialog).getByRole("button", { name: "Approve" }));
+    expect(api.respond).toHaveBeenCalledWith("g1", true, true);
+    // Ticking it and then declining grants nothing.
+    emit(fetchRequest("g2", "why", true, "/Users/aj/Reports"));
+    dialog = screen.getByRole("dialog", { name: "File request" });
+    await userEvent.click(within(dialog).getByRole("checkbox"));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Decline" }));
+    expect(api.respond).toHaveBeenCalledWith("g2", false, false);
+    // No folder offered (an incoming file): no checkbox.
+    emit(fetchRequest("g3", "why", true));
+    expect(within(screen.getByRole("dialog")).queryByRole("checkbox")).not.toBeInTheDocument();
   });
 
   it("shows who asks for a shared file, the file, that an assistant asked and why", async () => {
@@ -111,7 +140,7 @@ describe("App", () => {
     expect(dialog).toHaveTextContent("Reason given: “To summarize the Q3 numbers you asked about”");
     expect(dialog).toHaveTextContent("Declines automatically in 60s");
     await userEvent.click(within(dialog).getByRole("button", { name: "Approve" }));
-    expect(api.respond).toHaveBeenCalledWith("f1", true);
+    expect(api.respond).toHaveBeenCalledWith("f1", true, false);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -124,7 +153,7 @@ describe("App", () => {
     expect(within(dialog).queryByRole("note")).not.toBeInTheDocument();
     expect(dialog).toHaveTextContent("No reason given.");
     await userEvent.click(within(dialog).getByRole("button", { name: "Decline" }));
-    expect(api.respond).toHaveBeenCalledWith("f2", false);
+    expect(api.respond).toHaveBeenCalledWith("f2", false, false);
     expect(api.respond).toHaveBeenCalledTimes(1);
   });
 
@@ -139,7 +168,7 @@ describe("App", () => {
       expect(screen.getByRole("dialog")).toHaveTextContent("Declines automatically in 1s");
       expect(api.respond).not.toHaveBeenCalled();
       act(() => vi.advanceTimersByTime(1_000));
-      expect(api.respond).toHaveBeenCalledWith("f3", false);
+      expect(api.respond).toHaveBeenCalledWith("f3", false, false);
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     } finally {
       vi.useRealTimers();

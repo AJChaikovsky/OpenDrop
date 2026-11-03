@@ -54,9 +54,9 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     send(target, await api.pickFiles());
   };
 
-  const answer = (request: IncomingRequest, accept: boolean) => {
+  const answer = (request: IncomingRequest, accept: boolean, allowFolder = false) => {
     dispatch({ kind: "answered", transfer_id: request.transfer_id });
-    api.respond(request.transfer_id, accept);
+    api.respond(request.transfer_id, accept, accept && allowFolder);
   };
 
   const pair = async (device: Device) => {
@@ -318,9 +318,10 @@ function RequestDialog({
   onAnswer,
 }: {
   request: IncomingRequest;
-  onAnswer: (request: IncomingRequest, accept: boolean) => void;
+  onAnswer: (request: IncomingRequest, accept: boolean, allowFolder?: boolean) => void;
 }) {
   const [left, setLeft] = useState(ANSWER_SECONDS);
+  const [allowFolder, setAllowFolder] = useState(false);
   useEffect(() => {
     const timer = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(timer);
@@ -359,10 +360,16 @@ function RequestDialog({
             )}
           </p>
         )}
+        {fetch?.grant_folder && (
+          <label className="grant">
+            <input type="checkbox" checked={allowFolder} onChange={(e) => setAllowFolder(e.target.checked)} />
+            Also let {request.peer_name} fetch from {fetch.grant_folder} for 10 minutes without asking
+          </label>
+        )}
         <p className="countdown">Declines automatically in {left}s</p>
         <div className="actions">
           <button onClick={() => onAnswer(request, false)}>Decline</button>
-          <button className="primary" onClick={() => onAnswer(request, true)} autoFocus>
+          <button className="primary" onClick={() => onAnswer(request, true, allowFolder)} autoFocus>
             {fetch ? "Approve" : "Accept"}
           </button>
         </div>

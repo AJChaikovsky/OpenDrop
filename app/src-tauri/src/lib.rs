@@ -67,8 +67,13 @@ async fn send_files(
 }
 
 #[tauri::command]
-fn respond(node: State<'_, Arc<Node>>, transfer_id: String, accept: bool) -> bool {
-    node.respond(&transfer_id, accept)
+fn respond(
+    node: State<'_, Arc<Node>>,
+    transfer_id: String,
+    accept: bool,
+    allow_folder: Option<bool>,
+) -> bool {
+    node.respond(&transfer_id, accept, allow_folder.unwrap_or(false))
 }
 
 /// Start pairing with a discovered device; the codes arrive as events.

@@ -25,6 +25,7 @@
 
 use super::client::{Connection, FileResult};
 use super::fetch::{Claim, PendingFetches};
+use super::grants::{GrantOffer, Grants};
 use super::limit::RateLimit;
 use super::secure::SecureStream;
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
@@ -77,6 +78,9 @@ pub struct FetchInfo {
     pub reason: String,
     /// The requester says an AI assistant asked for the file.
     pub via_assistant: bool,
+    /// A grant the user can give along with a yes: this device may fetch
+    /// from this file's folder for 10 minutes without asking.
+    pub grant: Option<GrantOffer>,
 }
 
 /// What happens to an accepted file, for a UI that shows incoming transfers.
@@ -141,6 +145,8 @@ pub struct Options {
     pub outgoing: Option<Arc<TransferTable>>,
     /// How often each device may list our shares.
     pub list_limit: Arc<RateLimit>,
+    /// Folders devices may fetch from for a while without asking.
+    pub grants: Arc<Grants>,
 }
 
 impl Options {
@@ -158,6 +164,7 @@ impl Options {
             fetches: Arc::new(PendingFetches::new()),
             outgoing: None,
             list_limit: Arc::new(RateLimit::listings()),
+            grants: Arc::new(Grants::new()),
         }
     }
 }
@@ -250,7 +257,16 @@ async fn serve_fetch(
     let file = resolved.file.clone();
     // Sending a file away always takes an explicit yes: auto-accept is
     // about files coming in, so it doesn't approve fetches.
+    let granted = options.grants.covers(&peer.peer.id, &resolved.disk_path);
     let answer = match &options.approval {
+        // A folder grant the user gave this device earlier answers for them.
+        _ if granted => {
+            println!(
+                "[{peer_addr}] \"{peer_name}\" fetches \"{}\" under a folder grant",
+                file.name
+            );
+            Ok(())
+        }
         Approval::AcceptAll => Err(FetchDeclineReason::Declined),
         Approval::Ask(requests) => {
             let (respond, decision) = oneshot::channel();
@@ -266,6 +282,13 @@ async fn serve_fetch(
                     peer_id: peer.peer.id.clone(),
                     reason: request.reason.clone(),
                     via_assistant: request.via_assistant,
+                    grant: resolved.disk_path.parent().map(|folder| {
+                        GrantOffer::new(
+                            Arc::clone(&options.grants),
+                            peer.peer.id.clone(),
+                            folder.to_owned(),
+                        )
+                    }),
                 }),
             };
             if requests.send(ask).await.is_err() {

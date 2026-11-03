@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod fetch;
+pub mod grants;
 pub mod handshake;
 pub mod limit;
 pub mod secure;

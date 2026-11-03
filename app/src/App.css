@@ -85,6 +85,7 @@ input, button { font: inherit; }
 .dialog .file span { font-weight: 400; color: var(--muted); font-size: 14px; margin-left: 6px; }
 .dialog .assistant { color: var(--accent); font-weight: 600; font-size: 14px; }
 .dialog .unverified { color: var(--bad); font-weight: 600; font-size: 14px; }
+.dialog .grant { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; overflow-wrap: anywhere; }
 .dialog .reason { font-size: 14px; overflow-wrap: anywhere; }
 .dialog .code { font-size: 34px; font-weight: 700; letter-spacing: 0.12em; text-align: center; margin: 12px 0; font-variant-numeric: tabular-nums; }
 .actions button:disabled { opacity: 0.6; }
