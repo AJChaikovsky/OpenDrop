@@ -190,9 +190,12 @@ fetched files arrive through it, in `Downloads/OpenDrop`.
 Claude Code:
 
 ```bash
-claude mcp add opendrop -- opendrop mcp
+claude mcp add --scope user opendrop -- opendrop mcp
 claude mcp list               # opendrop: opendrop mcp - ✓ Connected
 ```
+
+`--scope user` makes it available in every folder; without it, Claude Code only offers the
+server in the folder where you ran the command.
 
 Claude Desktop: open **Settings → Developer → Edit Config** (the file is
 `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
