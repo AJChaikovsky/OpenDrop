@@ -51,6 +51,8 @@ USAGE:
     opendrop devices [--wait SECONDS] list nearby and paired devices
     opendrop unpair <DEVICE>          forget a paired device
     opendrop transfers                transfers seen by the running `listen`
+    opendrop audit                    what other devices listed, asked for and were
+                                    given or refused, and what you sent
     opendrop share add <PATH>         let paired devices ask for files in PATH
     opendrop share list               what is shared, with file ids
     opendrop share remove <PATH>      stop sharing PATH
@@ -145,6 +147,7 @@ async fn main() -> ExitCode {
         ["pair", target] => pair(&me, target, wait).await,
         ["devices"] => devices(&me, wait).await,
         ["transfers"] => transfers(&me).await,
+        ["audit"] => audit(&me),
         ["mcp"] => mcp(&me).await,
         ["share", "add", path] => share_add(&me, &download_dir, path),
         ["share", "list"] => share_list(&me, &download_dir),
@@ -191,6 +194,7 @@ async fn listen(
         port,
         paired: Arc::clone(&paired),
         pair_prompts: Some(pair_prompts),
+        audit: Arc::new(opendrop::audit::AuditLog::open(&config_dir)),
         control: Some(config_dir),
         shares: Some(Arc::clone(&shares)),
         allow_unpaired_fetch,
@@ -234,7 +238,11 @@ async fn listen(
         Err(e) => eprintln!("warning: {e}"),
     }
     if allow_unpaired_fetch {
-        println!("Unpaired devices may list and fetch shared files too (--allow-unpaired-fetch).");
+        eprintln!(
+            "WARNING: --allow-unpaired-fetch is on. Any device on this network, verified or not, \
+             can list your shared files and ask for them (you still approve each one). \
+             Use it only for local demos."
+        );
     }
     if auto_accept {
         println!(
@@ -649,6 +657,53 @@ async fn mcp(me: &Me) -> ExitCode {
     }
 }
 
+/// The audit log: lists, requests, decisions, grants and sends.
+fn audit(me: &Me) -> ExitCode {
+    let path = me.config_dir.join(opendrop::audit::FILE_NAME);
+    let entries = match opendrop::audit::read(&path) {
+        Ok(entries) => entries,
+        Err(e) => return fail(&format!("cannot read {}: {e}", path.display())),
+    };
+    if entries.is_empty() {
+        println!("Nothing recorded yet ({}).", path.display());
+        return ExitCode::SUCCESS;
+    }
+    for e in &entries {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(e.at_ms);
+        let ago = when.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+        let event = format!("{:?}", e.event).to_lowercase();
+        println!(
+            "{:>9}  {event:<8} \"{}\"{}{}{}",
+            human_ago(ago),
+            e.peer_name,
+            e.file
+                .as_deref()
+                .map(|f| format!("  {f}"))
+                .unwrap_or_default(),
+            e.detail
+                .as_deref()
+                .map(|d| format!("  ({d})"))
+                .unwrap_or_default(),
+            if e.via_assistant {
+                "  [AI assistant]"
+            } else {
+                ""
+            },
+        );
+    }
+    println!("{} entries in {}", entries.len(), path.display());
+    ExitCode::SUCCESS
+}
+
+fn human_ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s ago"),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
+
 /// What the running daemon (`listen` or the app) has sent and received.
 async fn transfers(me: &Me) -> ExitCode {
     let mut client = match Client::connect(&me.config_dir).await {
@@ -865,9 +920,9 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
-            let (question, limit, mut respond) = tokio::select! {
-                Some(FileRequest { peer_name, peer_addr, name, size, respond, fetch, .. }) = files.recv() => (
-                    match fetch {
+            let (question, limit, mut respond, grant) = tokio::select! {
+                Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, .. }) = files.recv() => (
+                    format!("{}{}", if verified { "" } else { "[unverified device] " }, match &fetch {
                         None => format!(
                             "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
                             peer_addr.ip(),
@@ -884,9 +939,10 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                                 format!("\n  Reason given: \"{}\"", fetch.reason)
                             },
                         ),
-                    },
+                    }),
                     APPROVAL_TIMEOUT,
                     respond,
+                    fetch.and_then(|f| f.grant),
                 ),
                 Some(PairPrompt { peer, code, incoming, respond }) = pairs.recv() => (
                     format!(
@@ -900,13 +956,21 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                     ),
                     PAIRING_TIMEOUT,
                     respond,
+                    None,
                 ),
                 else => break,
             };
             if respond.is_closed() {
                 continue; // Timed out or the sender hung up while queued.
             }
-            print!("\n? {question} [y/N] (within {}s): ", limit.as_secs());
+            match &grant {
+                Some(grant) => print!(
+                    "\n? {question} [y/N/a] (within {}s; a = yes, and let it fetch from {} for 10 minutes without asking): ",
+                    limit.as_secs(),
+                    grant.folder.display()
+                ),
+                None => print!("\n? {question} [y/N] (within {}s): ", limit.as_secs()),
+            }
             let _ = std::io::stdout().flush();
             let answer = tokio::select! {
                 line = lines.next_line() => line.ok().flatten(),
@@ -915,7 +979,17 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                     continue;
                 }
             };
-            let _ = respond.send(is_yes(answer));
+            let always = answer
+                .as_deref()
+                .is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "a" | "always"));
+            if let Some(grant) = grant.filter(|_| always) {
+                grant.accept();
+                println!(
+                    "  For 10 minutes, it can fetch from {} without asking.",
+                    grant.folder.display()
+                );
+            }
+            let _ = respond.send(always || is_yes(answer));
         }
     });
     (file_requests, pair_requests)

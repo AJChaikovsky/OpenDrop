@@ -24,6 +24,9 @@ export interface FetchDetails {
   reason: string;
   /** The requester says an AI assistant asked for the file. */
   via_assistant: boolean;
+  /** The folder the user may let this device fetch from for 10 minutes
+   * without asking, along with a yes. */
+  grant_folder: string | null;
 }
 
 export type PairStatus = "paired" | "declined" | "declined_by_peer" | "timed_out" | "failed";
@@ -35,6 +38,9 @@ export type AppEvent =
       transfer_id: string;
       peer_name: string;
       peer_ip: string;
+      /** Paired, and proved it holds the paired key. Otherwise anyone could
+       * have picked this name. */
+      verified: boolean;
       name: string;
       size: number;
       /** Set when the peer asks for one of our shared files instead. */
@@ -56,3 +62,14 @@ export type AppEvent =
 
 export type IncomingRequest = Extract<AppEvent, { kind: "incoming_request" }>;
 export type PairCode = Extract<AppEvent, { kind: "pair_code" }>;
+
+/** One line of the audit log (see `opendrop::audit`). */
+export interface AuditEntry {
+  at_ms: number;
+  event: "list" | "request" | "approve" | "decline" | "grant" | "send";
+  peer_id?: string;
+  peer_name: string;
+  file?: string;
+  detail?: string;
+  via_assistant?: boolean;
+}

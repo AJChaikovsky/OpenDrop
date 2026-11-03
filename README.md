@@ -131,8 +131,16 @@ declines it:
 ```
 
 A file can be named by its name, its path in the share (`Reports/2026/q3.pdf`) or its id
-from `files`. Only paired devices can list or fetch; `listen --allow-unpaired-fetch` lifts
-that for local demos. Hidden files, the download folder and anything a symlink would reach
+from `files`. Only paired devices can list or fetch, and each device may list at most 30
+times a minute; `listen --allow-unpaired-fetch` lifts the pairing rule for local demos and
+prints a warning. Every listing, request, approval, decline, folder grant and send is appended to `audit.log`
+in the config folder (one JSON object per line; names and decisions, never file contents).
+`opendrop audit` prints it, and the app shows it under *Activity*.
+
+When you approve a fetch you can also let that device fetch from the same folder (and its
+subfolders) for 10 minutes without asking: answer `a` in the terminal, or tick the box in the
+app. Grants are kept in memory only, per device and folder; asking each time stays the default.
+Hidden files, the download folder and anything a symlink would reach
 outside a shared folder are never shared. `--auto-accept` does not approve fetches.
 `opendrop transfers` lists what the running `listen` has sent and received; it and `files` /
 `fetch` reach it over a local socket (named pipe on Windows) only your user can open. If you
@@ -214,7 +222,7 @@ path to the binary (Claude Desktop doesn't search your `PATH`), and restart Clau
 ```
 
 On Windows the command is `"C:\\Users\\you\\.cargo\\bin\\opendrop.exe"`. The tools menu (the
-slider icon under the message box) then lists `opendrop` with five tools.
+slider icon under the message box) then lists `opendrop` with six tools.
 
 **Try it:**
 
@@ -229,11 +237,13 @@ slider icon under the message box) then lists `opendrop` with five tools.
 | `list_shared_files` | What a device shares: `file_id`, name, path in the share, size, type |
 | `request_file` | Asks the owner for one shared file, with a reason; returns a `transfer_id` at once |
 | `get_transfer_status` | `awaiting_approval` → `transferring` → `done` (or `declined`, `failed`, `cancelled`); can wait up to 30 s. When done: the saved path, and small text files or images inline |
+| `send_file` | Sends a file from this computer to a paired device, whose user accepts it as usual; returns a `transfer_id` at once |
 | `cancel_transfer` | Stops a request or a transfer under way |
 
 Errors come back as tool errors with a code the assistant can act on: `daemon_not_running`
 (start `opendrop listen` or the app), `unknown_device`, `device_offline`, `not_paired`,
-`not_shared`, `ambiguous_file`, `unknown_transfer`. There is no way to ask for a path: a
+`not_shared`, `ambiguous_file`, `unknown_transfer`, `rate_limited`, and for `send_file`
+`path_not_allowed` (relative, hidden, or OpenDrop's own keys) and `not_a_file`. There is no way to ask for a path: a
 request for anything not in the share list ends in `not_shared` with nothing sent. If you
 start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp --config DIR`.
 
@@ -241,15 +251,19 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch`, `transfers` and `mcp` |
+| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch`, `transfers`, `audit` and `mcp` |
 | `src/daemon/` | What `listen` and the app run: listener, discovery, transfer table, fetches |
 | `src/control/` | Local control API (Unix socket / named pipe) for the CLI, the app and the MCP server |
-| `src/mcp/` | `opendrop mcp`: the MCP server and its five tools |
+| `src/mcp/` | `opendrop mcp`: the MCP server and its six tools |
 | `src/share/` | Share allowlist, opaque file ids and safe path resolution |
 | `src/lib.rs` | Library root, so the Tauri app can reuse everything later |
 | `src/protocol/` | Message types, versioning, length-prefixed framing |
 | `src/identity.rs` | The device key pair, its file, and the device id derived from it |
-| `src/network/handshake.rs` | Signed handshake: proves each side holds its key |
+| `src/network/handshake.rs` | Signed handshake: proves each side holds its key, agrees on encryption keys |
+| `src/network/secure.rs` | The encrypted channel every connection switches to after the handshake |
+| `src/network/limit.rs` | Per-device rate limit (share listings) |
+| `src/network/grants.rs` | Time-limited folder grants given on a fetch approval |
+| `src/audit.rs` | The append-only audit log behind `opendrop audit` and the app's Activity view |
 | `src/pairing/` | Pairing protocol and 6-digit code; `store.rs` keeps paired devices |
 | `src/network/server.rs` | Accepts connections, one Tokio task per peer |
 | `src/network/client.rs` | `Connection`: connects to a peer, sends texts and files, lists shares, requests fetches |
@@ -260,22 +274,23 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 | `app/src-tauri/src/lib.rs` | Tauri commands and event forwarding |
 | `app/src/` | React UI: device list, drop targets, accept and pairing dialogs, transfers |
 
-## Protocol (v2)
+## Protocol (v3)
 
 Each control message is one frame: a 4-byte big-endian length followed by that many bytes of
-UTF-8 JSON. Frames over 64 KiB are rejected before any allocation. Every message carries
+UTF-8 JSON (inside the encrypted channel once the handshake is done). Frames over 64 KiB are
+rejected before any allocation. Every message carries
 `version` and `type`:
 
 ```json
-{"version": 2, "type": "text", "body": "hi"}
+{"version": 3, "type": "text", "body": "hi"}
 ```
 
 Keys, nonces and signatures travel as lowercase hex.
 
 | Type | Direction | Fields |
 |---|---|---|
-| `hello` | client to server, first message | `device_id`, `device_name`, `public_key`, `nonce` |
-| `welcome` | server reply to `hello` | `device_id`, `device_name`, `public_key`, `nonce`, `paired`, `signature` |
+| `hello` | client to server, first message | `device_id`, `device_name`, `public_key`, `nonce`, `ephemeral` |
+| `welcome` | server reply to `hello` | `device_id`, `device_name`, `public_key`, `nonce`, `ephemeral`, `paired`, `signature` |
 | `hello_proof` | client reply to `welcome` | `paired`, `signature` |
 | `ready` | server, once the proof checks out | |
 | `pair_request` | client | `commitment` (SHA-256 of its pairing nonce) |
@@ -295,7 +310,7 @@ Keys, nonces and signatures travel as lowercase hex.
 | `fetch_accepted` | owner reply, once its user said yes | `fetch_id` |
 | `fetch_declined` | owner reply | `fetch_id`, `reason` (`declined`, `timeout`, `not_shared`, `not_paired`) |
 | `fetch_offer` | owner to requester, on a new connection | like `file_offer`, plus `fetch_id` |
-| `error` | either, then close | `code` (`unsupported_version`, `unexpected_message`, `bad_message`, `file_rejected`, `checksum_mismatch`, `storage_error`, `identity_mismatch`, `pairing_failed`, `not_paired`), `message` |
+| `error` | either, then close | `code` (`unsupported_version`, `unexpected_message`, `bad_message`, `file_rejected`, `checksum_mismatch`, `storage_error`, `identity_mismatch`, `pairing_failed`, `not_paired`, `rate_limited`), `message` |
 
 A peer with a different `version` gets an `unsupported_version` error rather than a parse
 failure. Reads time out after 10 seconds so a stalled peer can't hold a connection open.
@@ -309,6 +324,26 @@ id or public key is useless without its private key. The device id must also be 
 fingerprint of the presented key, and a paired device must present the key stored for it.
 Any failure ends the connection with `identity_mismatch` before anything else is read. The
 `paired` flags keep pairing in sync: if one side unpaired, the other forgets it too.
+
+### Encryption
+
+Since protocol v3, `hello` and `welcome` also carry a fresh X25519 key (`ephemeral`), and the
+signatures cover both. After `ready`, everything on the connection, the messages and the file
+bytes alike, goes through an encrypted channel: HKDF-SHA256 over the X25519 result, salted with
+a hash of the whole handshake, gives one ChaCha20-Poly1305 key per direction. Each record is a
+4-byte length (authenticated) followed by ciphertext and a 16-byte tag, with a per-direction
+counter as nonce, at most 64 KiB of plaintext. A device in the middle can't swap in its own key
+without breaking a signature, a changed, replayed, reordered or cut record fails to decrypt, and
+since the X25519 keys are thrown away after the handshake, a device key stolen later can't
+decrypt a recorded connection. The handshake itself (names, device keys, nonces) stays
+readable. A device that isn't paired can still send files, but the prompt marks it
+*unverified*: anyone could have picked that name.
+
+We chose this signed-ephemeral design (as in TLS 1.3 and SIGMA) over Noise XX or TLS with
+pinned keys because the devices already authenticate with Ed25519 keys in the v2 handshake:
+adding an ephemeral key to the signed transcript gives the same guarantees with two small, well
+reviewed crates (`x25519-dalek`, `chacha20poly1305`) and no certificates or second key type to
+manage.
 
 ### Pairing
 

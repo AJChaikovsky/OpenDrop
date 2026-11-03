@@ -11,6 +11,7 @@ pub mod transfers;
 
 pub use transfers::{Direction, Status, Transfer, TransferTable};
 
+use crate::audit::{AuditLog, Entry, Event};
 use crate::discovery::{Discovery, Peer, same_name};
 use crate::error::{ErrorCode, coded};
 use crate::identity::random_bytes;
@@ -59,6 +60,8 @@ pub struct Options {
     pub shares: Option<Arc<Shares>>,
     /// Let unpaired devices list and fetch too (local demos only).
     pub allow_unpaired_fetch: bool,
+    /// Where lists, requests, decisions, grants and sends are recorded.
+    pub audit: Arc<AuditLog>,
 }
 
 impl Options {
@@ -76,6 +79,7 @@ impl Options {
             control: None,
             shares: None,
             allow_unpaired_fetch: false,
+            audit: Arc::new(AuditLog::in_memory()),
         }
     }
 }
@@ -115,6 +119,7 @@ pub struct Daemon {
     pub download_dir: PathBuf,
     pub paired: Arc<PairedDevices>,
     pub transfers: Arc<TransferTable>,
+    pub audit: Arc<AuditLog>,
     fetches: Arc<PendingFetches>,
     discovery: Option<Discovery>,
     discovery_error: Option<String>,
@@ -140,6 +145,7 @@ impl Daemon {
             control,
             shares,
             allow_unpaired_fetch,
+            audit,
         } = options;
         let listener = TcpListener::bind(("0.0.0.0", port))
             .await
@@ -172,6 +178,7 @@ impl Daemon {
                 allow_unpaired_fetch,
                 fetches: Arc::clone(&fetches),
                 outgoing: Some(Arc::clone(&transfers)),
+                audit: Arc::clone(&audit),
                 ..server::Options::new(
                     identity.clone(),
                     download_dir.clone(),
@@ -195,6 +202,7 @@ impl Daemon {
             download_dir,
             paired,
             transfers,
+            audit,
             fetches,
             discovery,
             discovery_error,
@@ -273,27 +281,53 @@ impl Daemon {
     /// transfer table. Returns the transfer id at once; the send runs in the
     /// background and can be cancelled through the table.
     pub async fn send_file(&self, addrs: &[SocketAddr], path: &Path) -> Result<String, BoxError> {
-        let meta =
-            std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if !meta.is_file() {
-            return Err(format!("{} is not a file", path.display()).into());
-        }
+        let size = file_size(path)?;
         let connection = connect(addrs, &self.identity, &self.paired).await?;
+        Ok(self.start_send(connection, path, size))
+    }
+
+    /// Send `path` to `device` (id, name or IP[:PORT]), like
+    /// [`send_file`](Self::send_file). With `paired_only`, a device we
+    /// aren't paired with is refused with `not_paired` before anything is
+    /// offered.
+    pub async fn send_to(
+        &self,
+        device: &str,
+        path: &Path,
+        paired_only: bool,
+    ) -> Result<String, BoxError> {
+        let size = file_size(path)?;
+        let addrs = self.addresses_of(device)?;
+        let connection = connect(&addrs, &self.identity, &self.paired).await?;
+        if paired_only && !connection.paired {
+            return Err(coded(
+                ErrorCode::NotPaired,
+                format!(
+                    "\"{}\" isn't paired with this device; pair first",
+                    connection.peer.name
+                ),
+            ));
+        }
+        Ok(self.start_send(connection, path, size))
+    }
+
+    fn start_send(&self, connection: Connection, path: &Path, size: u64) -> String {
         let (id, cancelled) = self.transfers.begin(Transfer::new(
             Direction::Send,
             Some(connection.peer.id.clone()),
             connection.peer.name.clone(),
             file_name(path),
-            meta.len(),
+            size,
         ));
         tokio::spawn(run_send(
             Arc::clone(&self.transfers),
+            Arc::clone(&self.audit),
             id.clone(),
             connection,
             path.to_owned(),
             cancelled,
         ));
-        Ok(id)
+        id
     }
 
     /// Where `device` can be reached: an IP (default port), IP:PORT, or a
@@ -410,6 +444,16 @@ impl Drop for Daemon {
             control.abort();
         }
     }
+}
+
+/// The size of regular file `path`, or why it can't be sent.
+fn file_size(path: &Path) -> Result<u64, BoxError> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a file", path.display()).into());
+    }
+    Ok(meta.len())
 }
 
 /// The shared file `query` names: its id, its path in the share, or its
@@ -542,11 +586,14 @@ async fn run_fetch(
 /// drops the connection, which the receiver sees as an interrupted transfer.
 async fn run_send(
     transfers: Arc<TransferTable>,
+    audit: Arc<AuditLog>,
     id: String,
     mut connection: Connection,
     path: PathBuf,
     cancelled: oneshot::Receiver<()>,
 ) {
+    let peer_id = connection.peer.id.clone();
+    let peer_name = connection.peer.name.clone();
     let progress = Arc::clone(&transfers);
     let progress_id = id.clone();
     let mut on_progress = |sent| {
@@ -567,6 +614,13 @@ async fn run_send(
             Err(e) => transfers.finish(&id, Status::Failed, Some(e.to_string())),
         },
         _ = cancelled => transfers.finish(&id, Status::Cancelled, None),
+    }
+    if let Some(row) = transfers.get(&id) {
+        audit.record(
+            Entry::new(Event::Send, Some(&peer_id), &peer_name)
+                .file(&row.name)
+                .detail(format!("{:?}", row.status).to_lowercase()),
+        );
     }
 }
 
@@ -600,6 +654,7 @@ async fn record_requests(
                 transfer_id,
                 peer_name,
                 peer_addr,
+                verified,
                 name,
                 size,
                 mut respond,
@@ -615,6 +670,7 @@ async fn record_requests(
                         transfer_id: transfer_id.clone(),
                         peer_name,
                         peer_addr,
+                        verified,
                         name,
                         size,
                         respond: answer_tx,

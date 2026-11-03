@@ -273,3 +273,136 @@ async fn listing_and_fetching_need_pairing_and_a_shared_id() {
     // The connection is still usable afterwards.
     assert_eq!(conn.send_text("still here").await.unwrap(), 10);
 }
+
+/// Issue #28: a device that lists shares too often is refused for a while.
+#[tokio::test]
+async fn listing_too_often_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shares = Shares::new(&tmp.path().join("config"), None);
+    let friend = DeviceIdentity::new("PC");
+    let other = DeviceIdentity::new("Laptop");
+    let owner = node(
+        "Mac",
+        &tmp.path().join("dl"),
+        Some(shares),
+        paired_with(&[&friend, &other]),
+    )
+    .await;
+    let store = paired_with(&[&owner.identity]);
+    let mut conn = client::Connection::open_with(&owner.addr, &friend, &store)
+        .await
+        .unwrap();
+    for _ in 0..limit::LIST_PER_MINUTE {
+        conn.list_shares(None).await.unwrap();
+    }
+    let refused = conn.list_shares(None).await.unwrap_err();
+    assert_eq!(
+        crate::error::code_of(&refused),
+        Some(crate::error::ErrorCode::RateLimited),
+        "{refused}"
+    );
+    // Another paired device isn't affected.
+    let mut conn = client::Connection::open_with(&owner.addr, &other, &store)
+        .await
+        .unwrap();
+    conn.list_shares(None).await.unwrap();
+}
+
+/// Issue #30 acceptance, with a fake clock: after the owner approves with a
+/// 10-minute grant for folder A, a fetch from A at minute 9 goes through
+/// without a prompt and one at minute 11 prompts. The grant doesn't cover
+/// folder B or another device.
+#[tokio::test]
+async fn folder_grants_skip_the_prompt_until_they_expire() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("Docs");
+    for (dir, file) in [("A", "a1.txt"), ("A", "a2.txt"), ("B", "b1.txt")] {
+        std::fs::create_dir_all(docs.join(dir)).unwrap();
+        std::fs::write(docs.join(dir).join(file), file).unwrap();
+    }
+    let shares = Shares::new(&tmp.path().join("config"), None);
+    shares.add(&docs).unwrap();
+    let id_of = |name: &str| {
+        shares
+            .list(Some(name))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .file_id
+    };
+    let (a1, a2, b1) = (id_of("a1.txt"), id_of("a2.txt"), id_of("b1.txt"));
+
+    let start = Instant::now();
+    let minutes = Arc::new(AtomicU64::new(0));
+    let now = Arc::clone(&minutes);
+    let grants = Arc::new(grants::Grants::with_clock(Box::new(move || {
+        start + Duration::from_secs(60 * now.load(Ordering::SeqCst))
+    })));
+    let pc = DeviceIdentity::new("PC");
+    let laptop = DeviceIdentity::new("Laptop");
+    let owner_id = DeviceIdentity::new("Mac");
+    let (ask, mut asked) = mpsc::channel(4);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(
+        listener,
+        server::Options {
+            paired: paired_with(&[&pc, &laptop]),
+            shares: Some(Arc::new(shares)),
+            grants: Arc::clone(&grants),
+            ..server::Options::new(
+                owner_id.clone(),
+                tmp.path().join("dl"),
+                server::Approval::Ask(ask),
+            )
+        },
+    ));
+    let store = paired_with(&[&owner_id]);
+    let fetch = |who: DeviceIdentity, file_id: String| {
+        let (addr, store) = (addr.clone(), Arc::clone(&store));
+        tokio::spawn(async move {
+            let mut conn = client::Connection::open_with(&addr, &who, &store)
+                .await
+                .unwrap();
+            conn.request_fetch("f", &file_id, "", true, 1)
+                .await
+                .unwrap()
+        })
+    };
+    let no_prompt = |asked: &mut mpsc::Receiver<server::FileRequest>| {
+        assert!(asked.try_recv().is_err(), "the owner was asked");
+    };
+
+    // Minute 0: asked about a1; the owner says yes and grants folder A.
+    let first = fetch(pc.clone(), a1);
+    let request = asked.recv().await.unwrap();
+    let offer = request.fetch.unwrap().grant.expect("a grant is offered");
+    assert_eq!(offer.folder, docs.join("A").canonicalize().unwrap());
+    offer.accept();
+    request.respond.send(true).unwrap();
+    assert_eq!(first.await.unwrap(), Ok(()));
+
+    // Minute 9: a2 from the same folder goes through without asking.
+    minutes.store(9, Ordering::SeqCst);
+    assert_eq!(fetch(pc.clone(), a2.clone()).await.unwrap(), Ok(()));
+    no_prompt(&mut asked);
+
+    // Folder B, or another device, still asks (declined here).
+    for (who, file_id) in [(pc.clone(), b1), (laptop.clone(), a2.clone())] {
+        let pending = fetch(who, file_id);
+        let request = asked.recv().await.unwrap();
+        request.respond.send(false).unwrap();
+        assert_eq!(pending.await.unwrap(), Err(FetchDeclineReason::Declined));
+    }
+
+    // Minute 11: the grant has run out, so a2 asks again.
+    minutes.store(11, Ordering::SeqCst);
+    let pending = fetch(pc, a2);
+    let request = asked.recv().await.unwrap();
+    assert_eq!(request.name, "a2.txt");
+    request.respond.send(false).unwrap();
+    assert_eq!(pending.await.unwrap(), Err(FetchDeclineReason::Declined));
+}

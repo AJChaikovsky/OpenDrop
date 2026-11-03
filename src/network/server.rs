@@ -25,7 +25,11 @@
 
 use super::client::{Connection, FileResult};
 use super::fetch::{Claim, PendingFetches};
+use super::grants::{GrantOffer, Grants};
+use super::limit::RateLimit;
+use super::secure::SecureStream;
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
+use crate::audit::{AuditLog, Entry, Event};
 use crate::daemon::{Direction, Status, Transfer, TransferTable};
 use crate::pairing::store::PairedDevices;
 use crate::pairing::{self, PairOutcome, PairPrompts, PairResult, PairResults};
@@ -39,6 +43,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+
+/// A connection after the handshake: everything on it is encrypted.
+type Secure<'a> = SecureStream<&'a mut TcpStream>;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -50,6 +57,10 @@ pub struct FileRequest {
     pub transfer_id: String,
     pub peer_name: String,
     pub peer_addr: SocketAddr,
+    /// The peer is a paired device that proved it holds the key we paired
+    /// with. Otherwise anyone could have picked this name: show it as
+    /// unverified.
+    pub verified: bool,
     /// Already sanitized: this is the name it will be saved under (or close
     /// to it, if a file with that name exists).
     pub name: String,
@@ -68,6 +79,9 @@ pub struct FetchInfo {
     pub reason: String,
     /// The requester says an AI assistant asked for the file.
     pub via_assistant: bool,
+    /// A grant the user can give along with a yes: this device may fetch
+    /// from this file's folder for 10 minutes without asking.
+    pub grant: Option<GrantOffer>,
 }
 
 /// What happens to an accepted file, for a UI that shows incoming transfers.
@@ -130,6 +144,12 @@ pub struct Options {
     pub fetches: Arc<PendingFetches>,
     /// Where to record files we send in answer to fetches, if anywhere.
     pub outgoing: Option<Arc<TransferTable>>,
+    /// How often each device may list our shares.
+    pub list_limit: Arc<RateLimit>,
+    /// Folders devices may fetch from for a while without asking.
+    pub grants: Arc<Grants>,
+    /// Where lists, requests and decisions are recorded.
+    pub audit: Arc<AuditLog>,
 }
 
 impl Options {
@@ -146,6 +166,9 @@ impl Options {
             allow_unpaired_fetch: false,
             fetches: Arc::new(PendingFetches::new()),
             outgoing: None,
+            list_limit: Arc::new(RateLimit::listings()),
+            grants: Arc::new(Grants::new()),
+            audit: Arc::new(AuditLog::in_memory()),
         }
     }
 }
@@ -205,7 +228,7 @@ struct IncomingFetch {
 /// Answer a fetch request: check pairing and the share list, ask our user,
 /// and if they approve, send the file back over a new connection.
 async fn serve_fetch(
-    stream: &mut TcpStream,
+    stream: &mut Secure<'_>,
     options: &Options,
     peer: &handshake::Handshake,
     peer_addr: SocketAddr,
@@ -217,8 +240,22 @@ async fn serve_fetch(
         fetch_id: fetch_id.clone(),
         reason,
     };
+    let entry = |event| {
+        Entry::new(event, Some(&peer.peer.id), peer_name).via_assistant(request.via_assistant)
+    };
+    let audit = &options.audit;
+    audit.record(
+        entry(Event::Request)
+            .file(&request.file_id)
+            .detail(&request.reason),
+    );
     if !(peer.paired || options.allow_unpaired_fetch) {
         println!("[{peer_addr}] refused a fetch from unpaired \"{peer_name}\"");
+        audit.record(
+            entry(Event::Decline)
+                .file(&request.file_id)
+                .detail("not paired"),
+        );
         write_message(stream, &decline(FetchDeclineReason::NotPaired)).await?;
         return Ok(());
     }
@@ -232,13 +269,27 @@ async fn serve_fetch(
     };
     let Ok(resolved) = resolved else {
         println!("[{peer_addr}] \"{peer_name}\" asked for a file that isn't shared");
+        audit.record(
+            entry(Event::Decline)
+                .file(&request.file_id)
+                .detail("not shared"),
+        );
         write_message(stream, &decline(FetchDeclineReason::NotShared)).await?;
         return Ok(());
     };
     let file = resolved.file.clone();
     // Sending a file away always takes an explicit yes: auto-accept is
     // about files coming in, so it doesn't approve fetches.
+    let granted = options.grants.covers(&peer.peer.id, &resolved.disk_path);
     let answer = match &options.approval {
+        // A folder grant the user gave this device earlier answers for them.
+        _ if granted => {
+            println!(
+                "[{peer_addr}] \"{peer_name}\" fetches \"{}\" under a folder grant",
+                file.name
+            );
+            Ok(())
+        }
         Approval::AcceptAll => Err(FetchDeclineReason::Declined),
         Approval::Ask(requests) => {
             let (respond, decision) = oneshot::channel();
@@ -246,6 +297,7 @@ async fn serve_fetch(
                 transfer_id: fetch_id.clone(),
                 peer_name: peer_name.clone(),
                 peer_addr,
+                verified: peer.paired,
                 name: file.name.clone(),
                 size: file.size,
                 respond,
@@ -253,6 +305,14 @@ async fn serve_fetch(
                     peer_id: peer.peer.id.clone(),
                     reason: request.reason.clone(),
                     via_assistant: request.via_assistant,
+                    grant: resolved.disk_path.parent().map(|folder| {
+                        GrantOffer::new(
+                            Arc::clone(&options.grants),
+                            peer.peer.id.clone(),
+                            folder.to_owned(),
+                        )
+                        .audited(Arc::clone(audit), peer_name)
+                    }),
                 }),
             };
             if requests.send(ask).await.is_err() {
@@ -271,9 +331,18 @@ async fn serve_fetch(
             "[{peer_addr}] fetch of \"{}\" by \"{peer_name}\": {reason:?}",
             file.name
         );
+        audit.record(entry(Event::Decline).file(&file.name).detail(match reason {
+            FetchDeclineReason::Timeout => "no answer in time",
+            _ => "declined",
+        }));
         write_message(stream, &decline(reason)).await?;
         return Ok(());
     }
+    audit.record(entry(Event::Approve).file(&file.name).detail(if granted {
+        "under a folder grant"
+    } else {
+        "approved"
+    }));
     write_message(
         stream,
         &Message::FetchAccepted {
@@ -304,12 +373,19 @@ async fn serve_fetch(
         resolved.disk_path,
         fetch_id,
         table,
+        (
+            Arc::clone(audit),
+            Entry::new(Event::Send, Some(&peer.peer.id), peer_name)
+                .file(&file.name)
+                .via_assistant(request.via_assistant),
+        ),
     ));
     Ok(())
 }
 
 /// Send an approved fetch back to the requester's listener, making sure it
 /// is the same device that asked.
+#[allow(clippy::too_many_arguments)]
 async fn push_fetched(
     identity: DeviceIdentity,
     paired: Arc<PairedDevices>,
@@ -318,6 +394,7 @@ async fn push_fetched(
     path: PathBuf,
     fetch_id: String,
     table: Option<Arc<TransferTable>>,
+    audit: (Arc<AuditLog>, Entry),
 ) {
     let record = |change: &dyn Fn(&mut Transfer)| {
         if let Some(table) = &table {
@@ -343,7 +420,7 @@ async fn push_fetched(
             .await
     }
     .await;
-    match result {
+    match &result {
         Ok(FileResult::Delivered(outcome)) => {
             println!("[{reply_to}] sent fetched \"{}\"", outcome.name);
             record(&|t| {
@@ -361,6 +438,12 @@ async fn push_fetched(
             })
         }
     }
+    let (log, entry) = audit;
+    log.record(entry.detail(match &result {
+        Ok(FileResult::Delivered(_)) => "fetched: done".to_owned(),
+        Ok(FileResult::Declined) => "fetched: declined".to_owned(),
+        Err(e) => format!("fetched: failed ({e})"),
+    }));
 }
 
 /// Hang up without losing the error we just sent. Closing a socket that
@@ -377,14 +460,16 @@ async fn close_after_error(mut stream: TcpStream) {
 }
 
 async fn handle_connection(
-    stream: &mut TcpStream,
+    raw: &mut TcpStream,
     peer_addr: SocketAddr,
     options: &Options,
 ) -> Result<(), BoxError> {
     let download_dir = options.download_dir.as_path();
     let approval = &options.approval;
     let events = options.events.as_ref();
-    let peer = handshake::accept(stream, &options.identity, &options.paired).await?;
+    let peer = handshake::accept(raw, &options.identity, &options.paired).await?;
+    let mut secure = SecureStream::new(raw, &peer.keys);
+    let stream = &mut secure;
     let peer_name = peer.peer.name.clone();
     println!(
         "[{peer_addr}] connected: \"{peer_name}\" ({}){}",
@@ -414,7 +499,8 @@ async fn handle_connection(
                     download_dir,
                     approval,
                     events,
-                    &peer_name,
+                    &peer,
+                    &options.audit,
                     peer_addr,
                     transfer_id,
                     &name,
@@ -449,7 +535,8 @@ async fn handle_connection(
                     download_dir,
                     approval,
                     events,
-                    &peer_name,
+                    &peer,
+                    &options.audit,
                     peer_addr,
                     transfer_id,
                     &name,
@@ -459,7 +546,11 @@ async fn handle_connection(
                 .await?;
             }
             Ok(Message::ShareListRequest { query }) => {
+                let entry = |event| Entry::new(event, Some(&peer.peer.id), &peer_name);
                 if !(peer.paired || options.allow_unpaired_fetch) {
+                    options
+                        .audit
+                        .record(entry(Event::Decline).detail("listing refused: not paired"));
                     return reject(
                         stream,
                         ErrorCode::NotPaired,
@@ -467,6 +558,22 @@ async fn handle_connection(
                     )
                     .await;
                 }
+                if !options.list_limit.allow(&peer.peer.id) {
+                    options
+                        .audit
+                        .record(entry(Event::Decline).detail("listing refused: rate limited"));
+                    println!("[{peer_addr}] {peer_name} is listing too often; refused");
+                    return reject(
+                        stream,
+                        ErrorCode::RateLimited,
+                        "too many share listings; try again in a minute".into(),
+                    )
+                    .await;
+                }
+                let matching = query
+                    .as_deref()
+                    .map(|q| format!(" matching \"{q}\""))
+                    .unwrap_or_default();
                 let files = match &options.shares {
                     Some(shares) => {
                         let shares = Arc::clone(shares);
@@ -482,6 +589,9 @@ async fn handle_connection(
                 println!(
                     "[{peer_addr}] {peer_name} listed shared files ({} found)",
                     files.len()
+                );
+                options.audit.record(
+                    entry(Event::List).detail(format!("{} file(s){matching}", files.len())),
                 );
                 write_message(stream, &share_list_within_frame(files)).await?;
             }
@@ -549,17 +659,20 @@ async fn handle_connection(
 /// hash, then move it into `download_dir`.
 #[allow(clippy::too_many_arguments)]
 async fn receive_file(
-    stream: &mut TcpStream,
+    stream: &mut Secure<'_>,
     download_dir: &Path,
     approval: &Approval,
     events: Option<&ReceiveEvents>,
-    peer_name: &str,
+    peer: &handshake::Handshake,
+    audit: &AuditLog,
     peer_addr: SocketAddr,
     transfer_id: String,
     offered_name: &str,
     size: u64,
     stop: Option<oneshot::Receiver<()>>,
 ) -> Result<(), BoxError> {
+    let peer_name = peer.peer.name.as_str();
+    let verified = peer.paired;
     let Some(name) = sanitize_file_name(offered_name) else {
         return reject(
             stream,
@@ -576,13 +689,28 @@ async fn receive_file(
                 transfer_id: transfer_id.clone(),
                 peer_name: peer_name.to_owned(),
                 peer_addr,
+                verified,
                 name: name.clone(),
                 size,
                 respond,
                 fetch: None,
             };
-            requests.send(request).await.is_ok()
-                && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)))
+            let accepted = requests.send(request).await.is_ok()
+                && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)));
+            audit.record(
+                Entry::new(
+                    if accepted {
+                        Event::Approve
+                    } else {
+                        Event::Decline
+                    },
+                    Some(&peer.peer.id),
+                    peer_name,
+                )
+                .file(&name)
+                .detail("incoming file"),
+            );
+            accepted
         }
     };
     if !accepted {
@@ -628,9 +756,20 @@ async fn receive_file(
 
 /// The accepted half of [`receive_file`]: tell the sender to go ahead, then
 /// stream, verify and save. Returns where the file was saved and its SHA-256.
+/// Resolves when `stop` fires; never, if there's no stop or its sender
+/// went away without firing.
+async fn stop_signal(stop: &mut Option<oneshot::Receiver<()>>) {
+    if let Some(rx) = stop
+        && rx.await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn save_file(
-    stream: &mut TcpStream,
+    stream: &mut Secure<'_>,
     download_dir: &Path,
     emit: &(impl Fn(ReceiveEvent) + Sync),
     peer_addr: SocketAddr,
@@ -667,18 +806,10 @@ async fn save_file(
             received,
         })
     };
-    let stopped = async move {
-        let stopped = match stop {
-            Some(stop) => stop.await.is_ok(),
-            None => false,
-        };
-        if !stopped {
-            std::future::pending::<()>().await;
-        }
-    };
+    let mut stop = stop;
     let copied = tokio::select! {
         actual = copy_hashed(stream, part.file(), size, &mut on_progress) => Some(actual),
-        () = stopped => None,
+        () = stop_signal(&mut stop) => None,
     };
     let Some(actual) = copied else {
         println!("[{peer_addr}] stopped receiving \"{name}\": cancelled");
@@ -701,6 +832,13 @@ async fn save_file(
         }
         Err(e) => return Err(e.into()),
     };
+    // A cancel that came in as the last bytes did still wins: don't keep a
+    // file the user no longer wants.
+    if stop.as_mut().is_some_and(|s| s.try_recv().is_ok()) {
+        println!("[{peer_addr}] stopped receiving \"{name}\": cancelled");
+        part.discard().await;
+        return Err("cancelled".into());
+    }
     if !actual.eq_ignore_ascii_case(&expected) {
         return reject(
             stream,
@@ -732,7 +870,7 @@ async fn save_file(
     Ok((saved, actual))
 }
 
-async fn next_message(stream: &mut TcpStream) -> Result<Message, ProtocolError> {
+async fn next_message(stream: &mut Secure<'_>) -> Result<Message, ProtocolError> {
     timeout(IO_TIMEOUT, read_message(stream))
         .await
         .unwrap_or_else(|_| {
@@ -745,7 +883,7 @@ async fn next_message(stream: &mut TcpStream) -> Result<Message, ProtocolError> 
 
 /// Tell the peer why we're hanging up, then hang up.
 async fn reject<T>(
-    stream: &mut TcpStream,
+    stream: &mut Secure<'_>,
     code: ErrorCode,
     message: String,
 ) -> Result<T, BoxError> {

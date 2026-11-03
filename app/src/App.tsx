@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { tauriApi, type Api } from "./api";
 import { formatSize, formatSpeed, initialState, reducer, type Transfer } from "./transfers";
-import type { Device, IncomingRequest, Me, PairCode } from "./types";
+import type { AuditEntry, Device, IncomingRequest, Me, PairCode } from "./types";
 import "./App.css";
 
 /** Seconds the receiver has to answer; matches APPROVAL_TIMEOUT in the crate. */
@@ -54,9 +54,9 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     send(target, await api.pickFiles());
   };
 
-  const answer = (request: IncomingRequest, accept: boolean) => {
+  const answer = (request: IncomingRequest, accept: boolean, allowFolder = false) => {
     dispatch({ kind: "answered", transfer_id: request.transfer_id });
-    api.respond(request.transfer_id, accept);
+    api.respond(request.transfer_id, accept, accept && allowFolder);
   };
 
   const pair = async (device: Device) => {
@@ -141,6 +141,8 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         </section>
       )}
 
+      <Activity api={api} />
+
       {state.pairing ? (
         <PairDialog key={state.pairing.pair_id} pairing={state.pairing} onAnswer={answerPair} />
       ) : (
@@ -149,6 +151,62 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         )
       )}
     </main>
+  );
+}
+
+const EVENT_LABELS: Record<AuditEntry["event"], string> = {
+  list: "Listed your shared files",
+  request: "Asked for a file",
+  approve: "Approved",
+  decline: "Declined",
+  grant: "Folder access granted",
+  send: "Sent",
+};
+
+/** The audit log: what other devices listed, asked for and were given or
+ * refused, and what this device sent. Loaded when opened. */
+function Activity({ api }: { api: Api }) {
+  const [entries, setEntries] = useState<AuditEntry[] | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  const load = () =>
+    api
+      .audit()
+      .then((e) => {
+        setEntries(e);
+        setFailed(null);
+      })
+      .catch((e) => setFailed(String(e)));
+  return (
+    <section className="activity">
+      <h2>Activity</h2>
+      {entries === null ? (
+        <button onClick={load}>Show activity</button>
+      ) : (
+        <>
+          <button onClick={load}>Refresh</button>
+          {entries.length === 0 ? (
+            <p className="empty">Nothing yet. Lists, requests and decisions will show up here.</p>
+          ) : (
+            <ul className="audit">
+              {entries.map((e, i) => (
+                <li key={`${e.at_ms}-${i}`} className={`audit-${e.event}`}>
+                  <time dateTime={new Date(e.at_ms).toISOString()}>{new Date(e.at_ms).toLocaleString()}</time>{" "}
+                  <strong>{EVENT_LABELS[e.event]}</strong> · {e.peer_name}
+                  {e.file && <> · {e.file}</>}
+                  {e.detail && <span className="detail"> ({e.detail})</span>}
+                  {e.via_assistant && <span className="detail"> · AI assistant</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+      {failed && (
+        <p className="error" role="alert">
+          {failed}
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -318,9 +376,10 @@ function RequestDialog({
   onAnswer,
 }: {
   request: IncomingRequest;
-  onAnswer: (request: IncomingRequest, accept: boolean) => void;
+  onAnswer: (request: IncomingRequest, accept: boolean, allowFolder?: boolean) => void;
 }) {
   const [left, setLeft] = useState(ANSWER_SECONDS);
+  const [allowFolder, setAllowFolder] = useState(false);
   useEffect(() => {
     const timer = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(timer);
@@ -340,6 +399,11 @@ function RequestDialog({
         <p className="file">
           {request.name} <span>{formatSize(request.size)}</span>
         </p>
+        {!request.verified && (
+          <p className="unverified" role="note">
+            Unverified device: it isn't paired, so anyone could be using this name.
+          </p>
+        )}
         {fetch?.via_assistant && (
           <p className="assistant" role="note">
             An AI assistant on {request.peer_name} asked for this file.
@@ -354,10 +418,16 @@ function RequestDialog({
             )}
           </p>
         )}
+        {fetch?.grant_folder && (
+          <label className="grant">
+            <input type="checkbox" checked={allowFolder} onChange={(e) => setAllowFolder(e.target.checked)} />
+            Also let {request.peer_name} fetch from {fetch.grant_folder} for 10 minutes without asking
+          </label>
+        )}
         <p className="countdown">Declines automatically in {left}s</p>
         <div className="actions">
           <button onClick={() => onAnswer(request, false)}>Decline</button>
-          <button className="primary" onClick={() => onAnswer(request, true)} autoFocus>
+          <button className="primary" onClick={() => onAnswer(request, true, allowFolder)} autoFocus>
             {fetch ? "Approve" : "Accept"}
           </button>
         </div>

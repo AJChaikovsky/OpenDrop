@@ -9,7 +9,7 @@
 //! ```
 //!
 //! The payload is UTF-8 JSON carrying a `version` and a `type` field, e.g.
-//! `{"version":2,"type":"text","body":"hi"}`. Framing means we never assume one
+//! `{"version":3,"type":"text","body":"hi"}`. Framing means we never assume one
 //! TCP read equals one message, and it lets raw file bytes travel between
 //! control frames: after a `file_accept`, the sender writes exactly the offered
 //! number of bytes, unframed, then resumes with a `file_done` frame.
@@ -19,8 +19,9 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Protocol version this build speaks. Version 2 added key-backed identity
-/// (signed handshake) and pairing.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// (signed handshake) and pairing; version 3 encrypts everything after the
+/// handshake (see `network::secure`).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest control frame we accept. Control messages are small; anything
 /// bigger is a bug or a hostile peer, so we refuse it before allocating.
@@ -39,6 +40,9 @@ pub enum Message {
         public_key: [u8; 32],
         #[serde(with = "hex_array")]
         nonce: [u8; 32],
+        /// Fresh X25519 key for this connection's encryption.
+        #[serde(with = "hex_array")]
+        ephemeral: [u8; 32],
     },
     /// Server's reply to `Hello`, identifying itself. `signature` covers
     /// both nonces and both keys (see `network::handshake`); `paired` says
@@ -50,6 +54,9 @@ pub enum Message {
         public_key: [u8; 32],
         #[serde(with = "hex_array")]
         nonce: [u8; 32],
+        /// Fresh X25519 key for this connection's encryption.
+        #[serde(with = "hex_array")]
+        ephemeral: [u8; 32],
         paired: bool,
         #[serde(with = "hex_array")]
         signature: [u8; 64],
@@ -189,6 +196,8 @@ pub enum ErrorCode {
     PairingFailed,
     /// Only paired devices may do this (list shares).
     NotPaired,
+    /// Too many requests of this kind; try again in a minute.
+    RateLimited,
 }
 
 /// Serde for fixed-size byte arrays as lowercase hex strings.
@@ -397,6 +406,7 @@ mod tests {
                 device_name: "Mac".into(),
                 public_key: [7; 32],
                 nonce: [0xab; 32],
+                ephemeral: [0x11; 32],
             },
             Message::HelloProof {
                 paired: true,
@@ -488,7 +498,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"version": 2, "type": "fetch_declined", "fetch_id": "x", "reason": "not_shared"})
+            serde_json::json!({"version": 3, "type": "fetch_declined", "fetch_id": "x", "reason": "not_shared"})
         );
     }
 
@@ -532,7 +542,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"version": 2, "type": "text", "body": "hi"})
+            serde_json::json!({"version": 3, "type": "text", "body": "hi"})
         );
         let frame = encode(&Message::PairNonce { nonce: [0x0f; 32] }).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
@@ -542,7 +552,7 @@ mod tests {
     #[test]
     fn rejects_malformed_hex() {
         for bad in ["0f", &"zz".repeat(32), &"é".repeat(32)] {
-            let json = format!(r#"{{"version":2,"type":"pair_nonce","nonce":"{bad}"}}"#);
+            let json = format!(r#"{{"version":3,"type":"pair_nonce","nonce":"{bad}"}}"#);
             assert!(serde_json::from_str::<Envelope>(&json).is_err(), "{bad}");
         }
     }
@@ -582,7 +592,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_other_protocol_versions() {
-        let payload = br#"{"version":3,"type":"text","body":"from the future"}"#;
+        let payload = br#"{"version":4,"type":"text","body":"from the future"}"#;
         let (mut a, mut b) = tokio::io::duplex(1024);
         a.write_all(&(payload.len() as u32).to_be_bytes())
             .await
@@ -590,7 +600,7 @@ mod tests {
         a.write_all(payload).await.unwrap();
         assert!(matches!(
             read_message(&mut b).await,
-            Err(ProtocolError::UnsupportedVersion(3))
+            Err(ProtocolError::UnsupportedVersion(4))
         ));
     }
 
