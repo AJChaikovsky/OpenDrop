@@ -155,6 +155,8 @@ async fn refuses_what_it_should_not_send() {
     std::os::unix::fs::symlink(hidden_dir.join("id_rsa"), src.path().join("innocent.txt")).unwrap();
 
     let owner = rig.owner_address();
+    // Only pushed to on Unix (the symlink case).
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut cases = vec![
         (json!(hidden_dir.join("id_rsa")), "path_not_allowed"),
         (json!(src.path().join(".env")), "path_not_allowed"),
