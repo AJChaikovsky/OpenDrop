@@ -25,6 +25,7 @@
 
 use super::client::{Connection, FileResult};
 use super::fetch::{Claim, PendingFetches};
+use super::secure::SecureStream;
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
 use crate::daemon::{Direction, Status, Transfer, TransferTable};
 use crate::pairing::store::PairedDevices;
@@ -39,6 +40,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+
+/// A connection after the handshake: everything on it is encrypted.
+type Secure<'a> = SecureStream<&'a mut TcpStream>;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -50,6 +54,10 @@ pub struct FileRequest {
     pub transfer_id: String,
     pub peer_name: String,
     pub peer_addr: SocketAddr,
+    /// The peer is a paired device that proved it holds the key we paired
+    /// with. Otherwise anyone could have picked this name: show it as
+    /// unverified.
+    pub verified: bool,
     /// Already sanitized: this is the name it will be saved under (or close
     /// to it, if a file with that name exists).
     pub name: String,
@@ -205,7 +213,7 @@ struct IncomingFetch {
 /// Answer a fetch request: check pairing and the share list, ask our user,
 /// and if they approve, send the file back over a new connection.
 async fn serve_fetch(
-    stream: &mut TcpStream,
+    stream: &mut Secure<'_>,
     options: &Options,
     peer: &handshake::Handshake,
     peer_addr: SocketAddr,
@@ -246,6 +254,7 @@ async fn serve_fetch(
                 transfer_id: fetch_id.clone(),
                 peer_name: peer_name.clone(),
                 peer_addr,
+                verified: peer.paired,
                 name: file.name.clone(),
                 size: file.size,
                 respond,
@@ -377,14 +386,16 @@ async fn close_after_error(mut stream: TcpStream) {
 }
 
 async fn handle_connection(
-    stream: &mut TcpStream,
+    raw: &mut TcpStream,
     peer_addr: SocketAddr,
     options: &Options,
 ) -> Result<(), BoxError> {
     let download_dir = options.download_dir.as_path();
     let approval = &options.approval;
     let events = options.events.as_ref();
-    let peer = handshake::accept(stream, &options.identity, &options.paired).await?;
+    let peer = handshake::accept(raw, &options.identity, &options.paired).await?;
+    let mut secure = SecureStream::new(raw, &peer.keys);
+    let stream = &mut secure;
     let peer_name = peer.peer.name.clone();
     println!(
         "[{peer_addr}] connected: \"{peer_name}\" ({}){}",
@@ -415,6 +426,7 @@ async fn handle_connection(
                     approval,
                     events,
                     &peer_name,
+                    peer.paired,
                     peer_addr,
                     transfer_id,
                     &name,
@@ -450,6 +462,7 @@ async fn handle_connection(
                     approval,
                     events,
                     &peer_name,
+                    peer.paired,
                     peer_addr,
                     transfer_id,
                     &name,
@@ -549,11 +562,12 @@ async fn handle_connection(
 /// hash, then move it into `download_dir`.
 #[allow(clippy::too_many_arguments)]
 async fn receive_file(
-    stream: &mut TcpStream,
+    stream: &mut Secure<'_>,
     download_dir: &Path,
     approval: &Approval,
     events: Option<&ReceiveEvents>,
     peer_name: &str,
+    verified: bool,
     peer_addr: SocketAddr,
     transfer_id: String,
     offered_name: &str,
@@ -576,6 +590,7 @@ async fn receive_file(
                 transfer_id: transfer_id.clone(),
                 peer_name: peer_name.to_owned(),
                 peer_addr,
+                verified,
                 name: name.clone(),
                 size,
                 respond,
@@ -630,7 +645,7 @@ async fn receive_file(
 /// stream, verify and save. Returns where the file was saved and its SHA-256.
 #[allow(clippy::too_many_arguments)]
 async fn save_file(
-    stream: &mut TcpStream,
+    stream: &mut Secure<'_>,
     download_dir: &Path,
     emit: &(impl Fn(ReceiveEvent) + Sync),
     peer_addr: SocketAddr,
@@ -732,7 +747,7 @@ async fn save_file(
     Ok((saved, actual))
 }
 
-async fn next_message(stream: &mut TcpStream) -> Result<Message, ProtocolError> {
+async fn next_message(stream: &mut Secure<'_>) -> Result<Message, ProtocolError> {
     timeout(IO_TIMEOUT, read_message(stream))
         .await
         .unwrap_or_else(|_| {
@@ -745,7 +760,7 @@ async fn next_message(stream: &mut TcpStream) -> Result<Message, ProtocolError> 
 
 /// Tell the peer why we're hanging up, then hang up.
 async fn reject<T>(
-    stream: &mut TcpStream,
+    stream: &mut Secure<'_>,
     code: ErrorCode,
     message: String,
 ) -> Result<T, BoxError> {

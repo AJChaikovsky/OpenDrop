@@ -18,9 +18,16 @@
 //! present the key we stored for it. Any of these failing ends the
 //! connection with `identity_mismatch` before any other message is read.
 //!
+//! Both `hello` and `welcome` also carry a fresh X25519 key, covered by
+//! the signatures, from which both sides derive the keys of the encrypted
+//! channel the connection switches to after `ready` (see `secure`). The
+//! keys are salted with the whole transcript, so the channel only works if
+//! both sides saw the same handshake.
+//!
 //! The `paired` flags let pairing state converge: if we have the peer as
 //! paired but it no longer has us (it unpaired), we forget it too.
 
+use super::secure::{Ephemeral, SessionKeys};
 use super::{DeviceIdentity, IO_TIMEOUT, PeerIdentity};
 use crate::identity::{device_id_for, random_bytes, verify};
 use crate::pairing::store::{PairedDevices, Trust};
@@ -37,6 +44,8 @@ pub struct Handshake {
     pub paired: bool,
     /// Both nonces, `(client, server)`; pairing binds its code to them.
     pub nonces: ([u8; 32], [u8; 32]),
+    /// Keys for the encrypted channel; wrap the stream with them.
+    pub keys: SessionKeys,
 }
 
 /// A handshake that failed, and what to tell the peer about it.
@@ -74,21 +83,26 @@ fn failed(message: impl Into<String>) -> HandshakeError {
 
 /// The bytes each side signs. `role` keeps a server's signature from being
 /// passed off as a client's and vice versa.
-fn transcript(
-    role: &str,
-    client: (&[u8; 32], &[u8; 32]),
-    server: (&[u8; 32], &[u8; 32]),
-    paired: bool,
-) -> Vec<u8> {
-    let mut t = Vec::with_capacity(160);
-    t.extend_from_slice(b"OpenDrop handshake v2\0");
+/// Each side's `(key, nonce, ephemeral)`.
+type Side<'a> = (&'a [u8; 32], &'a [u8; 32], &'a [u8; 32]);
+
+fn transcript(role: &str, client: Side, server: Side, paired: bool) -> Vec<u8> {
+    let mut t = Vec::with_capacity(224);
+    t.extend_from_slice(b"OpenDrop handshake v3\0");
     t.extend_from_slice(role.as_bytes());
     t.push(0);
-    t.extend_from_slice(client.0);
-    t.extend_from_slice(client.1);
-    t.extend_from_slice(server.0);
-    t.extend_from_slice(server.1);
+    for part in [client.0, client.1, client.2, server.0, server.1, server.2] {
+        t.extend_from_slice(part);
+    }
     t.push(paired as u8);
+    t
+}
+
+/// The salt for the channel keys: everything both sides sent, including
+/// both `paired` flags.
+fn key_transcript(client: Side, server: Side, client_paired: bool, server_paired: bool) -> Vec<u8> {
+    let mut t = transcript("keys", client, server, client_paired);
+    t.push(server_paired as u8);
     t
 }
 
@@ -159,13 +173,14 @@ async fn accept_inner<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (id, name, client_key, client_nonce) = match next(stream).await? {
+    let (id, name, client_key, client_nonce, client_eph) = match next(stream).await? {
         Message::Hello {
             device_id,
             device_name,
             public_key,
             nonce,
-        } => (device_id, device_name, public_key, nonce),
+            ephemeral,
+        } => (device_id, device_name, public_key, nonce, ephemeral),
         other => {
             return Err(refuse(
                 ErrorCode::UnexpectedMessage,
@@ -177,14 +192,11 @@ where
 
     let my_key = identity.public_key();
     let server_nonce = random_bytes();
-    let signed = |role, flag| {
-        transcript(
-            role,
-            (&client_key, &client_nonce),
-            (&my_key, &server_nonce),
-            flag,
-        )
-    };
+    let ephemeral = Ephemeral::new();
+    let server_eph = ephemeral.public;
+    let client: Side = (&client_key, &client_nonce, &client_eph);
+    let server: Side = (&my_key, &server_nonce, &server_eph);
+    let signed = |role, flag| transcript(role, client, server, flag);
     send(
         stream,
         &Message::Welcome {
@@ -192,6 +204,7 @@ where
             device_name: identity.name.clone(),
             public_key: my_key,
             nonce: server_nonce,
+            ephemeral: server_eph,
             paired: we_have,
             signature: identity.sign(&signed("server", we_have)),
         },
@@ -213,6 +226,13 @@ where
             format!("{id} could not prove it holds its key"),
         ));
     }
+    let keys = ephemeral
+        .agree(
+            &client_eph,
+            &key_transcript(client, server, they_have, we_have),
+            false,
+        )
+        .ok_or_else(|| refuse(ErrorCode::IdentityMismatch, "bad encryption key"))?;
     send(stream, &Message::Ready).await?;
     Ok(Handshake {
         paired: reconcile(paired, &id, we_have, they_have),
@@ -222,6 +242,7 @@ where
             public_key: client_key,
         },
         nonces: (client_nonce, server_nonce),
+        keys,
     })
 }
 
@@ -236,6 +257,8 @@ where
 {
     let my_key = identity.public_key();
     let client_nonce = random_bytes();
+    let ephemeral = Ephemeral::new();
+    let client_eph = ephemeral.public;
     send(
         stream,
         &Message::Hello {
@@ -243,31 +266,37 @@ where
             device_name: identity.name.clone(),
             public_key: my_key,
             nonce: client_nonce,
+            ephemeral: client_eph,
         },
     )
     .await?;
-    let (id, name, server_key, server_nonce, they_have, signature) = match next(stream).await? {
-        Message::Welcome {
-            device_id,
-            device_name,
-            public_key,
-            nonce,
-            paired,
-            signature,
-        } => (device_id, device_name, public_key, nonce, paired, signature),
-        Message::Error { code, message } => {
-            return Err(failed(format!("peer refused ({code:?}): {message}")));
-        }
-        other => return Err(failed(format!("expected welcome, got {other:?}"))),
-    };
-    let signed = |role, flag| {
-        transcript(
-            role,
-            (&my_key, &client_nonce),
-            (&server_key, &server_nonce),
-            flag,
-        )
-    };
+    let (id, name, server_key, server_nonce, server_eph, they_have, signature) =
+        match next(stream).await? {
+            Message::Welcome {
+                device_id,
+                device_name,
+                public_key,
+                nonce,
+                ephemeral,
+                paired,
+                signature,
+            } => (
+                device_id,
+                device_name,
+                public_key,
+                nonce,
+                ephemeral,
+                paired,
+                signature,
+            ),
+            Message::Error { code, message } => {
+                return Err(failed(format!("peer refused ({code:?}): {message}")));
+            }
+            other => return Err(failed(format!("expected welcome, got {other:?}"))),
+        };
+    let client: Side = (&my_key, &client_nonce, &client_eph);
+    let server: Side = (&server_key, &server_nonce, &server_eph);
+    let signed = |role, flag| transcript(role, client, server, flag);
     let checked = check_identity(paired, &id, &server_key).and_then(|we_have| {
         if verify(&server_key, &signed("server", they_have), &signature) {
             Ok(we_have)
@@ -309,6 +338,13 @@ where
         }
         other => return Err(failed(format!("expected ready, got {other:?}"))),
     }
+    let keys = ephemeral
+        .agree(
+            &server_eph,
+            &key_transcript(client, server, we_have, they_have),
+            true,
+        )
+        .ok_or_else(|| failed("peer sent a bad encryption key"))?;
     Ok(Handshake {
         paired: reconcile(paired, &id, we_have, they_have),
         peer: PeerIdentity {
@@ -317,6 +353,7 @@ where
             public_key: server_key,
         },
         nonces: (client_nonce, server_nonce),
+        keys,
     })
 }
 
@@ -413,6 +450,7 @@ mod tests {
                 device_name: "Mac".into(),
                 public_key: attacker.public_key(),
                 nonce: random_bytes(),
+                ephemeral: Ephemeral::new().public,
             },
         )
         .await
@@ -436,6 +474,7 @@ mod tests {
                 device_name: "Mac".into(),
                 public_key: mac.public_key(),
                 nonce: random_bytes(),
+                ephemeral: Ephemeral::new().public,
             },
         )
         .await
@@ -468,20 +507,24 @@ mod tests {
             device_name: "Mac".into(),
             public_key: mac.public_key(),
             nonce: [9; 32],
+            ephemeral: [5; 32],
         };
 
         // An honest connection, recorded by an eavesdropper.
         let (mut stream, server) = serve(pc.clone(), PairedDevices::in_memory());
         write_message(&mut stream, &hello).await.unwrap();
-        let Message::Welcome { nonce, .. } = read_message(&mut stream).await.unwrap() else {
+        let Message::Welcome {
+            nonce, ephemeral, ..
+        } = read_message(&mut stream).await.unwrap()
+        else {
             panic!("no welcome")
         };
         let proof = Message::HelloProof {
             paired: false,
             signature: mac.sign(&transcript(
                 "client",
-                (&mac.public_key(), &[9; 32]),
-                (&pc.public_key(), &nonce),
+                (&mac.public_key(), &[9; 32], &[5; 32]),
+                (&pc.public_key(), &nonce, &ephemeral),
                 false,
             )),
         };
@@ -517,6 +560,7 @@ mod tests {
                     device_name: "PC".into(),
                     public_key: pc.public_key(),
                     nonce: [1; 32],
+                    ephemeral: Ephemeral::new().public,
                     paired: false,
                     signature: [0; 64],
                 },

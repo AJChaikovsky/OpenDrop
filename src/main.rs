@@ -866,8 +866,8 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
             let (question, limit, mut respond) = tokio::select! {
-                Some(FileRequest { peer_name, peer_addr, name, size, respond, fetch, .. }) = files.recv() => (
-                    match fetch {
+                Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, .. }) = files.recv() => (
+                    format!("{}{}", if verified { "" } else { "[unverified device] " }, match fetch {
                         None => format!(
                             "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
                             peer_addr.ip(),
@@ -884,7 +884,7 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                                 format!("\n  Reason given: \"{}\"", fetch.reason)
                             },
                         ),
-                    },
+                    }),
                     APPROVAL_TIMEOUT,
                     respond,
                 ),

@@ -35,6 +35,9 @@ export type AppEvent =
       transfer_id: string;
       peer_name: string;
       peer_ip: string;
+      /** Paired, and proved it holds the paired key. Otherwise anyone could
+       * have picked this name. */
+      verified: boolean;
       name: string;
       size: number;
       /** Set when the peer asks for one of our shared files instead. */

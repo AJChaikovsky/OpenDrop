@@ -94,6 +94,8 @@ pub enum AppEvent {
         transfer_id: String,
         peer_name: String,
         peer_ip: String,
+        /// Paired and proved its key; otherwise shown as unverified.
+        verified: bool,
         name: String,
         size: u64,
         fetch: Option<FetchDetails>,
@@ -553,6 +555,7 @@ async fn forward_requests(
             transfer_id,
             peer_name,
             peer_addr,
+            verified,
             name,
             size,
             respond,
@@ -569,6 +572,7 @@ async fn forward_requests(
             transfer_id: transfer_id.clone(),
             peer_name,
             peer_ip: peer_addr.ip().to_string(),
+            verified,
             name,
             size,
             fetch: fetch.map(|f| FetchDetails {

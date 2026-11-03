@@ -4,6 +4,7 @@
 pub mod client;
 pub mod fetch;
 pub mod handshake;
+pub mod secure;
 pub mod server;
 
 use std::time::Duration;
@@ -32,6 +33,8 @@ pub struct PeerIdentity {
 
 #[cfg(test)]
 mod fetch_tests;
+#[cfg(test)]
+mod secure_tests;
 
 #[cfg(test)]
 mod tests {
@@ -209,16 +212,16 @@ mod tests {
     }
 
     /// Connect and complete the handshake, for protocol-level tests.
-    async fn handshake(addr: std::net::SocketAddr) -> TcpStream {
+    async fn handshake(addr: std::net::SocketAddr) -> secure::SecureStream<TcpStream> {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        handshake::connect(
+        let done = handshake::connect(
             &mut stream,
             &DeviceIdentity::new("Test"),
             &crate::pairing::store::PairedDevices::in_memory(),
         )
         .await
         .unwrap();
-        stream
+        secure::SecureStream::new(stream, &done.keys)
     }
 
     fn files_in(dir: &std::path::Path) -> Vec<String> {
@@ -509,6 +512,7 @@ mod tests {
                 device_name: "Mac".into(),
                 public_key: impostor.public_key(),
                 nonce: [3; 32],
+                ephemeral: [4; 32],
             },
         )
         .await

@@ -340,6 +340,11 @@ function RequestDialog({
         <p className="file">
           {request.name} <span>{formatSize(request.size)}</span>
         </p>
+        {!request.verified && (
+          <p className="unverified" role="note">
+            Unverified device: it isn't paired, so anyone could be using this name.
+          </p>
+        )}
         {fetch?.via_assistant && (
           <p className="assistant" role="note">
             An AI assistant on {request.peer_name} asked for this file.

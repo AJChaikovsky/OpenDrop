@@ -1,5 +1,6 @@
 //! Connects to another device and talks to it.
 
+use super::secure::SecureStream;
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity, handshake};
 use crate::error::{self, coded};
 use crate::pairing::store::PairedDevices;
@@ -41,7 +42,7 @@ pub enum FileResult {
 /// An open, introduced connection to a peer. Several texts and files can be
 /// sent over one connection.
 pub struct Connection {
-    stream: TcpStream,
+    stream: SecureStream<TcpStream>,
     pub peer: PeerIdentity,
     /// Whether we and the peer are paired (checked during the handshake).
     pub paired: bool,
@@ -69,7 +70,7 @@ impl Connection {
             .map_err(|e| format!("could not connect to {addr}: {e}"))?;
         let done = handshake::connect(&mut stream, identity, paired).await?;
         Ok(Self {
-            stream,
+            stream: SecureStream::new(stream, &done.keys),
             peer: done.peer,
             paired: done.paired,
             nonces: done.nonces,
@@ -278,11 +279,14 @@ pub async fn send_text(
     })
 }
 
-async fn recv(stream: &mut TcpStream) -> Result<Message, BoxError> {
+async fn recv(stream: &mut SecureStream<TcpStream>) -> Result<Message, BoxError> {
     recv_within(stream, IO_TIMEOUT).await
 }
 
-async fn recv_within(stream: &mut TcpStream, limit: Duration) -> Result<Message, BoxError> {
+async fn recv_within(
+    stream: &mut SecureStream<TcpStream>,
+    limit: Duration,
+) -> Result<Message, BoxError> {
     Ok(timeout(limit, read_message(stream))
         .await
         .map_err(|_| "timed out waiting for peer")??)

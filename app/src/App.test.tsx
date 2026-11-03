@@ -74,8 +74,8 @@ describe("App", () => {
     const { api, emit } = fakeApi();
     render(<App api={api} />);
     await screen.findByRole("button", { name: /AJ-PC/ });
-    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "192.168.1.30", name: "report.pdf", size: 2_100_000, fetch: null });
-    emit({ kind: "incoming_request", transfer_id: "t2", peer_name: "AJ-PC", peer_ip: "192.168.1.30", name: "virus.exe", size: 10, fetch: null });
+    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "192.168.1.30", verified: true, name: "report.pdf", size: 2_100_000, fetch: null });
+    emit({ kind: "incoming_request", transfer_id: "t2", peer_name: "AJ-PC", peer_ip: "192.168.1.30", verified: true, name: "virus.exe", size: 10, fetch: null });
     const dialog = screen.getByRole("dialog");
     expect(dialog).toHaveTextContent("report.pdf");
     expect(dialog).toHaveTextContent("2.1 MB");
@@ -92,6 +92,7 @@ describe("App", () => {
     transfer_id,
     peer_name: "AJ-PC",
     peer_ip: "192.168.1.30",
+    verified: true,
     name: "q3-report.pdf",
     size: 2_100_000,
     fetch: { reason, via_assistant },
@@ -149,9 +150,20 @@ describe("App", () => {
     const { api, emit } = fakeApi();
     render(<App api={api} />);
     await screen.findByRole("button", { name: /AJ-PC/ });
-    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "1.2.3.4", name: "a", size: 1, fetch: null });
+    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "1.2.3.4", verified: true, name: "a", size: 1, fetch: null });
     emit({ kind: "incoming_expired", transfer_id: "t1" });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("marks requests from unpaired devices as unverified", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("button", { name: /AJ-PC/ });
+    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "1.2.3.4", verified: false, name: "a", size: 1, fetch: null });
+    expect(within(screen.getByRole("dialog")).getByRole("note")).toHaveTextContent("Unverified device");
+    await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Decline" }));
+    emit({ kind: "incoming_request", transfer_id: "t2", peer_name: "AJ-PC", peer_ip: "1.2.3.4", verified: true, name: "a", size: 1, fetch: null });
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("Unverified");
   });
 
   it("shows progress and speed, then the result", async () => {
