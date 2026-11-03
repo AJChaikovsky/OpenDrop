@@ -664,6 +664,8 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Traced<R> {
 }
 
 #[cfg(test)]
+mod audit_tests;
+#[cfg(test)]
 mod send_tests;
 #[cfg(test)]
 mod tests;

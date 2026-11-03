@@ -3,6 +3,7 @@
 //! by that device of files in that folder (or below it) go through without
 //! asking. Per-file approval stays the default; grants live only in memory.
 
+use crate::audit::{AuditLog, Entry, Event};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -92,6 +93,8 @@ pub struct GrantOffer {
     grants: Arc<Grants>,
     pub peer_id: String,
     pub folder: PathBuf,
+    /// Where to record the grant, with the device's name.
+    audit: Option<(Arc<AuditLog>, String)>,
 }
 
 impl GrantOffer {
@@ -100,13 +103,31 @@ impl GrantOffer {
             grants,
             peer_id,
             folder,
+            audit: None,
         }
+    }
+
+    /// Record the grant in `audit` when it's given, under `peer_name`.
+    pub fn audited(mut self, audit: Arc<AuditLog>, peer_name: &str) -> Self {
+        self.audit = Some((audit, peer_name.to_owned()));
+        self
     }
 
     /// Give the grant.
     pub fn accept(&self) -> Grant {
-        self.grants
-            .allow(&self.peer_id, &self.folder, GRANT_DURATION)
+        let grant = self
+            .grants
+            .allow(&self.peer_id, &self.folder, GRANT_DURATION);
+        if let Some((audit, peer_name)) = &self.audit {
+            audit.record(
+                Entry::new(Event::Grant, Some(&self.peer_id), peer_name).detail(format!(
+                    "{} for {} minutes",
+                    self.folder.display(),
+                    GRANT_DURATION.as_secs() / 60
+                )),
+            );
+        }
+        grant
     }
 }
 

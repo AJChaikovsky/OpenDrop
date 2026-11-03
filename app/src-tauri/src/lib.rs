@@ -76,6 +76,12 @@ fn respond(
     node.respond(&transfer_id, accept, allow_folder.unwrap_or(false))
 }
 
+/// The audit log, newest first (the Activity view).
+#[tauri::command]
+fn audit(node: State<'_, Arc<Node>>) -> Vec<opendrop::audit::Entry> {
+    node.audit(500)
+}
+
 /// Start pairing with a discovered device; the codes arrive as events.
 #[tauri::command]
 async fn pair_device(node: State<'_, Arc<Node>>, device_id: String) -> Result<(), String> {
@@ -117,7 +123,8 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         respond,
         pair_device,
         respond_pair,
-        unpair_device
+        unpair_device,
+        audit
     ])
 }
 

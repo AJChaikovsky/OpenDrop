@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Api, DragEvent } from "./api";
 import App from "./App";
-import type { AppEvent, Device, Me } from "./types";
+import type { AppEvent, AuditEntry, Device, Me } from "./types";
 
 const pc: Device = { id: "device-pc", name: "AJ-PC", address: "192.168.1.30:45454", compatible: true, paired: false };
 
@@ -25,6 +25,11 @@ function fakeApi(devices: Device[] = [pc]) {
     respondPair: vi.fn(async () => true),
     unpairDevice: vi.fn(async () => true),
     pickFiles: vi.fn(async () => ["/tmp/photo.jpg"]),
+    audit: vi.fn(async (): Promise<AuditEntry[]> => [
+      { at_ms: 1_762_000_000_000, event: "approve", peer_name: "AJ-PC", file: "q3.pdf", detail: "approved", via_assistant: true },
+      { at_ms: 1_761_999_990_000, event: "request", peer_name: "AJ-PC", file: "q3.pdf", detail: "for the deck", via_assistant: true },
+      { at_ms: 1_761_999_980_000, event: "list", peer_name: "AJ-PC", detail: "3 file(s)" },
+    ]),
     onEvent: vi.fn(async (h: (e: AppEvent) => void) => ((emit = h), () => {})),
     onDrag: vi.fn(async (h: (e: DragEvent) => void) => ((drag = h), () => {})),
   } satisfies Api;
@@ -173,6 +178,20 @@ describe("App", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("shows the activity log when asked", async () => {
+    const { api } = fakeApi();
+    render(<App api={api} />);
+    expect(api.audit).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Show activity" }));
+    const items = await screen.findAllByRole("listitem");
+    const log = items.filter((li) => li.className.startsWith("audit-"));
+    expect(log.map((li) => li.className)).toEqual(["audit-approve", "audit-request", "audit-list"]);
+    expect(log[0]).toHaveTextContent("Approved · AJ-PC · q3.pdf (approved) · AI assistant");
+    expect(log[2]).toHaveTextContent("Listed your shared files · AJ-PC (3 file(s))");
+    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(api.audit).toHaveBeenCalledTimes(2);
   });
 
   it("closes the dialog when the request expires", async () => {

@@ -5,6 +5,7 @@
 //! Nothing here depends on Tauri, so it is tested on its own; `lib.rs` only
 //! forwards events to the window and commands to the node.
 
+use opendrop::audit::{AuditLog, Entry};
 use opendrop::daemon::{self, Daemon, Direction, Status, Transfer};
 use opendrop::discovery::{Discovery, Peer, PeerEvent};
 use opendrop::network::client::{Connection, FileResult};
@@ -263,6 +264,10 @@ impl Node {
             pair_prompts: Some(pair_prompts.clone()),
             pair_results: Some(pair_results),
             discover,
+            audit: Arc::new(match &config_dir {
+                Some(config) => AuditLog::open(config),
+                None => AuditLog::in_memory(),
+            }),
             control: config_dir,
             shares,
             ..daemon::Options::new(
@@ -333,6 +338,14 @@ impl Node {
         self.daemon
             .discovery()
             .map_or_else(Vec::new, |d| devices(&d.peers(), &self.paired))
+    }
+
+    /// The audit log, newest first, at most `limit` entries.
+    pub fn audit(&self, limit: usize) -> Vec<Entry> {
+        let mut entries = self.daemon.audit.entries().unwrap_or_default();
+        entries.reverse();
+        entries.truncate(limit);
+        entries
     }
 
     /// Answer an [`AppEvent::IncomingRequest`]. With `allow_folder`, a yes

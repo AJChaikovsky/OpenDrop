@@ -62,3 +62,14 @@ export type AppEvent =
 
 export type IncomingRequest = Extract<AppEvent, { kind: "incoming_request" }>;
 export type PairCode = Extract<AppEvent, { kind: "pair_code" }>;
+
+/** One line of the audit log (see `opendrop::audit`). */
+export interface AuditEntry {
+  at_ms: number;
+  event: "list" | "request" | "approve" | "decline" | "grant" | "send";
+  peer_id?: string;
+  peer_name: string;
+  file?: string;
+  detail?: string;
+  via_assistant?: boolean;
+}

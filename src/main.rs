@@ -51,6 +51,8 @@ USAGE:
     opendrop devices [--wait SECONDS] list nearby and paired devices
     opendrop unpair <DEVICE>          forget a paired device
     opendrop transfers                transfers seen by the running `listen`
+    opendrop audit                    what other devices listed, asked for and were
+                                    given or refused, and what you sent
     opendrop share add <PATH>         let paired devices ask for files in PATH
     opendrop share list               what is shared, with file ids
     opendrop share remove <PATH>      stop sharing PATH
@@ -145,6 +147,7 @@ async fn main() -> ExitCode {
         ["pair", target] => pair(&me, target, wait).await,
         ["devices"] => devices(&me, wait).await,
         ["transfers"] => transfers(&me).await,
+        ["audit"] => audit(&me),
         ["mcp"] => mcp(&me).await,
         ["share", "add", path] => share_add(&me, &download_dir, path),
         ["share", "list"] => share_list(&me, &download_dir),
@@ -191,6 +194,7 @@ async fn listen(
         port,
         paired: Arc::clone(&paired),
         pair_prompts: Some(pair_prompts),
+        audit: Arc::new(opendrop::audit::AuditLog::open(&config_dir)),
         control: Some(config_dir),
         shares: Some(Arc::clone(&shares)),
         allow_unpaired_fetch,
@@ -650,6 +654,53 @@ async fn mcp(me: &Me) -> ExitCode {
     match opendrop::mcp::serve_stdio(&me.config_dir).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&format!("mcp: {e}")),
+    }
+}
+
+/// The audit log: lists, requests, decisions, grants and sends.
+fn audit(me: &Me) -> ExitCode {
+    let path = me.config_dir.join(opendrop::audit::FILE_NAME);
+    let entries = match opendrop::audit::read(&path) {
+        Ok(entries) => entries,
+        Err(e) => return fail(&format!("cannot read {}: {e}", path.display())),
+    };
+    if entries.is_empty() {
+        println!("Nothing recorded yet ({}).", path.display());
+        return ExitCode::SUCCESS;
+    }
+    for e in &entries {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(e.at_ms);
+        let ago = when.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+        let event = format!("{:?}", e.event).to_lowercase();
+        println!(
+            "{:>9}  {event:<8} \"{}\"{}{}{}",
+            human_ago(ago),
+            e.peer_name,
+            e.file
+                .as_deref()
+                .map(|f| format!("  {f}"))
+                .unwrap_or_default(),
+            e.detail
+                .as_deref()
+                .map(|d| format!("  ({d})"))
+                .unwrap_or_default(),
+            if e.via_assistant {
+                "  [AI assistant]"
+            } else {
+                ""
+            },
+        );
+    }
+    println!("{} entries in {}", entries.len(), path.display());
+    ExitCode::SUCCESS
+}
+
+fn human_ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s ago"),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
     }
 }
 

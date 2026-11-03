@@ -133,7 +133,11 @@ declines it:
 A file can be named by its name, its path in the share (`Reports/2026/q3.pdf`) or its id
 from `files`. Only paired devices can list or fetch, and each device may list at most 30
 times a minute; `listen --allow-unpaired-fetch` lifts the pairing rule for local demos and
-prints a warning. When you approve a fetch you can also let that device fetch from the same folder (and its
+prints a warning. Every listing, request, approval, decline, folder grant and send is appended to `audit.log`
+in the config folder (one JSON object per line; names and decisions, never file contents).
+`opendrop audit` prints it, and the app shows it under *Activity*.
+
+When you approve a fetch you can also let that device fetch from the same folder (and its
 subfolders) for 10 minutes without asking: answer `a` in the terminal, or tick the box in the
 app. Grants are kept in memory only, per device and folder; asking each time stays the default.
 Hidden files, the download folder and anything a symlink would reach
@@ -247,7 +251,7 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch`, `transfers` and `mcp` |
+| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch`, `transfers`, `audit` and `mcp` |
 | `src/daemon/` | What `listen` and the app run: listener, discovery, transfer table, fetches |
 | `src/control/` | Local control API (Unix socket / named pipe) for the CLI, the app and the MCP server |
 | `src/mcp/` | `opendrop mcp`: the MCP server and its six tools |
@@ -259,6 +263,7 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 | `src/network/secure.rs` | The encrypted channel every connection switches to after the handshake |
 | `src/network/limit.rs` | Per-device rate limit (share listings) |
 | `src/network/grants.rs` | Time-limited folder grants given on a fetch approval |
+| `src/audit.rs` | The append-only audit log behind `opendrop audit` and the app's Activity view |
 | `src/pairing/` | Pairing protocol and 6-digit code; `store.rs` keeps paired devices |
 | `src/network/server.rs` | Accepts connections, one Tokio task per peer |
 | `src/network/client.rs` | `Connection`: connects to a peer, sends texts and files, lists shares, requests fetches |

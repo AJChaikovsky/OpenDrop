@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AppEvent, Device, Me } from "./types";
+import type { AppEvent, AuditEntry, Device, Me } from "./types";
 
 /** Where a file drag is, in CSS pixels, and which files it carries. */
 export type DragEvent =
@@ -23,6 +23,8 @@ export interface Api {
   respondPair(pairId: string, accept: boolean): Promise<boolean>;
   unpairDevice(deviceId: string): Promise<boolean>;
   pickFiles(): Promise<string[]>;
+  /** The audit log, newest first. */
+  audit(): Promise<AuditEntry[]>;
   onEvent(handler: (event: AppEvent) => void): Promise<() => void>;
   onDrag(handler: (event: DragEvent) => void): Promise<() => void>;
 }
@@ -37,6 +39,7 @@ export const tauriApi: Api = {
   pairDevice: (deviceId) => invoke("pair_device", { deviceId }),
   respondPair: (pairId, accept) => invoke("respond_pair", { pairId, accept }),
   unpairDevice: (deviceId) => invoke("unpair_device", { deviceId }),
+  audit: () => invoke("audit"),
   async pickFiles() {
     const picked = await open({ multiple: true, directory: false });
     if (picked === null) return [];

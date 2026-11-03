@@ -92,3 +92,9 @@ input, button { font: inherit; }
 .countdown { color: var(--muted); font-size: 13px; }
 .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .actions .primary { background: var(--accent); color: white; border-color: var(--accent); }
+
+.audit { list-style: none; padding: 0; margin: 8px 0 0; font-size: 13px; }
+.audit li { padding: 4px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.audit time { color: var(--muted); }
+.audit .detail { color: var(--muted); }
+.audit-decline strong { color: var(--bad); }

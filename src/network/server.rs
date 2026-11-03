@@ -29,6 +29,7 @@ use super::grants::{GrantOffer, Grants};
 use super::limit::RateLimit;
 use super::secure::SecureStream;
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
+use crate::audit::{AuditLog, Entry, Event};
 use crate::daemon::{Direction, Status, Transfer, TransferTable};
 use crate::pairing::store::PairedDevices;
 use crate::pairing::{self, PairOutcome, PairPrompts, PairResult, PairResults};
@@ -147,6 +148,8 @@ pub struct Options {
     pub list_limit: Arc<RateLimit>,
     /// Folders devices may fetch from for a while without asking.
     pub grants: Arc<Grants>,
+    /// Where lists, requests and decisions are recorded.
+    pub audit: Arc<AuditLog>,
 }
 
 impl Options {
@@ -165,6 +168,7 @@ impl Options {
             outgoing: None,
             list_limit: Arc::new(RateLimit::listings()),
             grants: Arc::new(Grants::new()),
+            audit: Arc::new(AuditLog::in_memory()),
         }
     }
 }
@@ -236,8 +240,22 @@ async fn serve_fetch(
         fetch_id: fetch_id.clone(),
         reason,
     };
+    let entry = |event| {
+        Entry::new(event, Some(&peer.peer.id), peer_name).via_assistant(request.via_assistant)
+    };
+    let audit = &options.audit;
+    audit.record(
+        entry(Event::Request)
+            .file(&request.file_id)
+            .detail(&request.reason),
+    );
     if !(peer.paired || options.allow_unpaired_fetch) {
         println!("[{peer_addr}] refused a fetch from unpaired \"{peer_name}\"");
+        audit.record(
+            entry(Event::Decline)
+                .file(&request.file_id)
+                .detail("not paired"),
+        );
         write_message(stream, &decline(FetchDeclineReason::NotPaired)).await?;
         return Ok(());
     }
@@ -251,6 +269,11 @@ async fn serve_fetch(
     };
     let Ok(resolved) = resolved else {
         println!("[{peer_addr}] \"{peer_name}\" asked for a file that isn't shared");
+        audit.record(
+            entry(Event::Decline)
+                .file(&request.file_id)
+                .detail("not shared"),
+        );
         write_message(stream, &decline(FetchDeclineReason::NotShared)).await?;
         return Ok(());
     };
@@ -288,6 +311,7 @@ async fn serve_fetch(
                             peer.peer.id.clone(),
                             folder.to_owned(),
                         )
+                        .audited(Arc::clone(audit), peer_name)
                     }),
                 }),
             };
@@ -307,9 +331,18 @@ async fn serve_fetch(
             "[{peer_addr}] fetch of \"{}\" by \"{peer_name}\": {reason:?}",
             file.name
         );
+        audit.record(entry(Event::Decline).file(&file.name).detail(match reason {
+            FetchDeclineReason::Timeout => "no answer in time",
+            _ => "declined",
+        }));
         write_message(stream, &decline(reason)).await?;
         return Ok(());
     }
+    audit.record(entry(Event::Approve).file(&file.name).detail(if granted {
+        "under a folder grant"
+    } else {
+        "approved"
+    }));
     write_message(
         stream,
         &Message::FetchAccepted {
@@ -340,12 +373,19 @@ async fn serve_fetch(
         resolved.disk_path,
         fetch_id,
         table,
+        (
+            Arc::clone(audit),
+            Entry::new(Event::Send, Some(&peer.peer.id), peer_name)
+                .file(&file.name)
+                .via_assistant(request.via_assistant),
+        ),
     ));
     Ok(())
 }
 
 /// Send an approved fetch back to the requester's listener, making sure it
 /// is the same device that asked.
+#[allow(clippy::too_many_arguments)]
 async fn push_fetched(
     identity: DeviceIdentity,
     paired: Arc<PairedDevices>,
@@ -354,6 +394,7 @@ async fn push_fetched(
     path: PathBuf,
     fetch_id: String,
     table: Option<Arc<TransferTable>>,
+    audit: (Arc<AuditLog>, Entry),
 ) {
     let record = |change: &dyn Fn(&mut Transfer)| {
         if let Some(table) = &table {
@@ -379,7 +420,7 @@ async fn push_fetched(
             .await
     }
     .await;
-    match result {
+    match &result {
         Ok(FileResult::Delivered(outcome)) => {
             println!("[{reply_to}] sent fetched \"{}\"", outcome.name);
             record(&|t| {
@@ -397,6 +438,12 @@ async fn push_fetched(
             })
         }
     }
+    let (log, entry) = audit;
+    log.record(entry.detail(match &result {
+        Ok(FileResult::Delivered(_)) => "fetched: done".to_owned(),
+        Ok(FileResult::Declined) => "fetched: declined".to_owned(),
+        Err(e) => format!("fetched: failed ({e})"),
+    }));
 }
 
 /// Hang up without losing the error we just sent. Closing a socket that
@@ -452,8 +499,8 @@ async fn handle_connection(
                     download_dir,
                     approval,
                     events,
-                    &peer_name,
-                    peer.paired,
+                    &peer,
+                    &options.audit,
                     peer_addr,
                     transfer_id,
                     &name,
@@ -488,8 +535,8 @@ async fn handle_connection(
                     download_dir,
                     approval,
                     events,
-                    &peer_name,
-                    peer.paired,
+                    &peer,
+                    &options.audit,
                     peer_addr,
                     transfer_id,
                     &name,
@@ -499,7 +546,11 @@ async fn handle_connection(
                 .await?;
             }
             Ok(Message::ShareListRequest { query }) => {
+                let entry = |event| Entry::new(event, Some(&peer.peer.id), &peer_name);
                 if !(peer.paired || options.allow_unpaired_fetch) {
+                    options
+                        .audit
+                        .record(entry(Event::Decline).detail("listing refused: not paired"));
                     return reject(
                         stream,
                         ErrorCode::NotPaired,
@@ -508,6 +559,9 @@ async fn handle_connection(
                     .await;
                 }
                 if !options.list_limit.allow(&peer.peer.id) {
+                    options
+                        .audit
+                        .record(entry(Event::Decline).detail("listing refused: rate limited"));
                     println!("[{peer_addr}] {peer_name} is listing too often; refused");
                     return reject(
                         stream,
@@ -516,6 +570,10 @@ async fn handle_connection(
                     )
                     .await;
                 }
+                let matching = query
+                    .as_deref()
+                    .map(|q| format!(" matching \"{q}\""))
+                    .unwrap_or_default();
                 let files = match &options.shares {
                     Some(shares) => {
                         let shares = Arc::clone(shares);
@@ -531,6 +589,9 @@ async fn handle_connection(
                 println!(
                     "[{peer_addr}] {peer_name} listed shared files ({} found)",
                     files.len()
+                );
+                options.audit.record(
+                    entry(Event::List).detail(format!("{} file(s){matching}", files.len())),
                 );
                 write_message(stream, &share_list_within_frame(files)).await?;
             }
@@ -602,14 +663,16 @@ async fn receive_file(
     download_dir: &Path,
     approval: &Approval,
     events: Option<&ReceiveEvents>,
-    peer_name: &str,
-    verified: bool,
+    peer: &handshake::Handshake,
+    audit: &AuditLog,
     peer_addr: SocketAddr,
     transfer_id: String,
     offered_name: &str,
     size: u64,
     stop: Option<oneshot::Receiver<()>>,
 ) -> Result<(), BoxError> {
+    let peer_name = peer.peer.name.as_str();
+    let verified = peer.paired;
     let Some(name) = sanitize_file_name(offered_name) else {
         return reject(
             stream,
@@ -632,8 +695,22 @@ async fn receive_file(
                 respond,
                 fetch: None,
             };
-            requests.send(request).await.is_ok()
-                && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)))
+            let accepted = requests.send(request).await.is_ok()
+                && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)));
+            audit.record(
+                Entry::new(
+                    if accepted {
+                        Event::Approve
+                    } else {
+                        Event::Decline
+                    },
+                    Some(&peer.peer.id),
+                    peer_name,
+                )
+                .file(&name)
+                .detail("incoming file"),
+            );
+            accepted
         }
     };
     if !accepted {

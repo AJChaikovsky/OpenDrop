@@ -1,4 +1,5 @@
 use super::*;
+use crate::audit::AuditLog;
 use crate::daemon::{Daemon, Options};
 use crate::network::DeviceIdentity;
 use crate::network::server::{Approval, FetchInfo, FileRequest};
@@ -57,6 +58,7 @@ pub(super) async fn rig(pdf: &[u8]) -> Rig {
         discover: false,
         paired: owner_store,
         shares: Some(Arc::new(shares)),
+        audit: Arc::new(AuditLog::open(&owner_dir.path().join("config"))),
         ..Options::new(owner_id, owner_dir.path().join("dl"), Approval::Ask(ask))
     })
     .await
@@ -67,6 +69,7 @@ pub(super) async fn rig(pdf: &[u8]) -> Rig {
         discover: false,
         paired: requester_store,
         control: Some(requester_config.clone()),
+        audit: Arc::new(AuditLog::open(&requester_config)),
         ..Options::new(
             requester_id,
             requester_dir.path().join("dl"),

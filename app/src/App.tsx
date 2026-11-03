@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { tauriApi, type Api } from "./api";
 import { formatSize, formatSpeed, initialState, reducer, type Transfer } from "./transfers";
-import type { Device, IncomingRequest, Me, PairCode } from "./types";
+import type { AuditEntry, Device, IncomingRequest, Me, PairCode } from "./types";
 import "./App.css";
 
 /** Seconds the receiver has to answer; matches APPROVAL_TIMEOUT in the crate. */
@@ -141,6 +141,8 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         </section>
       )}
 
+      <Activity api={api} />
+
       {state.pairing ? (
         <PairDialog key={state.pairing.pair_id} pairing={state.pairing} onAnswer={answerPair} />
       ) : (
@@ -149,6 +151,62 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         )
       )}
     </main>
+  );
+}
+
+const EVENT_LABELS: Record<AuditEntry["event"], string> = {
+  list: "Listed your shared files",
+  request: "Asked for a file",
+  approve: "Approved",
+  decline: "Declined",
+  grant: "Folder access granted",
+  send: "Sent",
+};
+
+/** The audit log: what other devices listed, asked for and were given or
+ * refused, and what this device sent. Loaded when opened. */
+function Activity({ api }: { api: Api }) {
+  const [entries, setEntries] = useState<AuditEntry[] | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  const load = () =>
+    api
+      .audit()
+      .then((e) => {
+        setEntries(e);
+        setFailed(null);
+      })
+      .catch((e) => setFailed(String(e)));
+  return (
+    <section className="activity">
+      <h2>Activity</h2>
+      {entries === null ? (
+        <button onClick={load}>Show activity</button>
+      ) : (
+        <>
+          <button onClick={load}>Refresh</button>
+          {entries.length === 0 ? (
+            <p className="empty">Nothing yet. Lists, requests and decisions will show up here.</p>
+          ) : (
+            <ul className="audit">
+              {entries.map((e, i) => (
+                <li key={`${e.at_ms}-${i}`} className={`audit-${e.event}`}>
+                  <time dateTime={new Date(e.at_ms).toISOString()}>{new Date(e.at_ms).toLocaleString()}</time>{" "}
+                  <strong>{EVENT_LABELS[e.event]}</strong> · {e.peer_name}
+                  {e.file && <> · {e.file}</>}
+                  {e.detail && <span className="detail"> ({e.detail})</span>}
+                  {e.via_assistant && <span className="detail"> · AI assistant</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+      {failed && (
+        <p className="error" role="alert">
+          {failed}
+        </p>
+      )}
+    </section>
   );
 }
 
