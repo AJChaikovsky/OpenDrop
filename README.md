@@ -3,7 +3,7 @@
 Cross-platform, AirDrop-style file sharing over the local network (macOS, Windows, Linux).
 No accounts, no cloud: every device runs the same app and talks directly to its peers.
 
-**Status:** Phase 1 done (Tasks 1-3), plus an MVP desktop app. Devices find each other on the
+**Status:** pairing, sharing and fetching work, from the CLI, the desktop app and AI assistants (MCP). Devices find each other on the
 local network over mDNS and send each other messages and files over TCP, by device name or IP
 address. Files are verified with SHA-256 before they're saved.
 
@@ -154,13 +154,94 @@ prompt the first time; on Windows allow it in the Defender dialog). If `peers` f
 the network may block multicast (common on guest and corporate Wi-Fi, and with some VPNs);
 sending by IP still works.
 
+## Use it from an AI assistant (MCP)
+
+`opendrop mcp` lets Claude Code, Claude Desktop or any other MCP client get files from your
+other devices: "get the Q3 report from my MacBook". The assistant only sees files the owner
+shared, and the owner approves every request on their own screen, with the assistant's
+stated reason.
+
+```text
+assistant ──MCP (stdio)──> opendrop mcp ──local socket──> opendrop listen / the app ──LAN──> other device
+```
+
+**1. Install OpenDrop on both devices.** From a clone of this repo:
+
+```bash
+cargo install --path .        # puts `opendrop` in ~/.cargo/bin
+```
+
+**2. On the device that has the files**, share a folder (nothing is shared by default) and
+keep OpenDrop running, either `opendrop listen` or the desktop app:
+
+```bash
+opendrop share add ~/Documents/Reports
+opendrop listen
+```
+
+**3. Pair the two devices once**, if you haven't: `opendrop pair "<other device>"` with
+`listen` running on the other one (or the app's **Pair** button).
+
+**4. On the device the assistant runs on**, keep `opendrop listen` (or the app) running too:
+fetched files arrive through it, in `Downloads/OpenDrop`.
+
+**5. Add the server to your assistant.**
+
+Claude Code:
+
+```bash
+claude mcp add opendrop -- opendrop mcp
+claude mcp list               # opendrop: opendrop mcp - ✓ Connected
+```
+
+Claude Desktop: open **Settings → Developer → Edit Config** (the file is
+`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows), add the server with the full
+path to the binary (Claude Desktop doesn't search your `PATH`), and restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "opendrop": {
+      "command": "/Users/you/.cargo/bin/opendrop",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+On Windows the command is `"C:\\Users\\you\\.cargo\\bin\\opendrop.exe"`. The tools menu (the
+slider icon under the message box) then lists `opendrop` with five tools.
+
+**Try it:**
+
+- "What devices can OpenDrop see?"
+- "Which files does my MacBook share?"
+- "Get notes.txt from my MacBook and summarize it." The owner sees an approval prompt;
+  once they approve, the assistant reads the file.
+
+| Tool | What it does |
+|---|---|
+| `list_devices` | Nearby and paired devices, with `online`, `paired`, `compatible` |
+| `list_shared_files` | What a device shares: `file_id`, name, path in the share, size, type |
+| `request_file` | Asks the owner for one shared file, with a reason; returns a `transfer_id` at once |
+| `get_transfer_status` | `awaiting_approval` → `transferring` → `done` (or `declined`, `failed`, `cancelled`); can wait up to 30 s. When done: the saved path, and small text files or images inline |
+| `cancel_transfer` | Stops a request or a transfer under way |
+
+Errors come back as tool errors with a code the assistant can act on: `daemon_not_running`
+(start `opendrop listen` or the app), `unknown_device`, `device_offline`, `not_paired`,
+`not_shared`, `ambiguous_file`, `unknown_transfer`. There is no way to ask for a path: a
+request for anything not in the share list ends in `not_shared` with nothing sent. If you
+start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp --config DIR`.
+
 ## Layout
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch` and `transfers` |
+| `src/main.rs` | CLI: `listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `unpair`, `share`, `files`, `fetch`, `transfers` and `mcp` |
 | `src/daemon/` | What `listen` and the app run: listener, discovery, transfer table, fetches |
-| `src/control/` | Local control API (Unix socket / named pipe) for the CLI and, later, the MCP server |
+| `src/control/` | Local control API (Unix socket / named pipe) for the CLI, the app and the MCP server |
+| `src/mcp/` | `opendrop mcp`: the MCP server and its five tools |
 | `src/share/` | Share allowlist, opaque file ids and safe path resolution |
 | `src/lib.rs` | Library root, so the Tauri app can reuse everything later |
 | `src/protocol/` | Message types, versioning, length-prefixed framing |
