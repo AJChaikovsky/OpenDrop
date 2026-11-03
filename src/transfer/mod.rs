@@ -136,6 +136,15 @@ impl PartFile {
         self.file.as_mut().expect("file is open until persisted")
     }
 
+    /// Give up on the file: finish any pending write, close it and delete
+    /// it.
+    pub async fn discard(mut self) {
+        if let Some(mut file) = self.file.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = file.flush().await;
+        }
+    }
+
     /// Flush to disk and move into `dir` as `name`, or `name (1)`,
     /// `name (2)`, ... if that's taken. Returns where the file ended up.
     pub async fn persist(mut self, dir: &Path, name: &str) -> io::Result<PathBuf> {
@@ -152,6 +161,8 @@ impl PartFile {
 impl Drop for PartFile {
     fn drop(&mut self) {
         if !self.kept {
+            // Close first: Windows won't delete a file that is still open.
+            drop(self.file.take());
             let _ = std::fs::remove_file(&self.path);
         }
     }

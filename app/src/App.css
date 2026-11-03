@@ -83,6 +83,8 @@ input, button { font: inherit; }
 .dialog h2 { margin-top: 0; color: var(--text); text-transform: none; letter-spacing: 0; font-size: 18px; }
 .dialog .file { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
 .dialog .file span { font-weight: 400; color: var(--muted); font-size: 14px; margin-left: 6px; }
+.dialog .assistant { color: var(--accent); font-weight: 600; font-size: 14px; }
+.dialog .reason { font-size: 14px; overflow-wrap: anywhere; }
 .dialog .code { font-size: 34px; font-weight: 700; letter-spacing: 0.12em; text-align: center; margin: 12px 0; font-variant-numeric: tabular-nums; }
 .actions button:disabled { opacity: 0.6; }
 .countdown { color: var(--muted); font-size: 13px; }

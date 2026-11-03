@@ -74,8 +74,8 @@ describe("App", () => {
     const { api, emit } = fakeApi();
     render(<App api={api} />);
     await screen.findByRole("button", { name: /AJ-PC/ });
-    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "192.168.1.30", name: "report.pdf", size: 2_100_000 });
-    emit({ kind: "incoming_request", transfer_id: "t2", peer_name: "AJ-PC", peer_ip: "192.168.1.30", name: "virus.exe", size: 10 });
+    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "192.168.1.30", name: "report.pdf", size: 2_100_000, fetch: null });
+    emit({ kind: "incoming_request", transfer_id: "t2", peer_name: "AJ-PC", peer_ip: "192.168.1.30", name: "virus.exe", size: 10, fetch: null });
     const dialog = screen.getByRole("dialog");
     expect(dialog).toHaveTextContent("report.pdf");
     expect(dialog).toHaveTextContent("2.1 MB");
@@ -87,11 +87,69 @@ describe("App", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  const fetchRequest = (transfer_id: string, reason: string, via_assistant: boolean): AppEvent => ({
+    kind: "incoming_request",
+    transfer_id,
+    peer_name: "AJ-PC",
+    peer_ip: "192.168.1.30",
+    name: "q3-report.pdf",
+    size: 2_100_000,
+    fetch: { reason, via_assistant },
+  });
+
+  it("shows who asks for a shared file, the file, that an assistant asked and why", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("button", { name: /AJ-PC/ });
+    emit(fetchRequest("f1", "To summarize the Q3 numbers you asked about", true));
+    const dialog = screen.getByRole("dialog", { name: "File request" });
+    expect(dialog).toHaveTextContent("AJ-PC (192.168.1.30) asks for your file");
+    expect(dialog).toHaveTextContent("q3-report.pdf");
+    expect(dialog).toHaveTextContent("2.1 MB");
+    expect(within(dialog).getByRole("note")).toHaveTextContent("An AI assistant on AJ-PC asked for this file.");
+    expect(dialog).toHaveTextContent("Reason given: “To summarize the Q3 numbers you asked about”");
+    expect(dialog).toHaveTextContent("Declines automatically in 60s");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Approve" }));
+    expect(api.respond).toHaveBeenCalledWith("f1", true);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("declines a file request, and says so when no assistant or reason is involved", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("button", { name: /AJ-PC/ });
+    emit(fetchRequest("f2", "  ", false));
+    const dialog = screen.getByRole("dialog", { name: "File request" });
+    expect(within(dialog).queryByRole("note")).not.toBeInTheDocument();
+    expect(dialog).toHaveTextContent("No reason given.");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Decline" }));
+    expect(api.respond).toHaveBeenCalledWith("f2", false);
+    expect(api.respond).toHaveBeenCalledTimes(1);
+  });
+
+  it("declines a file request nobody answers within 60 seconds", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { api, emit } = fakeApi();
+      render(<App api={api} />);
+      await screen.findByRole("button", { name: /AJ-PC/ });
+      emit(fetchRequest("f3", "why not", true));
+      act(() => vi.advanceTimersByTime(59_000));
+      expect(screen.getByRole("dialog")).toHaveTextContent("Declines automatically in 1s");
+      expect(api.respond).not.toHaveBeenCalled();
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(api.respond).toHaveBeenCalledWith("f3", false);
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("closes the dialog when the request expires", async () => {
     const { api, emit } = fakeApi();
     render(<App api={api} />);
     await screen.findByRole("button", { name: /AJ-PC/ });
-    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "1.2.3.4", name: "a", size: 1 });
+    emit({ kind: "incoming_request", transfer_id: "t1", peer_name: "AJ-PC", peer_ip: "1.2.3.4", name: "a", size: 1, fetch: null });
     emit({ kind: "incoming_expired", transfer_id: "t1" });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });

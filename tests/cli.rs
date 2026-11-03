@@ -432,3 +432,105 @@ fn fetch_a_file_end_to_end() {
 fn fetch_100mb_end_to_end() {
     fetch_end_to_end(100 * 1024 * 1024);
 }
+
+/// Issue #22: `opendrop mcp` speaks MCP over stdio to a real client
+/// handshake, lists the five tools and reaches the running `listen`. Every
+/// line it prints on stdout is a JSON-RPC message.
+#[test]
+fn mcp_server_answers_over_stdio() {
+    let config = tempfile::tempdir().unwrap();
+    let downloads = tempfile::tempdir().unwrap();
+    let listener = Listener::start(config.path(), "Desk", 0, downloads.path());
+    let mut child = Command::new(BIN)
+        .arg("mcp")
+        .arg("--config")
+        .arg(config.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (tx, replies) = mpsc::channel::<String>();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let ask = |stdin: &mut ChildStdin, message: serde_json::Value| -> serde_json::Value {
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+        let id = message["id"].clone();
+        loop {
+            let line = replies
+                .recv_timeout(Duration::from_secs(10))
+                .expect("an answer");
+            let reply: serde_json::Value =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"));
+            assert_eq!(reply["jsonrpc"], "2.0", "{reply}");
+            if reply["id"] == id {
+                return reply;
+            }
+        }
+    };
+
+    let init = ask(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "cli-test", "version": "0"}
+            }
+        }),
+    );
+    assert_eq!(init["result"]["serverInfo"]["name"], "opendrop", "{init}");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .unwrap();
+
+    let listed = ask(
+        &mut stdin,
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    );
+    let mut names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{listed}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "cancel_transfer",
+            "get_transfer_status",
+            "list_devices",
+            "list_shared_files",
+            "request_file"
+        ]
+    );
+
+    let devices = ask(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "list_devices", "arguments": {}}
+        }),
+    );
+    assert_ne!(devices["result"]["isError"], true, "{devices}");
+    assert!(
+        devices["result"]["structuredContent"]["devices"].is_array(),
+        "{devices}"
+    );
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    listener.stop();
+    assert!(status.success(), "mcp exited with {status}");
+}

@@ -17,7 +17,7 @@ describe("reducer", () => {
 
   it("queues incoming requests and drops them when answered or expired", () => {
     const req = (id: string): AppEvent => ({
-      kind: "incoming_request", transfer_id: id, peer_name: "Mac", peer_ip: "10.0.0.2", name: `${id}.txt`, size: 5,
+      kind: "incoming_request", transfer_id: id, peer_name: "Mac", peer_ip: "10.0.0.2", name: `${id}.txt`, size: 5, fetch: null,
     });
     const s = run([req("t1"), req("t2")]);
     expect(s.requests.map((r) => r.transfer_id)).toEqual(["t1", "t2"]);

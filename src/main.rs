@@ -11,11 +11,12 @@
 //!   opendrop share add|remove <PATH>, opendrop share list
 //!   opendrop files <DEVICE>
 //!   opendrop fetch <DEVICE> <FILE> [--reason TEXT]
+//!   opendrop mcp
 
 use opendrop::DEFAULT_PORT;
 use opendrop::control::{Client, Request, Response};
 use opendrop::daemon::{self, Daemon, Direction, Status};
-use opendrop::discovery::{Discovery, Peer, PeerEvent};
+use opendrop::discovery::{Discovery, Peer, PeerEvent, same_name};
 use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::server::{Approval, FileRequest};
@@ -57,6 +58,9 @@ USAGE:
     opendrop fetch <DEVICE> <FILE> [--reason TEXT]
                                     ask a device for a shared file (by name, path or id);
                                     needs `listen` running here, the owner approves it
+    opendrop mcp                      MCP server on stdin/stdout for AI assistants
+                                    (Claude Code: claude mcp add opendrop -- opendrop mcp);
+                                    needs `listen` (or the app) running here
 
 Every command also takes --config DIR.
 
@@ -141,6 +145,7 @@ async fn main() -> ExitCode {
         ["pair", target] => pair(&me, target, wait).await,
         ["devices"] => devices(&me, wait).await,
         ["transfers"] => transfers(&me).await,
+        ["mcp"] => mcp(&me).await,
         ["share", "add", path] => share_add(&me, &download_dir, path),
         ["share", "list"] => share_list(&me, &download_dir),
         ["share", "remove", path] => share_remove(&me, &download_dir, path),
@@ -552,7 +557,7 @@ async fn files(me: &Me, device: &str) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Ok(Response::Error { message }) => fail(&message),
+        Ok(Response::Error { message, .. }) => fail(&message),
         Ok(other) => fail(&format!("unexpected answer: {other:?}")),
         Err(e) => fail(&e.to_string()),
     }
@@ -573,7 +578,7 @@ async fn fetch(me: &Me, device: &str, file: &str, reason: &str) -> ExitCode {
     };
     let id = match client.call(&request).await {
         Ok(Response::FetchStarted { transfer_id }) => transfer_id,
-        Ok(Response::Error { message }) => return fail(&message),
+        Ok(Response::Error { message, .. }) => return fail(&message),
         Ok(other) => return fail(&format!("unexpected answer: {other:?}")),
         Err(e) => return fail(&e.to_string()),
     };
@@ -635,6 +640,15 @@ async fn fetch(me: &Me, device: &str, file: &str, reason: &str) -> ExitCode {
     }
 }
 
+/// Serve MCP on stdio for an AI assistant, over the running daemon's
+/// control API. Logs go to stderr: stdout belongs to the protocol.
+async fn mcp(me: &Me) -> ExitCode {
+    match opendrop::mcp::serve_stdio(&me.config_dir).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&format!("mcp: {e}")),
+    }
+}
+
 /// What the running daemon (`listen` or the app) has sent and received.
 async fn transfers(me: &Me) -> ExitCode {
     let mut client = match Client::connect(&me.config_dir).await {
@@ -680,7 +694,7 @@ fn unpair(me: &Me, target: &str) -> ExitCode {
         .paired
         .list()
         .into_iter()
-        .filter(|d| d.id == target || d.name.eq_ignore_ascii_case(target))
+        .filter(|d| d.id == target || same_name(&d.name, target))
         .collect();
     let device = match matches.as_slice() {
         [device] => device,

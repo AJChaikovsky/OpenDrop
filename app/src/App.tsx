@@ -325,21 +325,40 @@ function RequestDialog({
     const timer = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(timer);
   }, []);
+  // Out of time: decline here too (the other side stops waiting anyway).
+  useEffect(() => {
+    if (left === 0) onAnswer(request, false);
+  }, [left, request, onAnswer]);
+  const fetch = request.fetch;
   return (
     <div className="backdrop">
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="request-title">
-        <h2 id="request-title">Incoming file</h2>
+        <h2 id="request-title">{fetch ? "File request" : "Incoming file"}</h2>
         <p>
-          <strong>{request.peer_name}</strong> ({request.peer_ip}) wants to send you
+          <strong>{request.peer_name}</strong> ({request.peer_ip}) {fetch ? "asks for your file" : "wants to send you"}
         </p>
         <p className="file">
           {request.name} <span>{formatSize(request.size)}</span>
         </p>
+        {fetch?.via_assistant && (
+          <p className="assistant" role="note">
+            An AI assistant on {request.peer_name} asked for this file.
+          </p>
+        )}
+        {fetch && (
+          <p className="reason">
+            {fetch.reason.trim() ? (
+              <>Reason given: “{fetch.reason.trim()}”</>
+            ) : (
+              "No reason given."
+            )}
+          </p>
+        )}
         <p className="countdown">Declines automatically in {left}s</p>
         <div className="actions">
           <button onClick={() => onAnswer(request, false)}>Decline</button>
           <button className="primary" onClick={() => onAnswer(request, true)} autoFocus>
-            Accept
+            {fetch ? "Approve" : "Accept"}
           </button>
         </div>
       </div>

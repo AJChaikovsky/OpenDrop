@@ -6,7 +6,9 @@
 pub mod control;
 pub mod daemon;
 pub mod discovery;
+pub mod error;
 pub mod identity;
+pub mod mcp;
 pub mod network;
 pub mod pairing;
 pub mod protocol;

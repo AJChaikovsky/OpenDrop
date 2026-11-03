@@ -151,18 +151,30 @@ pub fn run() {
                 // Prefer the standard port so CLI peers can reach us by IP
                 // alone; if something already has it, take any port (mDNS
                 // advertises the real one).
-                match Node::start(
+                match Node::start_with_config(
                     identity.clone(),
                     Arc::clone(&paired),
                     DEFAULT_PORT,
                     download_dir.clone(),
                     true,
                     sink.clone(),
+                    Some(config_dir.clone()),
                 )
                 .await
                 {
                     Ok(node) => Ok(node),
-                    Err(_) => Node::start(identity, paired, 0, download_dir, true, sink).await,
+                    Err(_) => {
+                        Node::start_with_config(
+                            identity,
+                            paired,
+                            0,
+                            download_dir,
+                            true,
+                            sink,
+                            Some(config_dir),
+                        )
+                        .await
+                    }
                 }
             })
             .map_err(|e| e.to_string())?;

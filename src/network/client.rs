@@ -1,9 +1,12 @@
 //! Connects to another device and talks to it.
 
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity, handshake};
+use crate::error::{self, coded};
 use crate::pairing::store::PairedDevices;
 use crate::pairing::{self, PairOutcome, PairPrompts};
-use crate::protocol::{FetchDeclineReason, Message, SharedFile, read_message, write_message};
+use crate::protocol::{
+    ErrorCode, FetchDeclineReason, Message, SharedFile, read_message, write_message,
+};
 use crate::transfer::{copy_hashed, sanitize_file_name};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -287,6 +290,13 @@ async fn recv_within(stream: &mut TcpStream, limit: Duration) -> Result<Message,
 
 fn unexpected(message: Message) -> BoxError {
     match message {
+        Message::Error {
+            code: ErrorCode::NotPaired,
+            message,
+        } => coded(
+            error::ErrorCode::NotPaired,
+            format!("peer refused (NotPaired): {message}"),
+        ),
         Message::Error { code, message } => format!("peer refused ({code:?}): {message}").into(),
         other => format!("unexpected reply from peer: {other:?}").into(),
     }

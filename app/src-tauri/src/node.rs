@@ -13,6 +13,7 @@ use opendrop::network::{BoxError, DeviceIdentity};
 use opendrop::pairing::store::PairedDevices;
 use opendrop::pairing::{PairOutcome, PairPrompt, PairPrompts, PairResult};
 use opendrop::protocol::PROTOCOL_VERSION;
+use opendrop::share::Shares;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -69,6 +70,15 @@ pub enum PairStatus {
     Failed,
 }
 
+/// What a request for one of our shared files adds to the prompt.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FetchDetails {
+    /// Why the requester wants it, in its own words (may be empty).
+    pub reason: String,
+    /// The requester says an AI assistant asked for the file.
+    pub via_assistant: bool,
+}
+
 /// Everything the UI needs to hear about. Serialized as
 /// `{"kind": "send_progress", ...}` for the frontend.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -78,13 +88,15 @@ pub enum AppEvent {
     Devices {
         devices: Vec<Device>,
     },
-    /// Someone wants to send us a file; answer with [`Node::respond`].
+    /// Someone wants to send us a file, or (with `fetch`) asks for one of
+    /// ours; answer with [`Node::respond`].
     IncomingRequest {
         transfer_id: String,
         peer_name: String,
         peer_ip: String,
         name: String,
         size: u64,
+        fetch: Option<FetchDetails>,
     },
     /// An incoming request was not answered in time or its sender gave up.
     IncomingExpired {
@@ -183,7 +195,8 @@ impl Node {
     /// Listen on `port` (0 lets the OS pick), save accepted files in
     /// `download_dir`, trust the devices in `paired`, and with `discover`
     /// advertise and browse over mDNS. Must be called from within a Tokio
-    /// runtime.
+    /// runtime. Tests use it; the app passes its config dir.
+    #[cfg(test)]
     pub async fn start(
         identity: DeviceIdentity,
         paired: Arc<PairedDevices>,
@@ -192,6 +205,24 @@ impl Node {
         discover: bool,
         sink: EventSink,
     ) -> Result<Arc<Self>, BoxError> {
+        Self::start_with_config(identity, paired, port, download_dir, discover, sink, None).await
+    }
+
+    /// [`Node::start`], and with `config_dir` also share what `opendrop
+    /// share` lists there and serve the control API (so `opendrop mcp` and
+    /// the CLI can use the app as their daemon).
+    pub async fn start_with_config(
+        identity: DeviceIdentity,
+        paired: Arc<PairedDevices>,
+        port: u16,
+        download_dir: PathBuf,
+        discover: bool,
+        sink: EventSink,
+        config_dir: Option<PathBuf>,
+    ) -> Result<Arc<Self>, BoxError> {
+        let shares = config_dir
+            .as_deref()
+            .map(|config| Arc::new(Shares::new(config, Some(&download_dir))));
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (requests, request_rx) = mpsc::channel(16);
         let (events, event_rx) = mpsc::unbounded_channel();
@@ -222,6 +253,8 @@ impl Node {
             pair_prompts: Some(pair_prompts.clone()),
             pair_results: Some(pair_results),
             discover,
+            control: config_dir,
+            shares,
             ..daemon::Options::new(
                 identity.clone(),
                 download_dir.clone(),
@@ -523,8 +556,7 @@ async fn forward_requests(
             name,
             size,
             respond,
-            // The app has no fetch wording yet; it asks as for any file.
-            fetch: _,
+            fetch,
         } = request;
         // The server drops its end after APPROVAL_TIMEOUT or if the sender
         // hangs up; we notice by holding a watch on it.
@@ -539,6 +571,10 @@ async fn forward_requests(
             peer_ip: peer_addr.ip().to_string(),
             name,
             size,
+            fetch: fetch.map(|f| FetchDetails {
+                reason: f.reason,
+                via_assistant: f.via_assistant,
+            }),
         });
         let pending = Arc::clone(&pending);
         let sink = sink.clone();
@@ -755,6 +791,108 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("timed out; got {log:?}"));
         log
+    }
+
+    /// Issue #24: the app shares what `opendrop share` lists in its config
+    /// dir, and a fetch reaches the window with who asked, the file, the
+    /// reason and whether an assistant asked. Approving sends it.
+    #[tokio::test]
+    async fn fetch_requests_reach_the_window_with_their_details() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let docs = root.path().join("Docs");
+        std::fs::create_dir(&docs).unwrap();
+        let content = b"Line one.\nThe quarterly numbers are in blue folder nine.\n".to_vec();
+        std::fs::write(docs.join("notes.txt"), &content).unwrap();
+        Shares::new(&config, Some(&root.path().join("dl")))
+            .add(&docs)
+            .unwrap();
+
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let sink: EventSink = Arc::new(move |e| {
+            let _ = tx.send(e);
+        });
+        let owner = Node::start_with_config(
+            DeviceIdentity::new("Mac"),
+            Arc::new(PairedDevices::in_memory()),
+            0,
+            root.path().join("dl"),
+            false,
+            sink,
+            Some(config.clone()),
+        )
+        .await
+        .unwrap();
+        let requester_id = DeviceIdentity::new("PC");
+        let requester_paired = Arc::new(PairedDevices::in_memory());
+        let pair = |store: &PairedDevices, other: &DeviceIdentity| {
+            store
+                .insert(opendrop::pairing::store::PairedDevice::new(
+                    other.id.clone(),
+                    other.name.clone(),
+                    other.public_key(),
+                ))
+                .unwrap()
+        };
+        pair(&owner.paired, &requester_id);
+        pair(&requester_paired, &owner.identity);
+        let requester = Daemon::start(daemon::Options {
+            port: 0,
+            discover: false,
+            paired: requester_paired,
+            ..daemon::Options::new(requester_id, root.path().join("pc-dl"), Approval::AcceptAll)
+        })
+        .await
+        .unwrap();
+
+        let id = requester
+            .fetch(
+                &format!("127.0.0.1:{}", owner.port),
+                "notes.txt",
+                "To summarize your notes",
+                true,
+            )
+            .await
+            .unwrap();
+        let asked = until(&mut events, |e| {
+            matches!(e, AppEvent::IncomingRequest { .. })
+        })
+        .await;
+        let AppEvent::IncomingRequest {
+            transfer_id,
+            peer_name,
+            name,
+            size,
+            fetch,
+            ..
+        } = asked.last().unwrap()
+        else {
+            panic!("{asked:?}")
+        };
+        assert_eq!(
+            (peer_name.as_str(), name.as_str(), *size),
+            ("PC", "notes.txt", content.len() as u64)
+        );
+        assert_eq!(
+            fetch,
+            &Some(FetchDetails {
+                reason: "To summarize your notes".into(),
+                via_assistant: true,
+            })
+        );
+        assert!(owner.respond(transfer_id, true));
+
+        let mut row = None;
+        for _ in 0..500 {
+            row = requester.transfers.get(&id).filter(|t| t.status.is_final());
+            if row.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let row = row.expect("fetch finished");
+        assert_eq!(row.status, Status::Done, "{row:?}");
+        assert_eq!(row.sha256.as_deref(), Some(sha256_hex(&content).as_str()));
     }
 
     #[tokio::test]
