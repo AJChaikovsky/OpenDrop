@@ -209,13 +209,28 @@ fn to_value<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
+/// Drops the `$schema` keyword from every tool's input and output schema.
+/// Some MCP relays (seen with Claude Desktop's remote-devices link) send
+/// empty arguments to tools whose schema names a draft; the rest of the
+/// schema is plain JSON Schema that every client reads the same way.
+fn plain_schemas<S>(mut router: ToolRouter<S>) -> ToolRouter<S> {
+    for route in router.map.values_mut() {
+        let tool = &mut route.attr;
+        std::sync::Arc::make_mut(&mut tool.input_schema).remove("$schema");
+        if let Some(output) = tool.output_schema.as_mut() {
+            std::sync::Arc::make_mut(output).remove("$schema");
+        }
+    }
+    router
+}
+
 #[tool_router]
 impl OpenDropMcp {
     /// A server talking to the daemon at `endpoint`.
     pub fn new(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
-            tool_router: Self::tool_router(),
+            tool_router: plain_schemas(Self::tool_router()),
         }
     }
 

@@ -173,6 +173,11 @@ async fn lists_exactly_five_tools_with_valid_schemas() {
     for tool in &tools {
         let schema = Value::Object((*tool.input_schema).clone());
         assert_eq!(schema["type"], "object", "{}: {schema}", tool.name);
+        assert!(
+            schema.get("$schema").is_none(),
+            "{} names a draft in its schema, which some relays mishandle",
+            tool.name
+        );
         if let Err(e) = jsonschema::meta::validate(&schema) {
             panic!("{} has an invalid input schema: {e}\n{schema}", tool.name);
         }
