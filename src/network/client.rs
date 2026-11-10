@@ -1,17 +1,20 @@
 //! Connects to another device and talks to it.
 
-use super::secure::SecureStream;
+use super::secure::{SecureStream, is_peer_cancel};
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity, handshake};
 use crate::error::{self, coded};
 use crate::pairing::store::PairedDevices;
 use crate::pairing::{self, PairOutcome, PairPrompts};
+use crate::protocol::FolderEntry;
 use crate::protocol::{
-    ErrorCode, FetchDeclineReason, Message, SharedFile, read_message, write_message,
+    ErrorCode, FetchDeclineReason, Message, ProtocolError, SharedFile, read_message, write_message,
 };
+use crate::transfer::folder::{check_listing, folder_name, list_folder, tree_hash};
 use crate::transfer::{copy_hashed, sanitize_file_name};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 /// Result of a successful `send_text`.
@@ -37,6 +40,10 @@ pub enum FileResult {
     /// The receiver said no (or didn't answer in time). Nothing was sent, and
     /// the connection is still usable.
     Declined,
+    /// We called it off midway (and told the receiver).
+    Cancelled,
+    /// The receiver called it off midway.
+    CancelledByPeer,
 }
 
 /// An open, introduced connection to a peer. Several texts and files can be
@@ -124,7 +131,18 @@ impl Connection {
         path: &Path,
         progress: &mut (dyn FnMut(u64) + Send),
     ) -> Result<FileResult, BoxError> {
-        self.offer(path, None, progress).await
+        self.offer(path, None, progress, None).await
+    }
+
+    /// [`Connection::send_file`] that stops when `stop` fires, telling the
+    /// receiver so it can clean up ([`FileResult::Cancelled`]).
+    pub async fn send_file_until(
+        &mut self,
+        path: &Path,
+        progress: &mut (dyn FnMut(u64) + Send),
+        stop: oneshot::Receiver<()>,
+    ) -> Result<FileResult, BoxError> {
+        self.offer(path, None, progress, Some(stop)).await
     }
 
     /// [`Connection::send_file`] in answer to the peer's fetch `fetch_id`
@@ -135,7 +153,145 @@ impl Connection {
         fetch_id: &str,
         progress: &mut (dyn FnMut(u64) + Send),
     ) -> Result<FileResult, BoxError> {
-        self.offer(path, Some(fetch_id), progress).await
+        self.offer(path, Some(fetch_id), progress, None).await
+    }
+
+    /// Send the folder at `path` as one transfer: one approval for all of
+    /// it, its tree recreated under the receiver's download folder. The
+    /// outcome's `sha256` is the folder's [`tree_hash`]; `progress` gets
+    /// bytes so far across all files. Stops (and tells the receiver) when
+    /// `stop` fires.
+    pub async fn send_folder_until(
+        &mut self,
+        path: &Path,
+        progress: &mut (dyn FnMut(u64) + Send),
+        stop: Option<oneshot::Receiver<()>>,
+    ) -> Result<FileResult, BoxError> {
+        let mut stop = stop;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(folder_name)
+            .ok_or_else(|| format!("{} has no usable folder name", path.display()))?;
+        let listing = {
+            let root = path.to_owned();
+            tokio::task::spawn_blocking(move || list_folder(&root))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("could not read {}: {e}", path.display()))?
+        };
+        let entries: Vec<FolderEntry> = listing.iter().map(|(_, e)| e.clone()).collect();
+        check_listing(&entries).map_err(|e| format!("can't send {}: {e}", path.display()))?;
+        let size: u64 = entries.iter().map(|e| e.size).sum();
+        let transfer_id = new_transfer_id();
+        write_message(
+            &mut self.stream,
+            &Message::FolderOffer {
+                transfer_id: transfer_id.clone(),
+                name: name.clone(),
+                files: entries.len() as u64,
+                size,
+            },
+        )
+        .await?;
+        for chunk in entry_chunks(&entries) {
+            write_message(
+                &mut self.stream,
+                &Message::FolderEntries {
+                    transfer_id: transfer_id.clone(),
+                    entries: chunk.to_vec(),
+                },
+            )
+            .await?;
+        }
+        let answer = recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT);
+        let answer = tokio::select! {
+            answer = answer => answer?,
+            () = stop_signal(&mut stop) => return Ok(FileResult::Cancelled),
+        };
+        match answer {
+            Message::FileAccept { transfer_id: id } if id == transfer_id => {}
+            Message::FileDecline { transfer_id: id } if id == transfer_id => {
+                return Ok(FileResult::Declined);
+            }
+            other => return Err(unexpected(other)),
+        }
+
+        let streamed = {
+            let (mut reader, mut writer) = tokio::io::split(&mut self.stream);
+            let send_all = async {
+                let mut hashes = Vec::with_capacity(listing.len());
+                let mut before = 0u64;
+                for (disk, entry) in &listing {
+                    let mut file = tokio::fs::File::open(disk)
+                        .await
+                        .map_err(|e| folder_error(disk, e))?;
+                    let now = file
+                        .metadata()
+                        .await
+                        .map_err(|e| folder_error(disk, e))?
+                        .len();
+                    if now != entry.size {
+                        return Err(std::io::Error::other(format!(
+                            "{} changed while it was being sent",
+                            disk.display()
+                        )));
+                    }
+                    let sha256 = copy_hashed(&mut file, &mut writer, entry.size, &mut |sent| {
+                        progress(before + sent)
+                    })
+                    .await?;
+                    before += entry.size;
+                    write_message(
+                        &mut writer,
+                        &Message::FileDone {
+                            transfer_id: transfer_id.clone(),
+                            sha256: sha256.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(std::io::Error::other)?;
+                    hashes.push(sha256);
+                }
+                Ok(hashes)
+            };
+            tokio::select! {
+                sent = send_all => Ok(sent),
+                said = read_message(&mut reader) => Err(Some(said)),
+                () = stop_signal(&mut stop) => Err(None),
+            }
+        };
+        let hashes = match streamed {
+            Ok(Ok(hashes)) => hashes,
+            Err(None) => {
+                let _ = timeout(CANCEL_TIMEOUT, self.stream.cancel()).await;
+                return Ok(FileResult::Cancelled);
+            }
+            Err(Some(said)) => return interrupted(said),
+            Ok(Err(e)) => {
+                return match recv(&mut self.stream).await {
+                    Ok(Message::Cancel { .. }) => Ok(FileResult::CancelledByPeer),
+                    Ok(reply) => Err(unexpected(reply)),
+                    Err(_) => Err(format!("transfer interrupted: {e}").into()),
+                };
+            }
+        };
+        match recv(&mut self.stream).await? {
+            Message::FileReceived {
+                transfer_id: id,
+                received_bytes,
+            } if id == transfer_id && received_bytes == size => {
+                let sha256 = tree_hash(
+                    entries
+                        .iter()
+                        .zip(&hashes)
+                        .map(|(e, h)| (e.path.as_str(), h.as_str())),
+                );
+                Ok(FileResult::Delivered(FileOutcome { name, size, sha256 }))
+            }
+            Message::Cancel { .. } => Ok(FileResult::CancelledByPeer),
+            other => Err(unexpected(other)),
+        }
     }
 
     /// The files the peer shares with us (if we're paired), and whether the
@@ -194,6 +350,7 @@ impl Connection {
         path: &Path,
         fetch_id: Option<&str>,
         progress: &mut (dyn FnMut(u64) + Send),
+        mut stop: Option<oneshot::Receiver<()>>,
     ) -> Result<FileResult, BoxError> {
         let mut file = tokio::fs::File::open(path)
             .await
@@ -226,7 +383,14 @@ impl Connection {
         write_message(&mut self.stream, &offer).await?;
         // The receiver may be asking its user, so allow for that on top of
         // the usual network delay.
-        match recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT).await? {
+        let answer = recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT);
+        let answer = tokio::select! {
+            answer = answer => answer?,
+            // Not started yet: hanging up is enough, the receiver's prompt
+            // goes away when the connection does.
+            () = stop_signal(&mut stop) => return Ok(FileResult::Cancelled),
+        };
+        match answer {
             Message::FileAccept { transfer_id: id } if id == transfer_id => {}
             Message::FileDecline { transfer_id: id } if id == transfer_id => {
                 return Ok(FileResult::Declined);
@@ -234,14 +398,31 @@ impl Connection {
             other => return Err(unexpected(other)),
         }
 
-        let sha256 = match copy_hashed(&mut file, &mut self.stream, size, progress).await {
-            Ok(hash) => hash,
+        // Stream the bytes while listening for the receiver calling it off.
+        // It sends nothing else until we're done, so the read below never
+        // has half a message in hand when the copy wins.
+        let streamed = {
+            let (mut reader, mut writer) = tokio::io::split(&mut self.stream);
+            tokio::select! {
+                copied = copy_hashed(&mut file, &mut writer, size, progress) => Streamed::Copied(copied),
+                said = read_message(&mut reader) => Streamed::Interrupted(said),
+                () = stop_signal(&mut stop) => Streamed::Stopped,
+            }
+        };
+        let sha256 = match streamed {
+            Streamed::Copied(Ok(hash)) => hash,
+            Streamed::Stopped => {
+                let _ = timeout(CANCEL_TIMEOUT, self.stream.cancel()).await;
+                return Ok(FileResult::Cancelled);
+            }
+            Streamed::Interrupted(said) => return interrupted(said),
             // If the peer hung up mid-transfer it probably said why first.
-            Err(e) => {
-                return Err(match recv(&mut self.stream).await {
-                    Ok(reply) => unexpected(reply),
-                    Err(_) => format!("transfer interrupted: {e}").into(),
-                });
+            Streamed::Copied(Err(e)) => {
+                return match recv(&mut self.stream).await {
+                    Ok(Message::Cancel { .. }) => Ok(FileResult::CancelledByPeer),
+                    Ok(reply) => Err(unexpected(reply)),
+                    Err(_) => Err(format!("transfer interrupted: {e}").into()),
+                };
             }
         };
         write_message(
@@ -262,6 +443,61 @@ impl Connection {
             other => Err(unexpected(other)),
         }
     }
+}
+
+fn folder_error(path: &Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("could not read {}: {e}", path.display()))
+}
+
+/// The listing split into pieces that each fit in one message.
+fn entry_chunks(entries: &[FolderEntry]) -> Vec<&[FolderEntry]> {
+    const BUDGET: usize = 48 * 1024;
+    let mut chunks = Vec::new();
+    let (mut start, mut used) = (0, 0);
+    for (i, entry) in entries.iter().enumerate() {
+        // Path plus JSON punctuation and the size; quotes and backslashes
+        // are rejected in names, so nothing needs escaping.
+        let cost = entry.path.len() + 40;
+        if used + cost > BUDGET && i > start {
+            chunks.push(&entries[start..i]);
+            (start, used) = (i, 0);
+        }
+        used += cost;
+    }
+    if start < entries.len() {
+        chunks.push(&entries[start..]);
+    }
+    chunks
+}
+
+/// How long telling the other side about a cancel may take.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
+
+enum Streamed {
+    Copied(std::io::Result<String>),
+    Interrupted(Result<Message, ProtocolError>),
+    Stopped,
+}
+
+/// The receiver said something (or hung up) while the file was streaming.
+fn interrupted(said: Result<Message, ProtocolError>) -> Result<FileResult, BoxError> {
+    match said {
+        Ok(Message::Cancel { .. }) => Ok(FileResult::CancelledByPeer),
+        Ok(other) => Err(unexpected(other)),
+        Err(e) if is_peer_cancel(&e) => Ok(FileResult::CancelledByPeer),
+        Err(e) => Err(format!("transfer interrupted: {e}").into()),
+    }
+}
+
+/// Resolves when `stop` fires; never, if there's no stop or its sender went
+/// away without firing.
+async fn stop_signal(stop: &mut Option<oneshot::Receiver<()>>) {
+    if let Some(rx) = stop
+        && rx.await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
 }
 
 /// Connect to `addr`, introduce ourselves, send `body`, and wait for the

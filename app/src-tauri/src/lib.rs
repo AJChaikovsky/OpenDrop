@@ -1,15 +1,18 @@
 //! Tauri shell around [`node::Node`]: commands in, events out.
 
+mod background;
+mod context_menu;
+mod history;
 mod node;
 
 use node::{AppEvent, Device, EventSink, Node};
 use opendrop::DEFAULT_PORT;
-use opendrop::identity::{DeviceIdentity, default_config_dir};
+use opendrop::identity::{DeviceIdentity, default_config_dir, default_device_name};
 use opendrop::pairing::store::PairedDevices;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
 /// The window listens for every [`AppEvent`] on this event name.
@@ -25,6 +28,17 @@ struct Me {
     /// Something the user should know about, e.g. a damaged paired-devices
     /// file.
     warning: Option<String>,
+}
+
+/// Files picked with "Send with OpenDrop" that the window hasn't taken yet.
+#[derive(Default)]
+struct SendQueue(Mutex<Vec<String>>);
+
+/// Queue `paths` for the window to send, and bring it up to ask where.
+fn queue_send<R: tauri::Runtime>(app: &tauri::AppHandle<R>, paths: Vec<String>) {
+    app.state::<SendQueue>().0.lock().unwrap().extend(paths);
+    background::show_window(app);
+    let _ = app.emit(EVENT, AppEvent::SendRequested);
 }
 
 /// A problem found at startup, shown in the window.
@@ -78,6 +92,56 @@ fn respond(
 
 /// The audit log, newest first (the Activity view).
 #[tauri::command]
+fn cancel_transfer(node: State<'_, Arc<Node>>, transfer_id: String) -> Result<(), String> {
+    node.cancel(&transfer_id)
+}
+
+/// The files waiting to be sent from "Send with OpenDrop", emptied.
+#[tauri::command]
+fn take_send_paths(queue: State<'_, SendQueue>) -> Vec<String> {
+    std::mem::take(&mut *queue.0.lock().unwrap())
+}
+
+/// Whether "Send with OpenDrop" is in the right-click menu, or `None` where
+/// it isn't available (Linux).
+#[tauri::command]
+fn context_menu_status() -> Option<bool> {
+    (cfg!(windows) || cfg!(target_os = "macos")).then(context_menu::installed)
+}
+
+/// Add or remove "Send with OpenDrop" in the right-click menu.
+#[tauri::command]
+fn set_context_menu(enabled: bool) -> Result<(), String> {
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        context_menu::install(&exe)
+    } else {
+        context_menu::uninstall()
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Finished transfers, newest first (the History view).
+#[tauri::command]
+fn history(node: State<'_, Arc<Node>>) -> Vec<history::Entry> {
+    node.history.entries(500)
+}
+
+/// Open the file browser at a received file or folder from the history.
+#[tauri::command]
+fn show_in_folder(node: State<'_, Arc<Node>>, path: String) -> Result<(), String> {
+    // Only paths the history recorded, so the window can't open anything.
+    if !node.history.has_path(&path) {
+        return Err("not a file from the history".into());
+    }
+    let path = PathBuf::from(path);
+    if !path.exists() {
+        return Err(format!("{} is no longer there", path.display()));
+    }
+    history::reveal(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn audit(node: State<'_, Arc<Node>>) -> Vec<opendrop::audit::Entry> {
     node.audit(500)
 }
@@ -124,17 +188,39 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         pair_device,
         respond_pair,
         unpair_device,
-        audit
+        audit,
+        cancel_transfer,
+        history,
+        show_in_folder,
+        take_send_paths,
+        context_menu_status,
+        set_context_menu
     ])
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     with_commands(tauri::Builder::default())
+        // First, so a second copy (started by "Send with OpenDrop") hands
+        // its files to this one and exits before doing anything else.
+        .plugin(tauri_plugin_single_instance::init(
+            |app, argv, _cwd| match context_menu::send_args(&argv) {
+                Some(paths) => queue_send(app, paths),
+                None => background::show_window(app),
+            },
+        ))
+        .manage(SendQueue::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            background::setup(app)?;
+            let argv: Vec<String> = std::env::args().collect();
+            if let Some(paths) = context_menu::send_args(&argv) {
+                app.state::<SendQueue>().0.lock().unwrap().extend(paths);
+            }
             let handle = app.handle().clone();
             let sink: EventSink = Arc::new(move |event: AppEvent| {
+                background::on_event(&handle, &event);
                 let _ = handle.emit(EVENT, event);
             });
             // OPENDROP_NAME, OPENDROP_DIR and OPENDROP_CONFIG_DIR let two
@@ -147,7 +233,7 @@ pub fn run() {
                         .unwrap_or_else(|_| PathBuf::from("."))
                         .join("OpenDrop")
                 });
-            let name = std::env::var("OPENDROP_NAME").unwrap_or_else(|_| device_name());
+            let name = std::env::var("OPENDROP_NAME").unwrap_or_else(|_| default_device_name());
             let config_dir = default_config_dir();
             let identity =
                 DeviceIdentity::load_or_create(&config_dir, name).map_err(|e| e.to_string())?;
@@ -193,31 +279,16 @@ pub fn run() {
             app.manage(node);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
-
-/// The name people know this computer by: "AJ's MacBook Pro" on macOS, the
-/// computer name on Windows, the hostname elsewhere.
-fn device_name() -> String {
-    let command = |program: &str, args: &[&str]| {
-        std::process::Command::new(program)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-    };
-    let name = if cfg!(target_os = "macos") {
-        command("scutil", &["--get", "ComputerName"])
-    } else {
-        None
-    };
-    name.or_else(|| std::env::var("COMPUTERNAME").ok())
-        .or_else(|| command("hostname", &[]))
-        .map(|s| s.trim().trim_end_matches(".local").to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "OpenDrop device".to_owned())
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // macOS: clicking the Dock icon brings the hidden window back.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                background::show_window(app);
+            }
+            let _ = (app, event);
+        });
 }
 
 #[cfg(test)]

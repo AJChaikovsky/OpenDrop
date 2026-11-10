@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { tauriApi, type Api } from "./api";
-import { formatSize, formatSpeed, initialState, reducer, type Transfer } from "./transfers";
-import type { AuditEntry, Device, IncomingRequest, Me, PairCode } from "./types";
+import { formatSize, formatSpeed, initialState, plural, reducer, type Transfer } from "./transfers";
+import type { AuditEntry, Device, HistoryEntry, IncomingRequest, Me, PairCode } from "./types";
 import "./App.css";
 
 /** Seconds the receiver has to answer; matches APPROVAL_TIMEOUT in the crate. */
@@ -15,6 +15,8 @@ export default function App({ api = tauriApi }: { api?: Api }) {
   const [me, setMe] = useState<Me | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Files from "Send with OpenDrop", waiting for a device to be picked. */
+  const [queued, setQueued] = useState<string[]>([]);
 
   const send = useCallback(
     async (target: { deviceId?: string; address?: string }, paths: string[]) => {
@@ -33,7 +35,18 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     let cleanups: (() => void)[] = [];
     let cancelled = false;
     const keep = (unlisten: () => void) => (cancelled ? unlisten() : cleanups.push(unlisten));
-    api.onEvent(dispatch).then(keep);
+    const takeQueued = () =>
+      api
+        .takeSendPaths()
+        .then((paths) => paths.length > 0 && setQueued((q) => [...q, ...paths.filter((p) => !q.includes(p))]))
+        .catch(() => {});
+    api
+      .onEvent((event) => {
+        if (event.kind === "send_requested") takeQueued();
+        dispatch(event);
+      })
+      .then(keep);
+    takeQueued();
     api
       .onDrag((drag) => {
         const id = drag.type === "leave" ? null : deviceAt(drag.x, drag.y);
@@ -43,6 +56,10 @@ export default function App({ api = tauriApi }: { api?: Api }) {
       .then(keep);
     api.me().then(setMe).catch((e) => setError(String(e)));
     api.devices().then((devices) => dispatch({ kind: "set_devices", devices }));
+    api
+      .history()
+      .then((entries) => dispatch({ kind: "set_history", entries }))
+      .catch(() => dispatch({ kind: "set_history", entries: [] }));
     return () => {
       cancelled = true;
       cleanups.forEach((f) => f());
@@ -50,13 +67,27 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     };
   }, [api, send]);
 
+  // With files waiting from the right-click menu, picking a device sends
+  // those; otherwise it opens the file picker.
   const pickAndSend = async (target: { deviceId?: string; address?: string }) => {
+    if (queued.length > 0) {
+      const paths = queued;
+      setQueued([]);
+      send(target, paths);
+      return;
+    }
     send(target, await api.pickFiles());
   };
 
   const answer = (request: IncomingRequest, accept: boolean, allowFolder = false) => {
     dispatch({ kind: "answered", transfer_id: request.transfer_id });
     api.respond(request.transfer_id, accept, accept && allowFolder);
+  };
+
+  // The row turns "cancelled" when the matching event arrives; a transfer
+  // that ended in the meantime just keeps its final state.
+  const cancel = (t: Transfer) => {
+    api.cancelTransfer(t.id).catch(() => {});
   };
 
   const pair = async (device: Device) => {
@@ -116,7 +147,17 @@ export default function App({ api = tauriApi }: { api?: Api }) {
             ))}
           </ul>
         )}
-        <p className="hint">Click a device to choose files, or drag files onto it.</p>
+        {queued.length > 0 ? (
+          <div className="queued" role="status">
+            <span>
+              Choose a device to send{" "}
+              <strong>{queued.length === 1 ? baseName(queued[0]) : plural(queued.length, "item")}</strong>
+            </span>
+            <button onClick={() => setQueued([])}>Cancel</button>
+          </div>
+        ) : (
+          <p className="hint">Click a device to choose files, or drag files onto it.</p>
+        )}
         <AddressForm onSend={(address) => pickAndSend({ address })} />
         {error && (
           <p className="error" role="alert">
@@ -135,13 +176,17 @@ export default function App({ api = tauriApi }: { api?: Api }) {
           <h2>Transfers</h2>
           <ul className="transfers">
             {state.transfers.map((t) => (
-              <TransferRow key={t.id} transfer={t} />
+              <TransferRow key={t.id} transfer={t} onCancel={cancel} />
             ))}
           </ul>
         </section>
       )}
 
+      <History entries={state.history} onShow={(path) => api.showInFolder(path).catch((e) => setError(String(e)))} />
+
       <Activity api={api} />
+
+      <ContextMenuSetting api={api} />
 
       {state.pairing ? (
         <PairDialog key={state.pairing.pair_id} pairing={state.pairing} onAnswer={answerPair} />
@@ -151,6 +196,91 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         )
       )}
     </main>
+  );
+}
+
+/** The last part of a path, on any OS. */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+/** Turn "Send with OpenDrop" in the right-click menu on or off. Hidden where
+ * the OS has no such menu entry (Linux). */
+function ContextMenuSetting({ api }: { api: Api }) {
+  const [installed, setInstalled] = useState<boolean | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  useEffect(() => {
+    api
+      .contextMenuStatus()
+      .then(setInstalled)
+      .catch(() => setInstalled(null));
+  }, [api]);
+  if (installed === null) return null;
+  const toggle = () =>
+    api
+      .setContextMenu(!installed)
+      .then(() => {
+        setInstalled(!installed);
+        setFailed(null);
+      })
+      .catch((e) => setFailed(String(e)));
+  return (
+    <section className="context-menu">
+      <h2>Right-click menu</h2>
+      <p>
+        {installed
+          ? "“Send with OpenDrop” is in the right-click menu for files and folders."
+          : "Add “Send with OpenDrop” to the right-click menu for files and folders."}
+      </p>
+      <button onClick={toggle}>{installed ? "Remove from the menu" : "Add to the menu"}</button>
+      {failed && (
+        <p className="error" role="alert">
+          {failed}
+        </p>
+      )}
+    </section>
+  );
+}
+
+const RESULT_LABELS: Record<HistoryEntry["result"], string> = {
+  done: "Done",
+  declined: "Declined",
+  failed: "Failed",
+  cancelled: "Cancelled",
+};
+
+/** Finished transfers, newest first, kept across restarts. */
+function History({ entries, onShow }: { entries: HistoryEntry[] | null; onShow: (path: string) => void }) {
+  if (entries === null) return null;
+  return (
+    <section className="history">
+      <h2>History</h2>
+      {entries.length === 0 ? (
+        <p className="empty">Nothing sent or received yet.</p>
+      ) : (
+        <ul className="history-list">
+          {entries.map((e, i) => (
+            <li key={`${e.at_ms}-${i}`} className={`history-entry history-${e.result}`}>
+              <span className="history-what">
+                {e.direction === "sent" ? "↑ Sent to" : "↓ Received from"} {e.peer} · <strong>{e.name}</strong>
+                {e.files != null && <> · folder, {plural(e.files, "file")}</>} · {formatSize(e.size)}
+              </span>
+              <span className="history-when">
+                <time dateTime={new Date(e.at_ms).toISOString()}>{new Date(e.at_ms).toLocaleString()}</time>
+                {" · "}
+                <span className="history-result">{RESULT_LABELS[e.result]}</span>
+                {e.detail && <span className="detail"> ({e.detail})</span>}
+              </span>
+              {e.path && e.result === "done" && (
+                <button className="history-show" onClick={() => onShow(e.path!)} aria-label={`Show ${e.name} in folder`}>
+                  Show in folder
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 
@@ -345,15 +475,19 @@ const STATUS_TEXT: Record<Transfer["status"], string> = {
   done: "Done",
   declined: "Declined",
   failed: "Failed",
+  cancelled: "Cancelled",
 };
 
-function TransferRow({ transfer: t }: { transfer: Transfer }) {
+function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: (t: Transfer) => void }) {
   const percent = t.size > 0 ? Math.floor((t.bytes / t.size) * 100) : 100;
   const arrow = t.direction === "send" ? `to ${t.peer}` : `from ${t.peer}`;
   return (
     <li className={`transfer ${t.status}`} aria-label={t.name}>
       <div className="transfer-line">
-        <span className="transfer-name">{t.name}</span>
+        <span className="transfer-name">
+          {t.name}
+          {t.files != null && <span className="transfer-files"> · folder, {plural(t.files, "file")}</span>}
+        </span>
         <span className="transfer-peer">{arrow}</span>
       </div>
       <progress max={100} value={t.status === "done" ? 100 : percent} />
@@ -367,6 +501,11 @@ function TransferRow({ transfer: t }: { transfer: Transfer }) {
         </span>
       </div>
       {t.detail && <div className="transfer-detail">{t.detail}</div>}
+      {(t.status === "waiting" || t.status === "active") && (
+        <button className="transfer-cancel" aria-label={`Cancel ${t.name}`} onClick={() => onCancel(t)}>
+          Cancel
+        </button>
+      )}
     </li>
   );
 }
@@ -380,6 +519,7 @@ function RequestDialog({
 }) {
   const [left, setLeft] = useState(ANSWER_SECONDS);
   const [allowFolder, setAllowFolder] = useState(false);
+  const folder = request.files != null;
   useEffect(() => {
     const timer = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(timer);
@@ -392,12 +532,17 @@ function RequestDialog({
   return (
     <div className="backdrop">
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="request-title">
-        <h2 id="request-title">{fetch ? "File request" : "Incoming file"}</h2>
+        <h2 id="request-title">{fetch ? "File request" : folder ? "Incoming folder" : "Incoming file"}</h2>
         <p>
-          <strong>{request.peer_name}</strong> ({request.peer_ip}) {fetch ? "asks for your file" : "wants to send you"}
+          <strong>{request.peer_name}</strong> ({request.peer_ip}){" "}
+          {fetch ? "asks for your file" : folder ? "wants to send you the folder" : "wants to send you"}
         </p>
         <p className="file">
-          {request.name} <span>{formatSize(request.size)}</span>
+          {request.name}{" "}
+          <span>
+            {folder ? `${plural(request.files ?? 0, "file")}, ` : ""}
+            {formatSize(request.size)}
+          </span>
         </p>
         {!request.verified && (
           <p className="unverified" role="note">

@@ -1,9 +1,9 @@
 // What the window shows: devices, incoming requests, pairing and transfers,
 // updated by one pure reducer so it can be tested without Tauri.
 
-import type { AppEvent, Device, IncomingRequest, PairCode, PairStatus } from "./types";
+import type { AppEvent, Device, HistoryEntry, IncomingRequest, PairCode, PairStatus } from "./types";
 
-export type TransferStatus = "waiting" | "active" | "done" | "declined" | "failed";
+export type TransferStatus = "waiting" | "active" | "done" | "declined" | "failed" | "cancelled";
 
 export interface Transfer {
   id: string;
@@ -17,6 +17,8 @@ export interface Transfer {
   status: TransferStatus;
   /** Saved path (received), or the error. */
   detail?: string;
+  /** Set for a folder: how many files it holds. */
+  files?: number;
   sha256?: string;
 }
 
@@ -30,13 +32,23 @@ export interface State {
   pairing: (PairCode & { confirmed: boolean }) | null;
   /** How the last pairing ended, until the next one starts. */
   pairNotice: { text: string; ok: boolean } | null;
+  /** Finished transfers, newest first; null until loaded. */
+  history: HistoryEntry[] | null;
 }
 
-export const initialState: State = { devices: [], requests: [], transfers: [], pairing: null, pairNotice: null };
+export const initialState: State = {
+  devices: [],
+  requests: [],
+  transfers: [],
+  pairing: null,
+  pairNotice: null,
+  history: null,
+};
 
 export type Action =
   | AppEvent
   | { kind: "set_devices"; devices: Device[] }
+  | { kind: "set_history"; entries: HistoryEntry[] }
   | { kind: "answered"; transfer_id: string }
   | { kind: "pair_answered"; pair_id: string; accept: boolean };
 
@@ -92,6 +104,7 @@ export function reducer(state: State, action: Action): State {
         bytes: 0,
         bytesPerSec: 0,
         status: "waiting",
+        files: action.files ?? undefined,
       });
     case "receive_progress":
     case "send_progress":
@@ -107,6 +120,12 @@ export function reducer(state: State, action: Action): State {
     case "receive_failed":
     case "send_failed":
       return update(action.transfer_id, { status: "failed", detail: action.error });
+    case "receive_cancelled":
+    case "send_cancelled": {
+      const t = state.transfers.find((x) => x.id === action.transfer_id);
+      const detail = action.by_peer && t ? `${t.peer} cancelled it` : undefined;
+      return update(action.transfer_id, { status: "cancelled", detail });
+    }
     case "pair_code":
       return { ...state, pairing: { ...action, confirmed: false }, pairNotice: null };
     case "pair_answered":
@@ -123,7 +142,17 @@ export function reducer(state: State, action: Action): State {
         pairNotice: { text, ok: action.status === "paired" },
       };
     }
+    case "send_requested":
+      return state;
+    case "set_history":
+      return { ...state, history: action.entries };
+    case "history_added":
+      return { ...state, history: [action.entry, ...(state.history ?? [])] };
   }
+}
+
+export function plural(n: number, word: string): string {
+  return `${n.toLocaleString("en-US")} ${word}${n === 1 ? "" : "s"}`;
 }
 
 export function formatSize(bytes: number): string {

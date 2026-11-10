@@ -3,11 +3,11 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Api, DragEvent } from "./api";
 import App from "./App";
-import type { AppEvent, AuditEntry, Device, Me } from "./types";
+import type { AppEvent, AuditEntry, Device, HistoryEntry, Me } from "./types";
 
 const pc: Device = { id: "device-pc", name: "AJ-PC", address: "192.168.1.30:45454", compatible: true, paired: false };
 
-function fakeApi(devices: Device[] = [pc]) {
+function fakeApi(devices: Device[] = [pc], history: HistoryEntry[] = []) {
   let emit: (e: AppEvent) => void = () => {};
   let drag: (e: DragEvent) => void = () => {};
   const api = {
@@ -21,6 +21,7 @@ function fakeApi(devices: Device[] = [pc]) {
     devices: vi.fn(async () => devices),
     sendFiles: vi.fn(async () => ["send-1"]),
     respond: vi.fn(async () => true),
+    cancelTransfer: vi.fn(async () => {}),
     pairDevice: vi.fn(async () => {}),
     respondPair: vi.fn(async () => true),
     unpairDevice: vi.fn(async () => true),
@@ -30,6 +31,11 @@ function fakeApi(devices: Device[] = [pc]) {
       { at_ms: 1_761_999_990_000, event: "request", peer_name: "AJ-PC", file: "q3.pdf", detail: "for the deck", via_assistant: true },
       { at_ms: 1_761_999_980_000, event: "list", peer_name: "AJ-PC", detail: "3 file(s)" },
     ]),
+    history: vi.fn(async () => history),
+    showInFolder: vi.fn(async () => {}),
+    takeSendPaths: vi.fn(async (): Promise<string[]> => []),
+    contextMenuStatus: vi.fn(async (): Promise<boolean | null> => false),
+    setContextMenu: vi.fn(async () => {}),
     onEvent: vi.fn(async (h: (e: AppEvent) => void) => ((emit = h), () => {})),
     onDrag: vi.fn(async (h: (e: DragEvent) => void) => ((drag = h), () => {})),
   } satisfies Api;
@@ -37,6 +43,156 @@ function fakeApi(devices: Device[] = [pc]) {
 }
 
 describe("App", () => {
+  it("asks for a device for files from the right-click menu, then sends them", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("button", { name: /AJ-PC/ });
+    api.takeSendPaths.mockResolvedValueOnce(["C:\\Users\\aj\\Desktop\\report.pdf"]);
+    await act(async () => emit({ kind: "send_requested" }));
+    expect(await screen.findByText("report.pdf")).toBeInTheDocument();
+    expect(screen.getByText(/Choose a device to send/)).toBeInTheDocument();
+    // Another file picked while waiting joins it.
+    api.takeSendPaths.mockResolvedValueOnce(["/Users/aj/notes"]);
+    await act(async () => emit({ kind: "send_requested" }));
+    expect(await screen.findByText("2 items")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /AJ-PC/ }));
+    expect(api.sendFiles).toHaveBeenCalledWith({ deviceId: "device-pc" }, [
+      "C:\\Users\\aj\\Desktop\\report.pdf",
+      "/Users/aj/notes",
+    ]);
+    expect(api.pickFiles).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Choose a device to send/)).not.toBeInTheDocument();
+    // Without queued files, a click opens the picker as before.
+    await userEvent.click(screen.getByRole("button", { name: /AJ-PC/ }));
+    expect(api.pickFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it("can cancel files queued from the right-click menu", async () => {
+    const { api } = fakeApi();
+    api.takeSendPaths.mockResolvedValueOnce(["/tmp/a.txt"]);
+    render(<App api={api} />);
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText(/Choose a device to send/)).not.toBeInTheDocument();
+    expect(api.sendFiles).not.toHaveBeenCalled();
+  });
+
+  it("adds and removes the right-click menu entry", async () => {
+    const { api } = fakeApi();
+    render(<App api={api} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Add to the menu" }));
+    expect(api.setContextMenu).toHaveBeenCalledWith(true);
+    await userEvent.click(await screen.findByRole("button", { name: "Remove from the menu" }));
+    expect(api.setContextMenu).toHaveBeenLastCalledWith(false);
+    expect(await screen.findByRole("button", { name: "Add to the menu" })).toBeInTheDocument();
+  });
+
+  it("hides the right-click menu setting where there is none", async () => {
+    const { api } = fakeApi();
+    api.contextMenuStatus.mockResolvedValue(null);
+    render(<App api={api} />);
+    await screen.findByRole("heading", { name: "History" });
+    expect(screen.queryByRole("heading", { name: "Right-click menu" })).not.toBeInTheDocument();
+  });
+
+  it("shows the saved history, adds finished transfers live, and opens received files", async () => {
+    const saved: HistoryEntry[] = [
+      { at_ms: 1_762_000_300_000, direction: "sent", peer: "Windows", name: "unwanted.txt", size: 40, result: "declined" },
+      {
+        at_ms: 1_762_000_200_000,
+        direction: "received",
+        peer: "Windows",
+        name: "Project X",
+        size: 1_200_000_000,
+        files: 500,
+        result: "done",
+        path: "/Users/aj/Downloads/OpenDrop/Project X",
+      },
+      { at_ms: 1_762_000_100_000, direction: "sent", peer: "Windows", name: "two.txt", size: 20, result: "done" },
+      { at_ms: 1_762_000_000_000, direction: "received", peer: "Windows", name: "big.bin", size: 5, result: "cancelled", detail: "the sender cancelled it" },
+    ];
+    const { api, emit } = fakeApi([pc], saved);
+    render(<App api={api} />);
+    const section = (await screen.findByRole("heading", { name: "History" })).closest("section")!;
+    const rows = () => within(section).getAllByRole("listitem");
+    expect(rows().map((li) => li.className)).toEqual([
+      "history-entry history-declined",
+      "history-entry history-done",
+      "history-entry history-done",
+      "history-entry history-cancelled",
+    ]);
+    expect(rows()[1]).toHaveTextContent("Received from Windows · Project X · folder, 500 files · 1.2 GB");
+    expect(rows()[3]).toHaveTextContent("Cancelled (the sender cancelled it)");
+    // Only finished received items can be shown in their folder.
+    expect(within(section).getAllByRole("button", { name: /in folder/ })).toHaveLength(1);
+    await userEvent.click(within(section).getByRole("button", { name: "Show Project X in folder" }));
+    expect(api.showInFolder).toHaveBeenCalledWith("/Users/aj/Downloads/OpenDrop/Project X");
+
+    emit({
+      kind: "history_added",
+      entry: { at_ms: 1_762_000_400_000, direction: "sent", peer: "Windows", name: "new.txt", size: 3, result: "done" },
+    });
+    expect(rows()).toHaveLength(5);
+    expect(rows()[0]).toHaveTextContent("Sent to Windows · new.txt");
+    expect(rows()[0]).toHaveTextContent("Done");
+  });
+
+  it("says so when there is no history yet", async () => {
+    const { api } = fakeApi();
+    render(<App api={api} />);
+    expect(await screen.findByText("Nothing sent or received yet.")).toBeInTheDocument();
+  });
+
+  it("asks once for a whole folder and shows it as one transfer", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    emit({
+      kind: "incoming_request",
+      transfer_id: "in-9",
+      peer_name: "AJ-PC",
+      peer_ip: "192.168.1.30",
+      verified: true,
+      name: "Project X",
+      size: 1_200_000_000,
+      fetch: null,
+      files: 500,
+    });
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Incoming folder")).toBeInTheDocument();
+    expect(within(dialog).getByText(/wants to send you the folder/)).toBeInTheDocument();
+    expect(within(dialog).getByText("500 files, 1.2 GB")).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: /Accept/ }));
+    expect(api.respond).toHaveBeenCalledWith("in-9", true, false);
+
+    emit({ kind: "send_waiting", transfer_id: "send-7", device_name: "AJ-PC", name: "Photos", size: 3000, files: 3 });
+    const row = screen.getByRole("listitem", { name: "Photos" });
+    expect(within(row).getByText(/folder, 3 files/)).toBeInTheDocument();
+  });
+
+
+  it("cancels a transfer from its Cancel button and shows who cancelled", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    emit({ kind: "send_waiting", transfer_id: "send-1", device_name: "AJ-PC", name: "movie.mp4", size: 1_000_000_000 });
+    emit({ kind: "send_progress", transfer_id: "send-1", bytes: 500_000_000, size: 1_000_000_000, bytes_per_sec: 50_000_000 });
+    const row = screen.getByRole("listitem", { name: "movie.mp4" });
+    await userEvent.click(within(row).getByRole("button", { name: "Cancel movie.mp4" }));
+    expect(api.cancelTransfer).toHaveBeenCalledWith("send-1");
+    emit({ kind: "send_cancelled", transfer_id: "send-1", by_peer: false });
+    expect(within(row).getByText("Cancelled")).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: /Cancel/ })).not.toBeInTheDocument();
+
+    // An incoming file the sender calls off says so, and has no button left.
+    emit({ kind: "receive_started", transfer_id: "in-1", peer_name: "AJ-PC", name: "big.zip", size: 1000 });
+    const incoming = screen.getByRole("listitem", { name: "big.zip" });
+    expect(within(incoming).getByRole("button", { name: "Cancel big.zip" })).toBeInTheDocument();
+    emit({ kind: "receive_cancelled", transfer_id: "in-1", by_peer: true });
+    expect(within(incoming).getByText("Cancelled")).toBeInTheDocument();
+    expect(within(incoming).getByText("AJ-PC cancelled it")).toBeInTheDocument();
+    expect(within(incoming).queryByRole("button", { name: /Cancel/ })).not.toBeInTheDocument();
+  });
+
+
   it("lists nearby devices and sends picked files to the clicked one", async () => {
     const { api } = fakeApi();
     render(<App api={api} />);

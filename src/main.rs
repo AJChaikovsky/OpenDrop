@@ -3,7 +3,7 @@
 //!   opendrop listen [--port PORT] [--name NAME] [--dir DIR] [--auto-accept]
 //!   opendrop peers [--wait SECONDS]
 //!   opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
-//!   opendrop send-file <DEVICE|IP[:PORT]> <FILE>... [--name NAME]
+//!   opendrop send-file <DEVICE|IP[:PORT]> <FILE|FOLDER>... [--name NAME]
 //!   opendrop pair <DEVICE|IP[:PORT]>
 //!   opendrop devices [--wait SECONDS]
 //!   opendrop unpair <DEVICE>
@@ -16,7 +16,7 @@
 use opendrop::DEFAULT_PORT;
 use opendrop::control::{Client, Request, Response};
 use opendrop::daemon::{self, Daemon, Direction, Status};
-use opendrop::discovery::{Discovery, Peer, PeerEvent, same_name};
+use opendrop::discovery::{Discovery, Peer, PeerEvent, netif, same_name};
 use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::server::{Approval, FileRequest};
@@ -46,7 +46,7 @@ USAGE:
                                     advertise, receive messages and files
     opendrop peers [--wait SECONDS] list devices on this network
     opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
-    opendrop send-file <DEVICE|IP[:PORT]> <FILE>... [--name NAME]
+    opendrop send-file <DEVICE|IP[:PORT]> <FILE|FOLDER>... [--name NAME]
     opendrop pair <DEVICE|IP[:PORT]>  pair with a device (both screens show a code)
     opendrop devices [--wait SECONDS] list nearby and paired devices
     opendrop unpair <DEVICE>          forget a paired device
@@ -82,7 +82,8 @@ EXAMPLES:
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let name = take_flag(&mut args, "--name").unwrap_or_else(default_device_name);
+    let name =
+        take_flag(&mut args, "--name").unwrap_or_else(opendrop::identity::default_device_name);
     let port = match take_flag(&mut args, "--port").map(|p| p.parse::<u16>()) {
         None => DEFAULT_PORT,
         Some(Ok(p)) => p,
@@ -211,9 +212,17 @@ async fn listen(
         "\"{}\" ({}) listening on port {port}",
         daemon.identity.name, daemon.identity.id
     );
-    match local_ip() {
+    let local = netif::local_addrs();
+    match netif::best_lan_ip(&local).or_else(route_ip) {
         Some(ip) => println!("Other devices can reach this one at {ip}:{port}"),
         None => println!("Could not detect this device's LAN IP; check your network settings"),
+    }
+    let skipped = opendrop::discovery::virtual_interfaces();
+    if !skipped.is_empty() {
+        println!(
+            "Not advertising virtual adapters others can't reach: {}",
+            skipped.join(", ")
+        );
     }
     println!(
         "Received files are saved to {}",
@@ -298,6 +307,22 @@ async fn listen(
             Err(e) => fail(&format!("server stopped: {e}")),
         },
         _ = tokio::signal::ctrl_c() => {
+            // Call off anything still running, so the other side hears it
+            // was cancelled rather than finding a dropped connection.
+            let running: Vec<String> = daemon
+                .transfers
+                .list()
+                .into_iter()
+                .filter(|t| !t.status.is_final())
+                .map(|t| t.transfer_id)
+                .collect();
+            for id in &running {
+                let _ = daemon.transfers.cancel(id);
+            }
+            if !running.is_empty() {
+                println!("\nCancelling {} transfer(s)...", running.len());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             println!("\nShutting down.");
             ExitCode::SUCCESS
         }
@@ -345,12 +370,8 @@ async fn send_files(me: &Me, target: &str, files: &[&str], wait: Duration) -> Ex
     // Catch typos before connecting rather than halfway through a batch.
     for file in files {
         match std::fs::metadata(file) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => {
-                return fail(&format!(
-                    "{file} is not a file (folders aren't supported yet)"
-                ));
-            }
+            Ok(m) if m.is_file() || m.is_dir() => {}
+            Ok(_) => return fail(&format!("{file} is not a file or folder")),
             Err(e) => return fail(&format!("cannot read {file}: {e}")),
         }
     }
@@ -368,12 +389,46 @@ async fn send_files(me: &Me, target: &str, files: &[&str], wait: Duration) -> Ex
     let mut declined = 0;
     for file in files {
         let path = Path::new(file);
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let is_folder = path.is_dir();
+        let size = if is_folder {
+            match opendrop::transfer::folder::list_folder(path) {
+                Ok(listing) if !listing.is_empty() => {
+                    println!("{}: folder with {} file(s)", path.display(), listing.len());
+                    listing.iter().map(|(_, e)| e.size).sum()
+                }
+                Ok(_) => return fail(&format!("{file} is an empty folder")),
+                Err(e) => return fail(&format!("cannot read {file}: {e}")),
+            }
+        } else {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        };
         let mut bar = Progress::new(path, size);
-        match connection
-            .send_file(path, &mut |sent| bar.update(sent))
-            .await
-        {
+        // Ctrl+C calls the file off and tells the receiver.
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let ctrl_c = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = stop.send(());
+            }
+        });
+        let result = if is_folder {
+            connection
+                .send_folder_until(path, &mut |sent| bar.update(sent), Some(stopped))
+                .await
+        } else {
+            connection
+                .send_file_until(path, &mut |sent| bar.update(sent), stopped)
+                .await
+        };
+        ctrl_c.abort();
+        match result {
+            Ok(FileResult::Cancelled) => {
+                bar.finish("cancelled");
+                return fail("cancelled; the receiver was told and kept nothing");
+            }
+            Ok(FileResult::CancelledByPeer) => {
+                bar.finish("cancelled by the receiver");
+                return fail("the receiver cancelled the transfer");
+            }
             Ok(FileResult::Delivered(outcome)) => bar.finish(&format!(
                 "done, verified (SHA-256 {}...)",
                 &outcome.sha256[..12]
@@ -897,10 +952,15 @@ async fn find_peer(
 }
 
 fn describe(peer: &Peer, paired: &PairedDevices) -> String {
-    let addr = peer
-        .socket_addr()
+    let addrs = peer.socket_addrs();
+    let addr = addrs
+        .first()
         .map_or_else(|| format!("?:{}", peer.port), |a| a.to_string());
     let mut line = format!("\"{}\" ({}) at {addr}", peer.name, peer.id);
+    if addrs.len() > 1 {
+        let others: Vec<String> = addrs[1..].iter().map(|a| a.ip().to_string()).collect();
+        line.push_str(&format!(" (also {})", others.join(", ")));
+    }
     if peer.protocol_version != opendrop::protocol::PROTOCOL_VERSION {
         line.push_str(&format!(
             " [protocol v{}, incompatible]",
@@ -921,8 +981,14 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
             let (question, limit, mut respond, grant) = tokio::select! {
-                Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, .. }) = files.recv() => (
+                Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, files: count, .. }) = files.recv() => (
                     format!("{}{}", if verified { "" } else { "[unverified device] " }, match &fetch {
+                        None if count.is_some() => format!(
+                            "\"{peer_name}\" ({}) wants to send you the folder \"{name}\" ({} files, {}).\n  Accept?",
+                            peer_addr.ip(),
+                            count.unwrap_or_default(),
+                            human_size(size),
+                        ),
                         None => format!(
                             "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
                             peer_addr.ip(),
@@ -1022,24 +1088,10 @@ fn default_download_dir() -> PathBuf {
         .join("OpenDrop")
 }
 
-fn default_device_name() -> String {
-    std::env::var("COMPUTERNAME") // Windows
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-        })
-        .map(|s| s.trim().trim_end_matches(".local").to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "OpenDrop device".to_owned())
-}
-
-/// The LAN address the OS would use for outbound traffic. Connecting a UDP
-/// socket only picks a route; no packets are sent.
-fn local_ip() -> Option<IpAddr> {
+/// The address the OS would use for outbound traffic, for when no adapter
+/// looks like a LAN one. Connecting a UDP socket only picks a route; no
+/// packets are sent.
+fn route_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("192.168.0.1:9").ok()?;
     socket

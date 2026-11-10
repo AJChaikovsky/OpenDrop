@@ -45,20 +45,45 @@ export type AppEvent =
       size: number;
       /** Set when the peer asks for one of our shared files instead. */
       fetch: FetchDetails | null;
+      /** Set for a folder: how many files it holds (`size` is the total). */
+      files?: number | null;
     }
   | { kind: "incoming_expired"; transfer_id: string }
   | { kind: "receive_started"; transfer_id: string; peer_name: string; name: string; size: number }
   | { kind: "receive_progress"; transfer_id: string; bytes: number; size: number; bytes_per_sec: number }
   | { kind: "receive_done"; transfer_id: string; path: string; sha256: string }
   | { kind: "receive_failed"; transfer_id: string; error: string }
-  | { kind: "send_waiting"; transfer_id: string; device_name: string; name: string; size: number }
+  | { kind: "receive_cancelled"; transfer_id: string; by_peer: boolean }
+  | { kind: "send_waiting"; transfer_id: string; device_name: string; name: string; size: number; files?: number | null }
   | { kind: "send_progress"; transfer_id: string; bytes: number; size: number; bytes_per_sec: number }
   | { kind: "send_done"; transfer_id: string; sha256: string }
   | { kind: "send_declined"; transfer_id: string }
   | { kind: "send_failed"; transfer_id: string; error: string }
+  | { kind: "send_cancelled"; transfer_id: string; by_peer: boolean }
   | { kind: "pair_code"; pair_id: string; device_id: string; device_name: string; code: string; incoming: boolean }
   | { kind: "pair_expired"; pair_id: string }
-  | { kind: "pair_done"; device_id: string; device_name: string; status: PairStatus; error: string | null };
+  | { kind: "pair_done"; device_id: string; device_name: string; status: PairStatus; error: string | null }
+  | { kind: "history_added"; entry: HistoryEntry }
+  /** "Send with OpenDrop" was picked; fetch the files with `takeSendPaths`. */
+  | { kind: "send_requested" };
+
+/** One finished transfer (see `history::Entry` in src-tauri). */
+export interface HistoryEntry {
+  /** When it finished, in milliseconds since the Unix epoch. */
+  at_ms: number;
+  direction: "sent" | "received";
+  /** The other device. */
+  peer: string;
+  name: string;
+  size: number;
+  /** Set for a folder: how many files it held. */
+  files?: number;
+  result: "done" | "declined" | "failed" | "cancelled";
+  /** Where a received file or folder was saved. */
+  path?: string;
+  /** Why it failed, was declined or cancelled. */
+  detail?: string;
+}
 
 export type IncomingRequest = Extract<AppEvent, { kind: "incoming_request" }>;
 export type PairCode = Extract<AppEvent, { kind: "pair_code" }>;

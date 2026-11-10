@@ -57,8 +57,11 @@ cargo run --release -- send-file "AJ's MacBook" photo.jpg notes.pdf
 ```
 
 The receiver saves them to `~/Downloads/OpenDrop` (change with `listen --dir DIR`). Existing
-files are never overwritten: a second `photo.jpg` becomes `photo (1).jpg`. Folders aren't
-supported yet.
+files are never overwritten: a second `photo.jpg` becomes `photo (1).jpg`. A folder goes as
+one transfer with one approval ("the folder "Photos" (500 files, 1.2 GB)"), and its tree is
+recreated under the download folder (`Photos`, or `Photos (1)` if that exists). Symbolic links
+inside it are skipped. Press Ctrl+C during a send to cancel it: the receiver is told and keeps
+nothing.
 
 The receiver is asked about every file before anything is written:
 
@@ -136,6 +139,25 @@ times a minute; `listen --allow-unpaired-fetch` lifts the pairing rule for local
 prints a warning. Every listing, request, approval, decline, folder grant and send is appended to `audit.log`
 in the config folder (one JSON object per line; names and decisions, never file contents).
 `opendrop audit` prints it, and the app shows it under *Activity*.
+
+The desktop app also keeps a transfer history: every file or folder it sent or received,
+with the time, the other device, the size, how it ended (done, declined, failed or
+cancelled) and where a received item was saved, which *Show in folder* opens. It lives in
+`history.jsonl` in the config folder, so it survives restarts.
+
+Closing the app's window keeps OpenDrop running in the menu bar (macOS) or the system tray
+(Windows, Linux): it stays discoverable and keeps receiving. When a file, folder, fetch
+request or pairing code needs an answer, a notification appears and the window comes back
+with the question. Click the icon (or the Dock icon on macOS) to open the window, or pick
+*Quit OpenDrop* from its menu to stop. If the terminal's `opendrop listen` and the app run
+on one computer, other devices list it once, under the same name.
+
+To send from the file browser, turn on *Right-click menu → Add to the menu* in the app.
+Then right-click any files or folders and choose **Send with OpenDrop**. On macOS it is
+under *Quick Actions* (or *Services*), and on Windows 11 under *Show more options*. The app
+window comes up and asks which device to send them to. On Windows this adds entries under
+`HKCU\Software\Classes` (no admin needed). On macOS it adds
+`~/Library/Services/Send with OpenDrop.workflow`. *Remove from the menu* takes them away.
 
 When you approve a fetch you can also let that device fetch from the same folder (and its
 subfolders) for 10 minutes without asking: answer `a` in the terminal, or tick the box in the
@@ -270,6 +292,9 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 | `src/network/fetch.rs` | Fetches this device started, which decide which offers skip the prompt |
 | `src/discovery/` | mDNS advertising, browsing and the discovered-peer table |
 | `src/transfer/` | Chunked streaming with SHA-256, temp files, safe file names |
+| `app/src-tauri/src/background.rs` | Tray / menu bar icon, close-to-hide, and notifications for questions while hidden |
+| `app/src-tauri/src/context_menu.rs` | "Send with OpenDrop": the Explorer entries and the Finder Quick Action |
+| `app/src-tauri/src/history.rs` | The desktop app's transfer history (`history.jsonl`) and *Show in folder* |
 | `app/src-tauri/src/node.rs` | Desktop app backend: receive with approval, send, pair, progress and speed events |
 | `app/src-tauri/src/lib.rs` | Tauri commands and event forwarding |
 | `app/src/` | React UI: device list, drop targets, accept and pairing dialogs, transfers |
@@ -367,6 +392,21 @@ matches `file_done` is the file synced and renamed into place, then confirmed wi
 `file_received`. On a mismatch, a dropped connection or a stall, the temp file is deleted.
 Several files (and texts) can be sent over one connection, one after another.
 
+A folder starts with `folder_offer` (name, file count, total size) and its listing in
+`folder_entries` frames (paths relative to the folder, `/`-separated, each checked: no `..`,
+`.`, empty parts, absolute paths, drive letters, backslashes, Windows-reserved names or
+characters, duplicates, or more than 100,000 files or 64 levels). An unsafe listing gets
+`error` `file_rejected` before the user is even asked. After `file_accept`, each file goes in
+listing order as its raw bytes and a `file_done`. The receiver writes them into a hidden
+`.opendrop-*.partdir` folder and renames it into place only after the last one checks out;
+anything else deletes the whole folder. Both sides report a tree SHA-256 over each file's hash
+and path.
+
+Either side can cancel midway. The receiver sends `cancel`. The sender, whose side of the
+stream is raw file bytes at that point, sends an empty encrypted record instead, which no
+other message produces. Both ends delete the partial file or folder and report `cancelled`,
+saying which side did it.
+
 ### Fetching
 
 Fetching flips the flow: the device that wants a file asks for it. A paired requester can
@@ -385,7 +425,9 @@ reuse the SHA-256 check and `.part` handling of ordinary transfers.
 
 Each device advertises one `_opendrop._tcp.local.` instance named after its device id, on its
 TCP port, with TXT properties `device_id`, `device_name` (cut to 200 bytes) and
-`protocol_version` (`2`). It browses for the same service type at the same time, ignores its
+`protocol_version` (`3`). Virtual adapters (WSL and Hyper-V `vEthernet`, Docker, VMs, VPNs,
+Apple's AWDL) are left out of the advertisement, since other devices can't reach them, and a
+peer's addresses on a network this device is also on are tried first. It browses for the same service type at the same time, ignores its
 own instance, adds peers when they resolve and drops them when their instance is removed
 (`listen` unregisters on Ctrl+C, so peers see it leave right away). A peer advertising a
 different `protocol_version` is still listed, marked incompatible.

@@ -14,6 +14,7 @@
 //! control frames: after a `file_accept`, the sender writes exactly the offered
 //! number of bytes, unframed, then resumes with a `file_done` frame.
 
+pub use crate::transfer::folder::FolderEntry;
 use serde::{Deserialize, Serialize};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -106,6 +107,21 @@ pub enum Message {
         name: String,
         size: u64,
     },
+    /// Client proposes sending a folder: `files` files, `size` bytes in all.
+    /// The listing follows in `folder_entries` messages before the receiver
+    /// answers with `file_accept` / `file_decline`. Once accepted, each file
+    /// goes in listing order as its raw bytes followed by `file_done`.
+    FolderOffer {
+        transfer_id: String,
+        name: String,
+        files: u64,
+        size: u64,
+    },
+    /// Part of a folder's listing; paths are relative, separated by `/`.
+    FolderEntries {
+        transfer_id: String,
+        entries: Vec<FolderEntry>,
+    },
     /// Receiver agrees; the client then sends exactly `size` raw bytes.
     FileAccept { transfer_id: String },
     /// Receiver (or its user) said no. The connection stays open, so the
@@ -118,6 +134,11 @@ pub enum Message {
         transfer_id: String,
         received_bytes: u64,
     },
+    /// The receiver calls off a file it's taking in (its user pressed
+    /// Cancel). The sender stops sending; the receiver throws away what it
+    /// has. A sender calls a transfer off with an empty encrypted record
+    /// instead, since its side of the stream is raw file bytes.
+    Cancel { transfer_id: String },
     /// Requester asks which files the owner shares (only paired devices
     /// may), optionally only those whose path contains `query`.
     ShareListRequest {
@@ -262,7 +283,15 @@ impl std::fmt::Display for ProtocolError {
     }
 }
 
-impl std::error::Error for ProtocolError {}
+impl std::error::Error for ProtocolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Json(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for ProtocolError {
     fn from(e: io::Error) -> Self {

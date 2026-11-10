@@ -15,6 +15,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 /// Bytes read and written per step.
+pub mod folder;
+
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
 /// Longest file name we accept, in bytes (the common filesystem limit).

@@ -57,6 +57,10 @@ pub struct Transfer {
     pub error: Option<String>,
     /// Unix time in milliseconds when the row was created.
     pub started_ms: u64,
+    /// Set for a folder: how many files it holds (`name` is the folder's,
+    /// `size` and `bytes` cover all of them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<u64>,
 }
 
 impl Transfer {
@@ -83,6 +87,7 @@ impl Transfer {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or_default(),
+            files: None,
         }
     }
 }

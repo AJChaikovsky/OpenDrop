@@ -119,6 +119,31 @@ pub fn default_config_dir() -> PathBuf {
         .join("OpenDrop")
 }
 
+/// The name people know this computer by: the Computer Name on macOS ("AJ's
+/// MacBook Air"), the computer name on Windows, the hostname elsewhere. The
+/// CLI and the app both use it, so one device shows one name.
+pub fn default_device_name() -> String {
+    let command = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+    };
+    let name = if cfg!(target_os = "macos") {
+        command("scutil", &["--get", "ComputerName"])
+    } else {
+        None
+    };
+    name.or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| command("hostname", &[]))
+        .map(|s| s.trim().trim_end_matches(".local").to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "OpenDrop device".to_owned())
+}
+
 /// 32 bytes from the OS random number generator.
 pub fn random_bytes() -> [u8; 32] {
     let mut bytes = [0u8; 32];

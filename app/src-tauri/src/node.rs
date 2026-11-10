@@ -5,9 +5,10 @@
 //! Nothing here depends on Tauri, so it is tested on its own; `lib.rs` only
 //! forwards events to the window and commands to the node.
 
+use crate::history::{self, History};
 use opendrop::audit::{AuditLog, Entry};
 use opendrop::daemon::{self, Daemon, Direction, Status, Transfer};
-use opendrop::discovery::{Discovery, Peer, PeerEvent};
+use opendrop::discovery::{Discovery, Peer};
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::grants::GrantOffer;
 use opendrop::network::server::{Approval, FileRequest, ReceiveEvent};
@@ -104,6 +105,8 @@ pub enum AppEvent {
         name: String,
         size: u64,
         fetch: Option<FetchDetails>,
+        /// Set for a folder: how many files it holds.
+        files: Option<u64>,
     },
     /// An incoming request was not answered in time or its sender gave up.
     IncomingExpired {
@@ -130,12 +133,19 @@ pub enum AppEvent {
         transfer_id: String,
         error: String,
     },
+    /// Called off midway: by us, or (`by_peer`) by the sender. Nothing kept.
+    ReceiveCancelled {
+        transfer_id: String,
+        by_peer: bool,
+    },
     /// A file we're sending, waiting for the receiver to accept it.
     SendWaiting {
         transfer_id: String,
         device_name: String,
         name: String,
         size: u64,
+        /// Set for a folder: how many files it holds.
+        files: Option<u64>,
     },
     SendProgress {
         transfer_id: String,
@@ -153,6 +163,11 @@ pub enum AppEvent {
     SendFailed {
         transfer_id: String,
         error: String,
+    },
+    /// Called off midway: by us, or (`by_peer`) by the receiver.
+    SendCancelled {
+        transfer_id: String,
+        by_peer: bool,
     },
     /// Show `code` and ask whether the other screen shows the same; answer
     /// with [`Node::respond_pair`]. `incoming` if the other device asked.
@@ -175,6 +190,14 @@ pub enum AppEvent {
         status: PairStatus,
         error: Option<String>,
     },
+    /// "Send with OpenDrop" was picked in the file browser: the window
+    /// should ask for a device (it fetches the paths with
+    /// `take_send_paths`).
+    SendRequested,
+    /// A transfer finished and was added to the history.
+    HistoryAdded {
+        entry: history::Entry,
+    },
 }
 
 pub type EventSink = Arc<dyn Fn(AppEvent) + Send + Sync>;
@@ -193,6 +216,8 @@ pub struct Node {
     pending_pairs: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     pair_prompts: PairPrompts,
     sink: EventSink,
+    /// Finished transfers, kept across restarts.
+    pub history: Arc<History>,
     next_send_id: AtomicU64,
     /// The runtime the node was started on, for work started from plain
     /// (non-async) methods: Tauri runs sync commands on the main thread,
@@ -229,6 +254,19 @@ impl Node {
         sink: EventSink,
         config_dir: Option<PathBuf>,
     ) -> Result<Arc<Self>, BoxError> {
+        // Every event passes the history first; one that ends a transfer is
+        // followed by a `HistoryAdded`.
+        let history = Arc::new(History::new(config_dir.as_deref()));
+        let sink: EventSink = {
+            let history = Arc::clone(&history);
+            Arc::new(move |event| {
+                let added = history.observe(&event);
+                sink(event);
+                if let Some(entry) = added {
+                    sink(AppEvent::HistoryAdded { entry });
+                }
+            })
+        };
         let shares = config_dir
             .as_deref()
             .map(|config| Arc::new(Shares::new(config, Some(&download_dir))));
@@ -287,20 +325,14 @@ impl Node {
         let mut nearby = discovery.map(Discovery::subscribe);
         let mut pairings = paired.subscribe();
         let list_paired = Arc::clone(&paired);
+        let list_daemon = Arc::clone(&daemon);
         let list_sink = sink.clone();
         tokio::spawn(async move {
-            let mut peers: HashMap<String, Peer> = HashMap::new();
             loop {
                 tokio::select! {
                     change = async { nearby.as_mut().unwrap().recv().await }, if nearby.is_some() => {
                         match change {
-                            Ok(PeerEvent::Found(p) | PeerEvent::Updated(p)) => {
-                                peers.insert(p.id.clone(), p);
-                            }
-                            Ok(PeerEvent::Lost(p)) => {
-                                peers.remove(&p.id);
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                             Err(broadcast::error::RecvError::Closed) => nearby = None,
                         }
                     }
@@ -310,7 +342,11 @@ impl Node {
                         }
                     }
                 }
-                let list: Vec<Peer> = peers.values().cloned().collect();
+                // The discovery table already shows one entry per device.
+                let list = list_daemon
+                    .discovery()
+                    .map(Discovery::peers)
+                    .unwrap_or_default();
                 list_sink(AppEvent::Devices {
                     devices: devices(&list, &list_paired),
                 });
@@ -328,6 +364,7 @@ impl Node {
             pending_pairs,
             pair_prompts,
             sink,
+            history,
             next_send_id: AtomicU64::new(1),
             runtime: tokio::runtime::Handle::current(),
         }))
@@ -364,7 +401,19 @@ impl Node {
         {
             offer.accept();
         }
+        if !accept && let Some(entry) = self.history.declined(transfer_id) {
+            (self.sink)(AppEvent::HistoryAdded { entry });
+        }
         respond.send(accept).is_ok()
+    }
+
+    /// Call off transfer `transfer_id`, in either direction, waiting or
+    /// midway. The other device is told; a `*Cancelled` event follows.
+    pub fn cancel(&self, transfer_id: &str) -> Result<(), String> {
+        self.daemon
+            .transfers
+            .cancel(transfer_id)
+            .map_err(|e| e.to_string())
     }
 
     /// Send `paths` to the discovered device `device_id`, one after another
@@ -458,58 +507,86 @@ impl Node {
             .map(|path| {
                 let meta = std::fs::metadata(path)
                     .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-                if !meta.is_file() {
-                    return Err(format!(
-                        "{} is a folder; only files can be sent for now",
-                        file_name(path)
+                if meta.is_dir() {
+                    let listing = opendrop::transfer::folder::list_folder(path)
+                        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                    if listing.is_empty() {
+                        return Err(format!("{} is an empty folder", file_name(path)));
+                    }
+                    let size = listing.iter().map(|(_, e)| e.size).sum();
+                    return Ok((
+                        path.clone(),
+                        size,
+                        Some(listing.len() as u64),
+                        self.new_send_id(),
                     ));
                 }
-                Ok((path.clone(), meta.len(), self.new_send_id()))
+                if !meta.is_file() {
+                    return Err(format!("{} is not a file or folder", file_name(path)));
+                }
+                Ok((path.clone(), meta.len(), None, self.new_send_id()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut connection = connect(addrs, &self.identity, &self.paired).await?;
-        let ids = files.iter().map(|(_, _, id)| id.clone()).collect();
+        let ids = files.iter().map(|(_, _, _, id)| id.clone()).collect();
         let sink = self.sink.clone();
         let table = Arc::clone(&self.daemon.transfers);
+        let (addrs, identity, paired) = (
+            addrs.to_vec(),
+            self.identity.clone(),
+            Arc::clone(&self.paired),
+        );
         tokio::spawn(async move {
-            for (path, size, id) in files {
-                // The app has no cancel button yet, so the handle goes unused.
-                let _ = table.begin_with_id(
+            let mut files = files.into_iter();
+            while let Some((path, size, count, id)) = files.next() {
+                // Cancelling (see `Node::cancel`) fires `stop`.
+                let (_, stop) = table.begin_with_id(
                     id.clone(),
-                    Transfer::new(
-                        Direction::Send,
-                        Some(connection.peer.id.clone()),
-                        connection.peer.name.clone(),
-                        file_name(&path),
-                        size,
-                    ),
+                    Transfer {
+                        files: count,
+                        ..Transfer::new(
+                            Direction::Send,
+                            Some(connection.peer.id.clone()),
+                            connection.peer.name.clone(),
+                            file_name(&path),
+                            size,
+                        )
+                    },
                 );
                 sink(AppEvent::SendWaiting {
                     transfer_id: id.clone(),
                     device_name: connection.peer.name.clone(),
                     name: file_name(&path),
                     size,
+                    files: count,
                 });
                 let mut meter = Meter::new(size);
                 let progress_sink = sink.clone();
                 let progress_id = id.clone();
                 let progress_table = Arc::clone(&table);
-                let result = connection
-                    .send_file(&path, &mut |sent| {
-                        progress_table.update(&progress_id, |t| {
-                            t.status = Status::Transferring;
-                            t.bytes = sent;
+                let mut on_progress = |sent| {
+                    progress_table.update(&progress_id, |t| {
+                        t.status = Status::Transferring;
+                        t.bytes = sent;
+                    });
+                    if let Some(bytes_per_sec) = meter.update(sent) {
+                        progress_sink(AppEvent::SendProgress {
+                            transfer_id: progress_id.clone(),
+                            bytes: sent,
+                            size,
+                            bytes_per_sec,
                         });
-                        if let Some(bytes_per_sec) = meter.update(sent) {
-                            progress_sink(AppEvent::SendProgress {
-                                transfer_id: progress_id.clone(),
-                                bytes: sent,
-                                size,
-                                bytes_per_sec,
-                            });
-                        }
-                    })
-                    .await;
+                    }
+                };
+                let result = if count.is_some() {
+                    connection
+                        .send_folder_until(&path, &mut on_progress, Some(stop))
+                        .await
+                } else {
+                    connection
+                        .send_file_until(&path, &mut on_progress, stop)
+                        .await
+                };
                 match result {
                     Ok(FileResult::Delivered(outcome)) => {
                         table.update(&id, |t| {
@@ -525,6 +602,30 @@ impl Node {
                     Ok(FileResult::Declined) => {
                         table.finish(&id, Status::Declined, None);
                         sink(AppEvent::SendDeclined { transfer_id: id })
+                    }
+                    Ok(result @ (FileResult::Cancelled | FileResult::CancelledByPeer)) => {
+                        let by_peer = matches!(result, FileResult::CancelledByPeer);
+                        let error =
+                            by_peer.then(|| format!("{} cancelled it", connection.peer.name));
+                        table.finish(&id, Status::Cancelled, error);
+                        sink(AppEvent::SendCancelled {
+                            transfer_id: id,
+                            by_peer,
+                        });
+                        // That connection is done; the rest of the batch
+                        // goes over a new one.
+                        match connect(&addrs, &identity, &paired).await {
+                            Ok(fresh) => connection = fresh,
+                            Err(e) => {
+                                for (_, _, _, rest) in files {
+                                    sink(AppEvent::SendFailed {
+                                        transfer_id: rest,
+                                        error: e.to_string(),
+                                    });
+                                }
+                                return;
+                            }
+                        }
                     }
                     Err(e) => {
                         table.finish(&id, Status::Failed, Some(e.to_string()));
@@ -595,6 +696,8 @@ async fn forward_requests(
             size,
             respond,
             fetch,
+            files,
+            ..
         } = request;
         let grant = fetch.as_ref().and_then(|f| f.grant.clone());
         let grant_folder = grant.as_ref().map(|g| g.folder.display().to_string());
@@ -618,6 +721,7 @@ async fn forward_requests(
             verified,
             name,
             size,
+            files,
             fetch: fetch.map(|f| FetchDetails {
                 reason: f.reason,
                 via_assistant: f.via_assistant,
@@ -754,6 +858,16 @@ async fn forward_receive_events(
             ReceiveEvent::Failed { transfer_id, error } => {
                 meters.remove(&transfer_id);
                 sink(AppEvent::ReceiveFailed { transfer_id, error });
+            }
+            ReceiveEvent::Cancelled {
+                transfer_id,
+                by_peer,
+            } => {
+                meters.remove(&transfer_id);
+                sink(AppEvent::ReceiveCancelled {
+                    transfer_id,
+                    by_peer,
+                });
             }
         }
     }
@@ -1288,5 +1402,124 @@ mod tests {
         assert!(meter.update(10).is_some());
         assert!(meter.update(20).is_none());
         assert!(meter.update(100).is_some());
+    }
+
+    /// A node with a config folder (so its history is kept on disk).
+    async fn node_with_config(
+        name: &str,
+        root: &Path,
+    ) -> (Arc<Node>, mpsc::UnboundedReceiver<AppEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink: EventSink = Arc::new(move |e| {
+            let _ = tx.send(e);
+        });
+        let node = Node::start_with_config(
+            DeviceIdentity::new(name),
+            Arc::new(PairedDevices::in_memory()),
+            0,
+            root.join("dl"),
+            false,
+            sink,
+            Some(root.join("config")),
+        )
+        .await
+        .unwrap();
+        (node, rx)
+    }
+
+    /// Acceptance (#35): after 3 sends and 1 decline, history has 4 entries
+    /// with the right results on both sides, and they survive a restart.
+    #[tokio::test]
+    async fn history_records_sends_and_a_decline_and_survives_a_restart() {
+        let mac_root = tempfile::tempdir().unwrap();
+        let win_root = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let (mac, mut mac_events) = node_with_config("Mac", mac_root.path()).await;
+        let (win, mut win_events) = node_with_config("Windows", win_root.path()).await;
+        let mut paths = Vec::new();
+        for (i, name) in ["one.txt", "two.txt", "three.txt", "unwanted.txt"]
+            .iter()
+            .enumerate()
+        {
+            let path = src.path().join(name);
+            std::fs::write(&path, vec![b'x'; 10 * (i + 1)]).unwrap();
+            paths.push(path);
+        }
+
+        // Three accepted, then one declined.
+        for (i, path) in paths.iter().enumerate() {
+            let accept = i < 3;
+            mac.send_to_addrs(&addr(&win), std::slice::from_ref(path))
+                .await
+                .unwrap();
+            let asked = until(&mut win_events, |e| {
+                matches!(e, AppEvent::IncomingRequest { .. })
+            })
+            .await;
+            let Some(AppEvent::IncomingRequest { transfer_id, .. }) = asked.last() else {
+                unreachable!()
+            };
+            assert!(win.respond(transfer_id, accept, false));
+            until(&mut mac_events, |e| {
+                matches!(e, AppEvent::HistoryAdded { .. })
+            })
+            .await;
+            until(&mut win_events, |e| {
+                matches!(e, AppEvent::HistoryAdded { .. })
+            })
+            .await;
+        }
+
+        let check = |entries: Vec<history::Entry>, direction, peer: &str| {
+            let rows: Vec<(String, u64, history::Outcome)> = entries
+                .iter()
+                .map(|e| (e.name.clone(), e.size, e.result))
+                .collect();
+            println!("{peer}'s view: {rows:?}");
+            use history::Outcome::{Declined, Done};
+            assert_eq!(
+                rows,
+                [
+                    ("unwanted.txt".into(), 40, Declined),
+                    ("three.txt".into(), 30, Done),
+                    ("two.txt".into(), 20, Done),
+                    ("one.txt".into(), 10, Done),
+                ]
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|e| e.direction == direction && e.peer == peer)
+            );
+            entries
+        };
+        check(
+            mac.history.entries(100),
+            history::Direction::Sent,
+            "Windows",
+        );
+        let received = check(
+            win.history.entries(100),
+            history::Direction::Received,
+            "Mac",
+        );
+        // Received files keep where they were saved; the declined one has
+        // none and nothing was written for it.
+        for entry in &received[1..] {
+            let path = Path::new(entry.path.as_deref().unwrap());
+            assert!(path.exists(), "{path:?}");
+            assert!(win.history.has_path(entry.path.as_deref().unwrap()));
+        }
+        assert_eq!(received[0].path, None);
+        assert_eq!(received[0].detail.as_deref(), Some("you declined it"));
+        assert!(!win_root.path().join("dl/unwanted.txt").exists());
+
+        // Restart both: the same config folders give the same history.
+        let before = (mac.history.entries(100), win.history.entries(100));
+        drop((mac, win));
+        let (mac, _) = node_with_config("Mac", mac_root.path()).await;
+        let (win, _) = node_with_config("Windows", win_root.path()).await;
+        assert_eq!((mac.history.entries(100), win.history.entries(100)), before);
+        assert_eq!(mac.history.entries(100).len(), 4);
     }
 }

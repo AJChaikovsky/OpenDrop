@@ -281,7 +281,7 @@ impl Daemon {
     /// transfer table. Returns the transfer id at once; the send runs in the
     /// background and can be cancelled through the table.
     pub async fn send_file(&self, addrs: &[SocketAddr], path: &Path) -> Result<String, BoxError> {
-        let size = file_size(path)?;
+        let size = send_size(path)?;
         let connection = connect(addrs, &self.identity, &self.paired).await?;
         Ok(self.start_send(connection, path, size))
     }
@@ -296,7 +296,7 @@ impl Daemon {
         path: &Path,
         paired_only: bool,
     ) -> Result<String, BoxError> {
-        let size = file_size(path)?;
+        let size = send_size(path)?;
         let addrs = self.addresses_of(device)?;
         let connection = connect(&addrs, &self.identity, &self.paired).await?;
         if paired_only && !connection.paired {
@@ -311,14 +311,22 @@ impl Daemon {
         Ok(self.start_send(connection, path, size))
     }
 
-    fn start_send(&self, connection: Connection, path: &Path, size: u64) -> String {
-        let (id, cancelled) = self.transfers.begin(Transfer::new(
-            Direction::Send,
-            Some(connection.peer.id.clone()),
-            connection.peer.name.clone(),
-            file_name(path),
-            size,
-        ));
+    fn start_send(
+        &self,
+        connection: Connection,
+        path: &Path,
+        (size, files): (u64, Option<u64>),
+    ) -> String {
+        let (id, cancelled) = self.transfers.begin(Transfer {
+            files,
+            ..Transfer::new(
+                Direction::Send,
+                Some(connection.peer.id.clone()),
+                connection.peer.name.clone(),
+                file_name(path),
+                size,
+            )
+        });
         tokio::spawn(run_send(
             Arc::clone(&self.transfers),
             Arc::clone(&self.audit),
@@ -447,13 +455,24 @@ impl Drop for Daemon {
 }
 
 /// The size of regular file `path`, or why it can't be sent.
-fn file_size(path: &Path) -> Result<u64, BoxError> {
+/// How much sending `path` means: its size, and for a folder how many files
+/// it holds.
+fn send_size(path: &Path) -> Result<(u64, Option<u64>), BoxError> {
     let meta =
         std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a file", path.display()).into());
+    if meta.is_dir() {
+        let listing = crate::transfer::folder::list_folder(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if listing.is_empty() {
+            return Err(format!("{} is an empty folder", path.display()).into());
+        }
+        let size = listing.iter().map(|(_, e)| e.size).sum();
+        return Ok((size, Some(listing.len() as u64)));
     }
-    Ok(meta.len())
+    if !meta.is_file() {
+        return Err(format!("{} is not a file or folder", path.display()).into());
+    }
+    Ok((meta.len(), None))
 }
 
 /// The shared file `query` names: its id, its path in the share, or its
@@ -583,7 +602,7 @@ async fn run_fetch(
 }
 
 /// Send one file over `connection`, keeping its row up to date. Cancelling
-/// drops the connection, which the receiver sees as an interrupted transfer.
+/// tells the receiver, which throws away what it has.
 async fn run_send(
     transfers: Arc<TransferTable>,
     audit: Arc<AuditLog>,
@@ -602,18 +621,29 @@ async fn run_send(
             t.bytes = sent;
         })
     };
-    let send = connection.send_file(&path, &mut on_progress);
-    tokio::select! {
-        result = send => match result {
-            Ok(FileResult::Delivered(outcome)) => transfers.update(&id, |t| {
-                t.bytes = outcome.size;
-                t.sha256 = Some(outcome.sha256);
-                t.status = Status::Done;
-            }),
-            Ok(FileResult::Declined) => transfers.finish(&id, Status::Declined, None),
-            Err(e) => transfers.finish(&id, Status::Failed, Some(e.to_string())),
-        },
-        _ = cancelled => transfers.finish(&id, Status::Cancelled, None),
+    let result = if path.is_dir() {
+        connection
+            .send_folder_until(&path, &mut on_progress, Some(cancelled))
+            .await
+    } else {
+        connection
+            .send_file_until(&path, &mut on_progress, cancelled)
+            .await
+    };
+    match result {
+        Ok(FileResult::Delivered(outcome)) => transfers.update(&id, |t| {
+            t.bytes = outcome.size;
+            t.sha256 = Some(outcome.sha256);
+            t.status = Status::Done;
+        }),
+        Ok(FileResult::Declined) => transfers.finish(&id, Status::Declined, None),
+        Ok(FileResult::Cancelled) => transfers.finish(&id, Status::Cancelled, None),
+        Ok(FileResult::CancelledByPeer) => transfers.finish(
+            &id,
+            Status::Cancelled,
+            Some(format!("{peer_name} cancelled it")),
+        ),
+        Err(e) => transfers.finish(&id, Status::Failed, Some(e.to_string())),
     }
     if let Some(row) = transfers.get(&id) {
         audit.record(
@@ -637,15 +667,18 @@ async fn record_requests(
             Some(fetch) => (Direction::Send, Some(fetch.peer_id.clone())),
             None => (Direction::Receive, None),
         };
-        let (row, cancelled) = transfers.begin_with_id(
+        let (row, mut cancelled) = transfers.begin_with_id(
             request.transfer_id.clone(),
-            Transfer::new(
-                direction,
-                peer_id,
-                request.peer_name.clone(),
-                request.name.clone(),
-                request.size,
-            ),
+            Transfer {
+                files: request.files,
+                ..Transfer::new(
+                    direction,
+                    peer_id,
+                    request.peer_name.clone(),
+                    request.name.clone(),
+                    request.size,
+                )
+            },
         );
         let transfers = Arc::clone(&transfers);
         let approval = approval.clone();
@@ -659,6 +692,8 @@ async fn record_requests(
                 size,
                 mut respond,
                 fetch,
+                cancel,
+                files,
             } = request;
             let accept = match approval {
                 // Auto-accept takes files in; sending one away always needs
@@ -675,13 +710,15 @@ async fn record_requests(
                         size,
                         respond: answer_tx,
                         fetch,
+                        cancel: None,
+                        files,
                     };
                     if ask.send(forwarded).await.is_err() {
                         false
                     } else {
                         tokio::select! {
                             answer = answer => answer.unwrap_or(false),
-                            _ = cancelled => {
+                            _ = &mut cancelled => {
                                 transfers.finish(&row, Status::Cancelled, None);
                                 false
                             }
@@ -700,6 +737,17 @@ async fn record_requests(
                 });
             }
             let _ = respond.send(accept);
+            // Once the file is coming in, a cancel stops the download. The
+            // row is marked first so the receive's own report of it doesn't
+            // replace the status; the table drops the handle when the row
+            // ends any other way.
+            if accept
+                && let Some(cancel) = cancel
+                && cancelled.await.is_ok()
+            {
+                transfers.finish(&row, Status::Cancelled, None);
+                let _ = cancel.send(());
+            }
         });
     }
 }
@@ -757,6 +805,14 @@ async fn record_receive_events(
             ReceiveEvent::Failed { transfer_id, error } => {
                 transfers.finish(&row(transfer_id), Status::Failed, Some(error.clone()))
             }
+            ReceiveEvent::Cancelled {
+                transfer_id,
+                by_peer,
+            } => transfers.finish(
+                &row(transfer_id),
+                Status::Cancelled,
+                by_peer.then(|| "the sender cancelled it".to_owned()),
+            ),
         }
         if let Some(forward) = &forward {
             let _ = forward.send(event);
@@ -790,5 +846,7 @@ fn file_name(path: &Path) -> String {
     )
 }
 
+#[cfg(test)]
+mod cancel_tests;
 #[cfg(test)]
 mod tests;
