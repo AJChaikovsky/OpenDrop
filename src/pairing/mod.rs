@@ -361,7 +361,10 @@ mod tests {
         let (prompts, mut rx) = mpsc::channel::<PairPrompt>(1);
         let (code_tx, code_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let mut prompt = rx.recv().await.unwrap();
+            // Some tests end before anyone is asked.
+            let Some(mut prompt) = rx.recv().await else {
+                return;
+            };
             let _ = code_tx.send(prompt.code.clone());
             match behaviour {
                 User::Accept => drop(prompt.respond.send(true)),
