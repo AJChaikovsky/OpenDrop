@@ -190,6 +190,10 @@ pub enum AppEvent {
         status: PairStatus,
         error: Option<String>,
     },
+    /// "Send with OpenDrop" was picked in the file browser: the window
+    /// should ask for a device (it fetches the paths with
+    /// `take_send_paths`).
+    SendRequested,
     /// A transfer finished and was added to the history.
     HistoryAdded {
         entry: history::Entry,

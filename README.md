@@ -152,6 +152,13 @@ with the question. Click the icon (or the Dock icon on macOS) to open the window
 *Quit OpenDrop* from its menu to stop. If the terminal's `opendrop listen` and the app run
 on one computer, other devices list it once, under the same name.
 
+To send from the file browser, turn on *Right-click menu → Add to the menu* in the app.
+Then right-click any files or folders and choose **Send with OpenDrop**. On macOS it is
+under *Quick Actions* (or *Services*), and on Windows 11 under *Show more options*. The app
+window comes up and asks which device to send them to. On Windows this adds entries under
+`HKCU\Software\Classes` (no admin needed). On macOS it adds
+`~/Library/Services/Send with OpenDrop.workflow`. *Remove from the menu* takes them away.
+
 When you approve a fetch you can also let that device fetch from the same folder (and its
 subfolders) for 10 minutes without asking: answer `a` in the terminal, or tick the box in the
 app. Grants are kept in memory only, per device and folder; asking each time stays the default.
@@ -286,6 +293,7 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 | `src/discovery/` | mDNS advertising, browsing and the discovered-peer table |
 | `src/transfer/` | Chunked streaming with SHA-256, temp files, safe file names |
 | `app/src-tauri/src/background.rs` | Tray / menu bar icon, close-to-hide, and notifications for questions while hidden |
+| `app/src-tauri/src/context_menu.rs` | "Send with OpenDrop": the Explorer entries and the Finder Quick Action |
 | `app/src-tauri/src/history.rs` | The desktop app's transfer history (`history.jsonl`) and *Show in folder* |
 | `app/src-tauri/src/node.rs` | Desktop app backend: receive with approval, send, pair, progress and speed events |
 | `app/src-tauri/src/lib.rs` | Tauri commands and event forwarding |

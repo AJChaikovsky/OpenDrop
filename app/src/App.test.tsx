@@ -33,6 +33,9 @@ function fakeApi(devices: Device[] = [pc], history: HistoryEntry[] = []) {
     ]),
     history: vi.fn(async () => history),
     showInFolder: vi.fn(async () => {}),
+    takeSendPaths: vi.fn(async (): Promise<string[]> => []),
+    contextMenuStatus: vi.fn(async (): Promise<boolean | null> => false),
+    setContextMenu: vi.fn(async () => {}),
     onEvent: vi.fn(async (h: (e: AppEvent) => void) => ((emit = h), () => {})),
     onDrag: vi.fn(async (h: (e: DragEvent) => void) => ((drag = h), () => {})),
   } satisfies Api;
@@ -40,6 +43,58 @@ function fakeApi(devices: Device[] = [pc], history: HistoryEntry[] = []) {
 }
 
 describe("App", () => {
+  it("asks for a device for files from the right-click menu, then sends them", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("button", { name: /AJ-PC/ });
+    api.takeSendPaths.mockResolvedValueOnce(["C:\\Users\\aj\\Desktop\\report.pdf"]);
+    await act(async () => emit({ kind: "send_requested" }));
+    expect(await screen.findByText("report.pdf")).toBeInTheDocument();
+    expect(screen.getByText(/Choose a device to send/)).toBeInTheDocument();
+    // Another file picked while waiting joins it.
+    api.takeSendPaths.mockResolvedValueOnce(["/Users/aj/notes"]);
+    await act(async () => emit({ kind: "send_requested" }));
+    expect(await screen.findByText("2 items")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /AJ-PC/ }));
+    expect(api.sendFiles).toHaveBeenCalledWith({ deviceId: "device-pc" }, [
+      "C:\\Users\\aj\\Desktop\\report.pdf",
+      "/Users/aj/notes",
+    ]);
+    expect(api.pickFiles).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Choose a device to send/)).not.toBeInTheDocument();
+    // Without queued files, a click opens the picker as before.
+    await userEvent.click(screen.getByRole("button", { name: /AJ-PC/ }));
+    expect(api.pickFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it("can cancel files queued from the right-click menu", async () => {
+    const { api } = fakeApi();
+    api.takeSendPaths.mockResolvedValueOnce(["/tmp/a.txt"]);
+    render(<App api={api} />);
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText(/Choose a device to send/)).not.toBeInTheDocument();
+    expect(api.sendFiles).not.toHaveBeenCalled();
+  });
+
+  it("adds and removes the right-click menu entry", async () => {
+    const { api } = fakeApi();
+    render(<App api={api} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Add to the menu" }));
+    expect(api.setContextMenu).toHaveBeenCalledWith(true);
+    await userEvent.click(await screen.findByRole("button", { name: "Remove from the menu" }));
+    expect(api.setContextMenu).toHaveBeenLastCalledWith(false);
+    expect(await screen.findByRole("button", { name: "Add to the menu" })).toBeInTheDocument();
+  });
+
+  it("hides the right-click menu setting where there is none", async () => {
+    const { api } = fakeApi();
+    api.contextMenuStatus.mockResolvedValue(null);
+    render(<App api={api} />);
+    await screen.findByRole("heading", { name: "History" });
+    expect(screen.queryByRole("heading", { name: "Right-click menu" })).not.toBeInTheDocument();
+  });
+
   it("shows the saved history, adds finished transfers live, and opens received files", async () => {
     const saved: HistoryEntry[] = [
       { at_ms: 1_762_000_300_000, direction: "sent", peer: "Windows", name: "unwanted.txt", size: 40, result: "declined" },

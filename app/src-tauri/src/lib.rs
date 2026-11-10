@@ -1,6 +1,7 @@
 //! Tauri shell around [`node::Node`]: commands in, events out.
 
 mod background;
+mod context_menu;
 mod history;
 mod node;
 
@@ -11,7 +12,7 @@ use opendrop::pairing::store::PairedDevices;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
 /// The window listens for every [`AppEvent`] on this event name.
@@ -27,6 +28,17 @@ struct Me {
     /// Something the user should know about, e.g. a damaged paired-devices
     /// file.
     warning: Option<String>,
+}
+
+/// Files picked with "Send with OpenDrop" that the window hasn't taken yet.
+#[derive(Default)]
+struct SendQueue(Mutex<Vec<String>>);
+
+/// Queue `paths` for the window to send, and bring it up to ask where.
+fn queue_send<R: tauri::Runtime>(app: &tauri::AppHandle<R>, paths: Vec<String>) {
+    app.state::<SendQueue>().0.lock().unwrap().extend(paths);
+    background::show_window(app);
+    let _ = app.emit(EVENT, AppEvent::SendRequested);
 }
 
 /// A problem found at startup, shown in the window.
@@ -82,6 +94,31 @@ fn respond(
 #[tauri::command]
 fn cancel_transfer(node: State<'_, Arc<Node>>, transfer_id: String) -> Result<(), String> {
     node.cancel(&transfer_id)
+}
+
+/// The files waiting to be sent from "Send with OpenDrop", emptied.
+#[tauri::command]
+fn take_send_paths(queue: State<'_, SendQueue>) -> Vec<String> {
+    std::mem::take(&mut *queue.0.lock().unwrap())
+}
+
+/// Whether "Send with OpenDrop" is in the right-click menu, or `None` where
+/// it isn't available (Linux).
+#[tauri::command]
+fn context_menu_status() -> Option<bool> {
+    (cfg!(windows) || cfg!(target_os = "macos")).then(context_menu::installed)
+}
+
+/// Add or remove "Send with OpenDrop" in the right-click menu.
+#[tauri::command]
+fn set_context_menu(enabled: bool) -> Result<(), String> {
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        context_menu::install(&exe)
+    } else {
+        context_menu::uninstall()
+    }
+    .map_err(|e| e.to_string())
 }
 
 /// Finished transfers, newest first (the History view).
@@ -154,17 +191,33 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         audit,
         cancel_transfer,
         history,
-        show_in_folder
+        show_in_folder,
+        take_send_paths,
+        context_menu_status,
+        set_context_menu
     ])
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     with_commands(tauri::Builder::default())
+        // First, so a second copy (started by "Send with OpenDrop") hands
+        // its files to this one and exits before doing anything else.
+        .plugin(tauri_plugin_single_instance::init(
+            |app, argv, _cwd| match context_menu::send_args(&argv) {
+                Some(paths) => queue_send(app, paths),
+                None => background::show_window(app),
+            },
+        ))
+        .manage(SendQueue::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             background::setup(app)?;
+            let argv: Vec<String> = std::env::args().collect();
+            if let Some(paths) = context_menu::send_args(&argv) {
+                app.state::<SendQueue>().0.lock().unwrap().extend(paths);
+            }
             let handle = app.handle().clone();
             let sink: EventSink = Arc::new(move |event: AppEvent| {
                 background::on_event(&handle, &event);

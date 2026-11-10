@@ -63,7 +63,9 @@ export type AppEvent =
   | { kind: "pair_code"; pair_id: string; device_id: string; device_name: string; code: string; incoming: boolean }
   | { kind: "pair_expired"; pair_id: string }
   | { kind: "pair_done"; device_id: string; device_name: string; status: PairStatus; error: string | null }
-  | { kind: "history_added"; entry: HistoryEntry };
+  | { kind: "history_added"; entry: HistoryEntry }
+  /** "Send with OpenDrop" was picked; fetch the files with `takeSendPaths`. */
+  | { kind: "send_requested" };
 
 /** One finished transfer (see `history::Entry` in src-tauri). */
 export interface HistoryEntry {

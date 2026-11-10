@@ -117,3 +117,15 @@ input, button { font: inherit; }
 .history-failed .history-result { color: var(--bad); }
 .history .detail { color: var(--muted); }
 .history-done .history-result { color: var(--ok); }
+
+.queued {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  overflow-wrap: anywhere;
+}

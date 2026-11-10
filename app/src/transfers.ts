@@ -142,6 +142,8 @@ export function reducer(state: State, action: Action): State {
         pairNotice: { text, ok: action.status === "paired" },
       };
     }
+    case "send_requested":
+      return state;
     case "set_history":
       return { ...state, history: action.entries };
     case "history_added":

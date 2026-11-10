@@ -32,6 +32,12 @@ export interface Api {
   history(): Promise<HistoryEntry[]>;
   /** Open the file browser at a received file or folder from the history. */
   showInFolder(path: string): Promise<void>;
+  /** Files picked with "Send with OpenDrop" since the last call. */
+  takeSendPaths(): Promise<string[]>;
+  /** Whether "Send with OpenDrop" is in the right-click menu; null where
+   * it isn't available. */
+  contextMenuStatus(): Promise<boolean | null>;
+  setContextMenu(enabled: boolean): Promise<void>;
   onEvent(handler: (event: AppEvent) => void): Promise<() => void>;
   onDrag(handler: (event: DragEvent) => void): Promise<() => void>;
 }
@@ -50,6 +56,9 @@ export const tauriApi: Api = {
   audit: () => invoke("audit"),
   history: () => invoke("history"),
   showInFolder: (path) => invoke("show_in_folder", { path }),
+  takeSendPaths: () => invoke("take_send_paths"),
+  contextMenuStatus: () => invoke("context_menu_status"),
+  setContextMenu: (enabled) => invoke("set_context_menu", { enabled }),
   async pickFiles() {
     const picked = await open({ multiple: true, directory: false });
     if (picked === null) return [];

@@ -15,6 +15,8 @@ export default function App({ api = tauriApi }: { api?: Api }) {
   const [me, setMe] = useState<Me | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Files from "Send with OpenDrop", waiting for a device to be picked. */
+  const [queued, setQueued] = useState<string[]>([]);
 
   const send = useCallback(
     async (target: { deviceId?: string; address?: string }, paths: string[]) => {
@@ -33,7 +35,18 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     let cleanups: (() => void)[] = [];
     let cancelled = false;
     const keep = (unlisten: () => void) => (cancelled ? unlisten() : cleanups.push(unlisten));
-    api.onEvent(dispatch).then(keep);
+    const takeQueued = () =>
+      api
+        .takeSendPaths()
+        .then((paths) => paths.length > 0 && setQueued((q) => [...q, ...paths.filter((p) => !q.includes(p))]))
+        .catch(() => {});
+    api
+      .onEvent((event) => {
+        if (event.kind === "send_requested") takeQueued();
+        dispatch(event);
+      })
+      .then(keep);
+    takeQueued();
     api
       .onDrag((drag) => {
         const id = drag.type === "leave" ? null : deviceAt(drag.x, drag.y);
@@ -54,7 +67,15 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     };
   }, [api, send]);
 
+  // With files waiting from the right-click menu, picking a device sends
+  // those; otherwise it opens the file picker.
   const pickAndSend = async (target: { deviceId?: string; address?: string }) => {
+    if (queued.length > 0) {
+      const paths = queued;
+      setQueued([]);
+      send(target, paths);
+      return;
+    }
     send(target, await api.pickFiles());
   };
 
@@ -126,7 +147,17 @@ export default function App({ api = tauriApi }: { api?: Api }) {
             ))}
           </ul>
         )}
-        <p className="hint">Click a device to choose files, or drag files onto it.</p>
+        {queued.length > 0 ? (
+          <div className="queued" role="status">
+            <span>
+              Choose a device to send{" "}
+              <strong>{queued.length === 1 ? baseName(queued[0]) : plural(queued.length, "item")}</strong>
+            </span>
+            <button onClick={() => setQueued([])}>Cancel</button>
+          </div>
+        ) : (
+          <p className="hint">Click a device to choose files, or drag files onto it.</p>
+        )}
         <AddressForm onSend={(address) => pickAndSend({ address })} />
         {error && (
           <p className="error" role="alert">
@@ -155,6 +186,8 @@ export default function App({ api = tauriApi }: { api?: Api }) {
 
       <Activity api={api} />
 
+      <ContextMenuSetting api={api} />
+
       {state.pairing ? (
         <PairDialog key={state.pairing.pair_id} pairing={state.pairing} onAnswer={answerPair} />
       ) : (
@@ -163,6 +196,49 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         )
       )}
     </main>
+  );
+}
+
+/** The last part of a path, on any OS. */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+/** Turn "Send with OpenDrop" in the right-click menu on or off. Hidden where
+ * the OS has no such menu entry (Linux). */
+function ContextMenuSetting({ api }: { api: Api }) {
+  const [installed, setInstalled] = useState<boolean | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  useEffect(() => {
+    api
+      .contextMenuStatus()
+      .then(setInstalled)
+      .catch(() => setInstalled(null));
+  }, [api]);
+  if (installed === null) return null;
+  const toggle = () =>
+    api
+      .setContextMenu(!installed)
+      .then(() => {
+        setInstalled(!installed);
+        setFailed(null);
+      })
+      .catch((e) => setFailed(String(e)));
+  return (
+    <section className="context-menu">
+      <h2>Right-click menu</h2>
+      <p>
+        {installed
+          ? "“Send with OpenDrop” is in the right-click menu for files and folders."
+          : "Add “Send with OpenDrop” to the right-click menu for files and folders."}
+      </p>
+      <button onClick={toggle}>{installed ? "Remove from the menu" : "Add to the menu"}</button>
+      {failed && (
+        <p className="error" role="alert">
+          {failed}
+        </p>
+      )}
+    </section>
   );
 }
 
