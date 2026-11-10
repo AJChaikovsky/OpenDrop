@@ -106,6 +106,9 @@ pub enum PeerEvent {
 pub struct PeerTable {
     own_id: String,
     peers: HashMap<String, Peer>,
+    /// When each instance was last resolved, as a running count.
+    seen: HashMap<String, u64>,
+    clock: u64,
 }
 
 impl PeerTable {
@@ -113,6 +116,8 @@ impl PeerTable {
         Self {
             own_id: own_id.into(),
             peers: HashMap::new(),
+            seen: HashMap::new(),
+            clock: 0,
         }
     }
 
@@ -133,21 +138,39 @@ impl PeerTable {
             peer.addresses.sort();
             peer.addresses.dedup();
         }
-        match self.peers.insert(fullname.to_owned(), peer.clone()) {
-            None => Some(PeerEvent::Found(peer)),
-            Some(old) if old != peer => Some(PeerEvent::Updated(peer)),
-            Some(_) => None,
-        }
+        let change = match self.peers.insert(fullname.to_owned(), peer.clone()) {
+            None => PeerEvent::Found(peer),
+            Some(old) if old != peer => PeerEvent::Updated(peer),
+            Some(_) => return None,
+        };
+        // Only news counts, so periodic re-announcements don't flip which
+        // of two same-device instances stands for it.
+        self.clock += 1;
+        self.seen.insert(fullname.to_owned(), self.clock);
+        Some(change)
     }
 
     /// Forget a removed instance. Returns the peer that went away, if known.
     pub fn removed(&mut self, fullname: &str) -> Option<PeerEvent> {
+        self.seen.remove(fullname);
         self.peers.remove(fullname).map(PeerEvent::Lost)
     }
 
     /// All known peers, sorted by name then id.
+    ///
+    /// One per device: when two instances carry the same device id (the
+    /// CLI's `listen` and the app running on one computer), the one heard
+    /// from last stands for it.
     pub fn peers(&self) -> Vec<Peer> {
-        let mut peers: Vec<Peer> = self.peers.values().cloned().collect();
+        let mut latest: HashMap<&str, (u64, &Peer)> = HashMap::new();
+        for (fullname, peer) in &self.peers {
+            let seen = self.seen.get(fullname).copied().unwrap_or_default();
+            let entry = latest.entry(peer.id.as_str()).or_insert((seen, peer));
+            if seen > entry.0 {
+                *entry = (seen, peer);
+            }
+        }
+        let mut peers: Vec<Peer> = latest.into_values().map(|(_, p)| p.clone()).collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         peers
     }
@@ -398,6 +421,32 @@ mod tests {
         );
         assert_eq!(table.removed("a._opendrop._tcp.local."), None);
         assert!(table.peers().is_empty());
+    }
+
+    /// The CLI's `listen` and the app on one Mac share a device id: they
+    /// show as one device, the one heard from last, and the other takes
+    /// over when it goes away.
+    #[test]
+    fn two_instances_of_one_device_show_once() {
+        let mut table = PeerTable::new("device-me");
+        let cli = Peer {
+            port: 45454,
+            ..peer("device-mac", "AJs-MacBook-Air-2")
+        };
+        let app = Peer {
+            port: 61861,
+            ..peer("device-mac", "AJ’s MacBook Air (2)")
+        };
+        table.resolved("cli._opendrop._tcp.local.", cli.clone());
+        table.resolved("app._opendrop._tcp.local.", app.clone());
+        table.resolved("pc._opendrop._tcp.local.", peer("device-pc", "PCp7"));
+        let names = |t: &PeerTable| t.peers().into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(names(&table), ["AJ’s MacBook Air (2)", "PCp7"]);
+        // A re-announcement that says nothing new doesn't flip it.
+        table.resolved("cli._opendrop._tcp.local.", cli.clone());
+        assert_eq!(table.peers()[0].port, 61861);
+        table.removed("app._opendrop._tcp.local.");
+        assert_eq!(names(&table), ["AJs-MacBook-Air-2", "PCp7"]);
     }
 
     #[test]

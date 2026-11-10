@@ -8,7 +8,7 @@
 use crate::history::{self, History};
 use opendrop::audit::{AuditLog, Entry};
 use opendrop::daemon::{self, Daemon, Direction, Status, Transfer};
-use opendrop::discovery::{Discovery, Peer, PeerEvent};
+use opendrop::discovery::{Discovery, Peer};
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::grants::GrantOffer;
 use opendrop::network::server::{Approval, FileRequest, ReceiveEvent};
@@ -321,20 +321,14 @@ impl Node {
         let mut nearby = discovery.map(Discovery::subscribe);
         let mut pairings = paired.subscribe();
         let list_paired = Arc::clone(&paired);
+        let list_daemon = Arc::clone(&daemon);
         let list_sink = sink.clone();
         tokio::spawn(async move {
-            let mut peers: HashMap<String, Peer> = HashMap::new();
             loop {
                 tokio::select! {
                     change = async { nearby.as_mut().unwrap().recv().await }, if nearby.is_some() => {
                         match change {
-                            Ok(PeerEvent::Found(p) | PeerEvent::Updated(p)) => {
-                                peers.insert(p.id.clone(), p);
-                            }
-                            Ok(PeerEvent::Lost(p)) => {
-                                peers.remove(&p.id);
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                             Err(broadcast::error::RecvError::Closed) => nearby = None,
                         }
                     }
@@ -344,7 +338,11 @@ impl Node {
                         }
                     }
                 }
-                let list: Vec<Peer> = peers.values().cloned().collect();
+                // The discovery table already shows one entry per device.
+                let list = list_daemon
+                    .discovery()
+                    .map(Discovery::peers)
+                    .unwrap_or_default();
                 list_sink(AppEvent::Devices {
                     devices: devices(&list, &list_paired),
                 });

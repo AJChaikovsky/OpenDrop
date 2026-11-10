@@ -82,7 +82,8 @@ EXAMPLES:
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let name = take_flag(&mut args, "--name").unwrap_or_else(default_device_name);
+    let name =
+        take_flag(&mut args, "--name").unwrap_or_else(opendrop::identity::default_device_name);
     let port = match take_flag(&mut args, "--port").map(|p| p.parse::<u16>()) {
         None => DEFAULT_PORT,
         Some(Ok(p)) => p,
@@ -1085,21 +1086,6 @@ fn default_download_dir() -> PathBuf {
         .map(|home| PathBuf::from(home).join("Downloads"))
         .unwrap_or_default()
         .join("OpenDrop")
-}
-
-fn default_device_name() -> String {
-    std::env::var("COMPUTERNAME") // Windows
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-        })
-        .map(|s| s.trim().trim_end_matches(".local").to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "OpenDrop device".to_owned())
 }
 
 /// The address the OS would use for outbound traffic, for when no adapter
