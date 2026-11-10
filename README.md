@@ -145,6 +145,13 @@ with the time, the other device, the size, how it ended (done, declined, failed 
 cancelled) and where a received item was saved, which *Show in folder* opens. It lives in
 `history.jsonl` in the config folder, so it survives restarts.
 
+Closing the app's window keeps OpenDrop running in the menu bar (macOS) or the system tray
+(Windows, Linux): it stays discoverable and keeps receiving. When a file, folder, fetch
+request or pairing code needs an answer, a notification appears and the window comes back
+with the question. Click the icon (or the Dock icon on macOS) to open the window, or pick
+*Quit OpenDrop* from its menu to stop. If the terminal's `opendrop listen` and the app run
+on one computer, other devices list it once, under the same name.
+
 When you approve a fetch you can also let that device fetch from the same folder (and its
 subfolders) for 10 minutes without asking: answer `a` in the terminal, or tick the box in the
 app. Grants are kept in memory only, per device and folder; asking each time stays the default.
@@ -278,6 +285,7 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 | `src/network/fetch.rs` | Fetches this device started, which decide which offers skip the prompt |
 | `src/discovery/` | mDNS advertising, browsing and the discovered-peer table |
 | `src/transfer/` | Chunked streaming with SHA-256, temp files, safe file names |
+| `app/src-tauri/src/background.rs` | Tray / menu bar icon, close-to-hide, and notifications for questions while hidden |
 | `app/src-tauri/src/history.rs` | The desktop app's transfer history (`history.jsonl`) and *Show in folder* |
 | `app/src-tauri/src/node.rs` | Desktop app backend: receive with approval, send, pair, progress and speed events |
 | `app/src-tauri/src/lib.rs` | Tauri commands and event forwarding |

@@ -1,11 +1,12 @@
 //! Tauri shell around [`node::Node`]: commands in, events out.
 
+mod background;
 mod history;
 mod node;
 
 use node::{AppEvent, Device, EventSink, Node};
 use opendrop::DEFAULT_PORT;
-use opendrop::identity::{DeviceIdentity, default_config_dir};
+use opendrop::identity::{DeviceIdentity, default_config_dir, default_device_name};
 use opendrop::pairing::store::PairedDevices;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -161,9 +162,12 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
 pub fn run() {
     with_commands(tauri::Builder::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            background::setup(app)?;
             let handle = app.handle().clone();
             let sink: EventSink = Arc::new(move |event: AppEvent| {
+                background::on_event(&handle, &event);
                 let _ = handle.emit(EVENT, event);
             });
             // OPENDROP_NAME, OPENDROP_DIR and OPENDROP_CONFIG_DIR let two
@@ -176,7 +180,7 @@ pub fn run() {
                         .unwrap_or_else(|_| PathBuf::from("."))
                         .join("OpenDrop")
                 });
-            let name = std::env::var("OPENDROP_NAME").unwrap_or_else(|_| device_name());
+            let name = std::env::var("OPENDROP_NAME").unwrap_or_else(|_| default_device_name());
             let config_dir = default_config_dir();
             let identity =
                 DeviceIdentity::load_or_create(&config_dir, name).map_err(|e| e.to_string())?;
@@ -222,31 +226,16 @@ pub fn run() {
             app.manage(node);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
-
-/// The name people know this computer by: "AJ's MacBook Pro" on macOS, the
-/// computer name on Windows, the hostname elsewhere.
-fn device_name() -> String {
-    let command = |program: &str, args: &[&str]| {
-        std::process::Command::new(program)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-    };
-    let name = if cfg!(target_os = "macos") {
-        command("scutil", &["--get", "ComputerName"])
-    } else {
-        None
-    };
-    name.or_else(|| std::env::var("COMPUTERNAME").ok())
-        .or_else(|| command("hostname", &[]))
-        .map(|s| s.trim().trim_end_matches(".local").to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "OpenDrop device".to_owned())
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // macOS: clicking the Dock icon brings the hidden window back.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                background::show_window(app);
+            }
+            let _ = (app, event);
+        });
 }
 
 #[cfg(test)]
