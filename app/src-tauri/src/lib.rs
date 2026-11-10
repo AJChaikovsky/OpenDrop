@@ -1,5 +1,6 @@
 //! Tauri shell around [`node::Node`]: commands in, events out.
 
+mod history;
 mod node;
 
 use node::{AppEvent, Device, EventSink, Node};
@@ -82,6 +83,26 @@ fn cancel_transfer(node: State<'_, Arc<Node>>, transfer_id: String) -> Result<()
     node.cancel(&transfer_id)
 }
 
+/// Finished transfers, newest first (the History view).
+#[tauri::command]
+fn history(node: State<'_, Arc<Node>>) -> Vec<history::Entry> {
+    node.history.entries(500)
+}
+
+/// Open the file browser at a received file or folder from the history.
+#[tauri::command]
+fn show_in_folder(node: State<'_, Arc<Node>>, path: String) -> Result<(), String> {
+    // Only paths the history recorded, so the window can't open anything.
+    if !node.history.has_path(&path) {
+        return Err("not a file from the history".into());
+    }
+    let path = PathBuf::from(path);
+    if !path.exists() {
+        return Err(format!("{} is no longer there", path.display()));
+    }
+    history::reveal(&path).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn audit(node: State<'_, Arc<Node>>) -> Vec<opendrop::audit::Entry> {
     node.audit(500)
@@ -130,7 +151,9 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         respond_pair,
         unpair_device,
         audit,
-        cancel_transfer
+        cancel_transfer,
+        history,
+        show_in_folder
     ])
 }
 

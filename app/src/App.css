@@ -100,3 +100,20 @@ input, button { font: inherit; }
 .audit time { color: var(--muted); }
 .audit .detail { color: var(--muted); }
 .audit-decline strong { color: var(--bad); }
+
+.history-list { list-style: none; padding: 0; margin: 8px 0 0; font-size: 13px; }
+.history-entry {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.history-what { grid-column: 1; }
+.history-when { grid-column: 1; color: var(--muted); }
+.history-show { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
+.history-declined .history-result,
+.history-failed .history-result { color: var(--bad); }
+.history .detail { color: var(--muted); }
+.history-done .history-result { color: var(--ok); }

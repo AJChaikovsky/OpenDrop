@@ -1,7 +1,7 @@
 // What the window shows: devices, incoming requests, pairing and transfers,
 // updated by one pure reducer so it can be tested without Tauri.
 
-import type { AppEvent, Device, IncomingRequest, PairCode, PairStatus } from "./types";
+import type { AppEvent, Device, HistoryEntry, IncomingRequest, PairCode, PairStatus } from "./types";
 
 export type TransferStatus = "waiting" | "active" | "done" | "declined" | "failed" | "cancelled";
 
@@ -32,13 +32,23 @@ export interface State {
   pairing: (PairCode & { confirmed: boolean }) | null;
   /** How the last pairing ended, until the next one starts. */
   pairNotice: { text: string; ok: boolean } | null;
+  /** Finished transfers, newest first; null until loaded. */
+  history: HistoryEntry[] | null;
 }
 
-export const initialState: State = { devices: [], requests: [], transfers: [], pairing: null, pairNotice: null };
+export const initialState: State = {
+  devices: [],
+  requests: [],
+  transfers: [],
+  pairing: null,
+  pairNotice: null,
+  history: null,
+};
 
 export type Action =
   | AppEvent
   | { kind: "set_devices"; devices: Device[] }
+  | { kind: "set_history"; entries: HistoryEntry[] }
   | { kind: "answered"; transfer_id: string }
   | { kind: "pair_answered"; pair_id: string; accept: boolean };
 
@@ -132,6 +142,10 @@ export function reducer(state: State, action: Action): State {
         pairNotice: { text, ok: action.status === "paired" },
       };
     }
+    case "set_history":
+      return { ...state, history: action.entries };
+    case "history_added":
+      return { ...state, history: [action.entry, ...(state.history ?? [])] };
   }
 }
 

@@ -140,6 +140,11 @@ prints a warning. Every listing, request, approval, decline, folder grant and se
 in the config folder (one JSON object per line; names and decisions, never file contents).
 `opendrop audit` prints it, and the app shows it under *Activity*.
 
+The desktop app also keeps a transfer history: every file or folder it sent or received,
+with the time, the other device, the size, how it ended (done, declined, failed or
+cancelled) and where a received item was saved, which *Show in folder* opens. It lives in
+`history.jsonl` in the config folder, so it survives restarts.
+
 When you approve a fetch you can also let that device fetch from the same folder (and its
 subfolders) for 10 minutes without asking: answer `a` in the terminal, or tick the box in the
 app. Grants are kept in memory only, per device and folder; asking each time stays the default.
@@ -273,6 +278,7 @@ start OpenDrop with `--config DIR`, pass the same to the server: `opendrop mcp -
 | `src/network/fetch.rs` | Fetches this device started, which decide which offers skip the prompt |
 | `src/discovery/` | mDNS advertising, browsing and the discovered-peer table |
 | `src/transfer/` | Chunked streaming with SHA-256, temp files, safe file names |
+| `app/src-tauri/src/history.rs` | The desktop app's transfer history (`history.jsonl`) and *Show in folder* |
 | `app/src-tauri/src/node.rs` | Desktop app backend: receive with approval, send, pair, progress and speed events |
 | `app/src-tauri/src/lib.rs` | Tauri commands and event forwarding |
 | `app/src/` | React UI: device list, drop targets, accept and pairing dialogs, transfers |

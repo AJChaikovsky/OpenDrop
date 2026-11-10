@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AppEvent, AuditEntry, Device, Me } from "./types";
+import type { AppEvent, AuditEntry, Device, HistoryEntry, Me } from "./types";
 
 /** Where a file drag is, in CSS pixels, and which files it carries. */
 export type DragEvent =
@@ -28,6 +28,10 @@ export interface Api {
   pickFiles(): Promise<string[]>;
   /** The audit log, newest first. */
   audit(): Promise<AuditEntry[]>;
+  /** Finished transfers, newest first, kept across restarts. */
+  history(): Promise<HistoryEntry[]>;
+  /** Open the file browser at a received file or folder from the history. */
+  showInFolder(path: string): Promise<void>;
   onEvent(handler: (event: AppEvent) => void): Promise<() => void>;
   onDrag(handler: (event: DragEvent) => void): Promise<() => void>;
 }
@@ -44,6 +48,8 @@ export const tauriApi: Api = {
   respondPair: (pairId, accept) => invoke("respond_pair", { pairId, accept }),
   unpairDevice: (deviceId) => invoke("unpair_device", { deviceId }),
   audit: () => invoke("audit"),
+  history: () => invoke("history"),
+  showInFolder: (path) => invoke("show_in_folder", { path }),
   async pickFiles() {
     const picked = await open({ multiple: true, directory: false });
     if (picked === null) return [];

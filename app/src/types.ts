@@ -62,7 +62,26 @@ export type AppEvent =
   | { kind: "send_cancelled"; transfer_id: string; by_peer: boolean }
   | { kind: "pair_code"; pair_id: string; device_id: string; device_name: string; code: string; incoming: boolean }
   | { kind: "pair_expired"; pair_id: string }
-  | { kind: "pair_done"; device_id: string; device_name: string; status: PairStatus; error: string | null };
+  | { kind: "pair_done"; device_id: string; device_name: string; status: PairStatus; error: string | null }
+  | { kind: "history_added"; entry: HistoryEntry };
+
+/** One finished transfer (see `history::Entry` in src-tauri). */
+export interface HistoryEntry {
+  /** When it finished, in milliseconds since the Unix epoch. */
+  at_ms: number;
+  direction: "sent" | "received";
+  /** The other device. */
+  peer: string;
+  name: string;
+  size: number;
+  /** Set for a folder: how many files it held. */
+  files?: number;
+  result: "done" | "declined" | "failed" | "cancelled";
+  /** Where a received file or folder was saved. */
+  path?: string;
+  /** Why it failed, was declined or cancelled. */
+  detail?: string;
+}
 
 export type IncomingRequest = Extract<AppEvent, { kind: "incoming_request" }>;
 export type PairCode = Extract<AppEvent, { kind: "pair_code" }>;

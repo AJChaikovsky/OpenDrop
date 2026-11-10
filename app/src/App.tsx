@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { tauriApi, type Api } from "./api";
 import { formatSize, formatSpeed, initialState, plural, reducer, type Transfer } from "./transfers";
-import type { AuditEntry, Device, IncomingRequest, Me, PairCode } from "./types";
+import type { AuditEntry, Device, HistoryEntry, IncomingRequest, Me, PairCode } from "./types";
 import "./App.css";
 
 /** Seconds the receiver has to answer; matches APPROVAL_TIMEOUT in the crate. */
@@ -43,6 +43,10 @@ export default function App({ api = tauriApi }: { api?: Api }) {
       .then(keep);
     api.me().then(setMe).catch((e) => setError(String(e)));
     api.devices().then((devices) => dispatch({ kind: "set_devices", devices }));
+    api
+      .history()
+      .then((entries) => dispatch({ kind: "set_history", entries }))
+      .catch(() => dispatch({ kind: "set_history", entries: [] }));
     return () => {
       cancelled = true;
       cleanups.forEach((f) => f());
@@ -147,6 +151,8 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         </section>
       )}
 
+      <History entries={state.history} onShow={(path) => api.showInFolder(path).catch((e) => setError(String(e)))} />
+
       <Activity api={api} />
 
       {state.pairing ? (
@@ -157,6 +163,48 @@ export default function App({ api = tauriApi }: { api?: Api }) {
         )
       )}
     </main>
+  );
+}
+
+const RESULT_LABELS: Record<HistoryEntry["result"], string> = {
+  done: "Done",
+  declined: "Declined",
+  failed: "Failed",
+  cancelled: "Cancelled",
+};
+
+/** Finished transfers, newest first, kept across restarts. */
+function History({ entries, onShow }: { entries: HistoryEntry[] | null; onShow: (path: string) => void }) {
+  if (entries === null) return null;
+  return (
+    <section className="history">
+      <h2>History</h2>
+      {entries.length === 0 ? (
+        <p className="empty">Nothing sent or received yet.</p>
+      ) : (
+        <ul className="history-list">
+          {entries.map((e, i) => (
+            <li key={`${e.at_ms}-${i}`} className={`history-entry history-${e.result}`}>
+              <span className="history-what">
+                {e.direction === "sent" ? "↑ Sent to" : "↓ Received from"} {e.peer} · <strong>{e.name}</strong>
+                {e.files != null && <> · folder, {plural(e.files, "file")}</>} · {formatSize(e.size)}
+              </span>
+              <span className="history-when">
+                <time dateTime={new Date(e.at_ms).toISOString()}>{new Date(e.at_ms).toLocaleString()}</time>
+                {" · "}
+                <span className="history-result">{RESULT_LABELS[e.result]}</span>
+                {e.detail && <span className="detail"> ({e.detail})</span>}
+              </span>
+              {e.path && e.result === "done" && (
+                <button className="history-show" onClick={() => onShow(e.path!)} aria-label={`Show ${e.name} in folder`}>
+                  Show in folder
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 

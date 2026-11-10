@@ -3,11 +3,11 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Api, DragEvent } from "./api";
 import App from "./App";
-import type { AppEvent, AuditEntry, Device, Me } from "./types";
+import type { AppEvent, AuditEntry, Device, HistoryEntry, Me } from "./types";
 
 const pc: Device = { id: "device-pc", name: "AJ-PC", address: "192.168.1.30:45454", compatible: true, paired: false };
 
-function fakeApi(devices: Device[] = [pc]) {
+function fakeApi(devices: Device[] = [pc], history: HistoryEntry[] = []) {
   let emit: (e: AppEvent) => void = () => {};
   let drag: (e: DragEvent) => void = () => {};
   const api = {
@@ -31,6 +31,8 @@ function fakeApi(devices: Device[] = [pc]) {
       { at_ms: 1_761_999_990_000, event: "request", peer_name: "AJ-PC", file: "q3.pdf", detail: "for the deck", via_assistant: true },
       { at_ms: 1_761_999_980_000, event: "list", peer_name: "AJ-PC", detail: "3 file(s)" },
     ]),
+    history: vi.fn(async () => history),
+    showInFolder: vi.fn(async () => {}),
     onEvent: vi.fn(async (h: (e: AppEvent) => void) => ((emit = h), () => {})),
     onDrag: vi.fn(async (h: (e: DragEvent) => void) => ((drag = h), () => {})),
   } satisfies Api;
@@ -38,6 +40,54 @@ function fakeApi(devices: Device[] = [pc]) {
 }
 
 describe("App", () => {
+  it("shows the saved history, adds finished transfers live, and opens received files", async () => {
+    const saved: HistoryEntry[] = [
+      { at_ms: 1_762_000_300_000, direction: "sent", peer: "Windows", name: "unwanted.txt", size: 40, result: "declined" },
+      {
+        at_ms: 1_762_000_200_000,
+        direction: "received",
+        peer: "Windows",
+        name: "Project X",
+        size: 1_200_000_000,
+        files: 500,
+        result: "done",
+        path: "/Users/aj/Downloads/OpenDrop/Project X",
+      },
+      { at_ms: 1_762_000_100_000, direction: "sent", peer: "Windows", name: "two.txt", size: 20, result: "done" },
+      { at_ms: 1_762_000_000_000, direction: "received", peer: "Windows", name: "big.bin", size: 5, result: "cancelled", detail: "the sender cancelled it" },
+    ];
+    const { api, emit } = fakeApi([pc], saved);
+    render(<App api={api} />);
+    const section = (await screen.findByRole("heading", { name: "History" })).closest("section")!;
+    const rows = () => within(section).getAllByRole("listitem");
+    expect(rows().map((li) => li.className)).toEqual([
+      "history-entry history-declined",
+      "history-entry history-done",
+      "history-entry history-done",
+      "history-entry history-cancelled",
+    ]);
+    expect(rows()[1]).toHaveTextContent("Received from Windows · Project X · folder, 500 files · 1.2 GB");
+    expect(rows()[3]).toHaveTextContent("Cancelled (the sender cancelled it)");
+    // Only finished received items can be shown in their folder.
+    expect(within(section).getAllByRole("button", { name: /in folder/ })).toHaveLength(1);
+    await userEvent.click(within(section).getByRole("button", { name: "Show Project X in folder" }));
+    expect(api.showInFolder).toHaveBeenCalledWith("/Users/aj/Downloads/OpenDrop/Project X");
+
+    emit({
+      kind: "history_added",
+      entry: { at_ms: 1_762_000_400_000, direction: "sent", peer: "Windows", name: "new.txt", size: 3, result: "done" },
+    });
+    expect(rows()).toHaveLength(5);
+    expect(rows()[0]).toHaveTextContent("Sent to Windows · new.txt");
+    expect(rows()[0]).toHaveTextContent("Done");
+  });
+
+  it("says so when there is no history yet", async () => {
+    const { api } = fakeApi();
+    render(<App api={api} />);
+    expect(await screen.findByText("Nothing sent or received yet.")).toBeInTheDocument();
+  });
+
   it("asks once for a whole folder and shows it as one transfer", async () => {
     const { api, emit } = fakeApi();
     render(<App api={api} />);
