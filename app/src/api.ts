@@ -53,14 +53,26 @@ export const tauriApi: Api = {
   onDrag: (handler) =>
     getCurrentWebview().onDragDropEvent((e) => {
       const p = e.payload;
-      // Positions arrive in physical pixels; the DOM works in CSS pixels.
-      const scale = window.devicePixelRatio || 1;
       if (p.type === "enter" || p.type === "over") {
-        handler({ type: "over", x: p.position.x / scale, y: p.position.y / scale });
+        handler({ type: "over", ...toCssPoint(p.position, window.devicePixelRatio, navigator.userAgent) });
       } else if (p.type === "drop") {
-        handler({ type: "drop", x: p.position.x / scale, y: p.position.y / scale, paths: p.paths });
+        handler({ type: "drop", ...toCssPoint(p.position, window.devicePixelRatio, navigator.userAgent), paths: p.paths });
       } else {
         handler({ type: "leave" });
       }
     }),
 };
+
+/** Turn a drag position from Tauri into CSS pixels for `elementFromPoint`.
+ *  Windows and Linux report physical pixels, so we divide by the device
+ *  pixel ratio. macOS already reports logical (CSS) pixels: dividing there
+ *  halved the point on a Retina screen, so a drop only landed on a card when
+ *  the pointer was at twice its position. */
+export function toCssPoint(
+  position: { x: number; y: number },
+  ratio: number | undefined,
+  userAgent: string,
+): { x: number; y: number } {
+  const scale = /Macintosh|Mac OS X/.test(userAgent) ? 1 : ratio || 1;
+  return { x: position.x / scale, y: position.y / scale };
+}
