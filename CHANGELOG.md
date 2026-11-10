@@ -40,8 +40,8 @@ local network, with no accounts and no cloud.
   each device and time-limited folder grants.
 
 ### CLI
-- `opendrop listen`, `send`, `fetch`, `pair`, `devices` and `audit` for scripting and
-  headless machines.
+- `opendrop listen`, `peers`, `send`, `send-file`, `pair`, `devices`, `share`, `files`,
+  `fetch`, `audit` and `mcp`, for scripting and headless machines.
 
 ### Known limitations
 - The installers aren't code-signed yet; the README explains the one-time step to open
