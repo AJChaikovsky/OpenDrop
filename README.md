@@ -57,8 +57,11 @@ cargo run --release -- send-file "AJ's MacBook" photo.jpg notes.pdf
 ```
 
 The receiver saves them to `~/Downloads/OpenDrop` (change with `listen --dir DIR`). Existing
-files are never overwritten: a second `photo.jpg` becomes `photo (1).jpg`. Folders aren't
-supported yet.
+files are never overwritten: a second `photo.jpg` becomes `photo (1).jpg`. A folder goes as
+one transfer with one approval ("the folder "Photos" (500 files, 1.2 GB)"), and its tree is
+recreated under the download folder (`Photos`, or `Photos (1)` if that exists). Symbolic links
+inside it are skipped. Press Ctrl+C during a send to cancel it: the receiver is told and keeps
+nothing.
 
 The receiver is asked about every file before anything is written:
 
@@ -367,6 +370,21 @@ matches `file_done` is the file synced and renamed into place, then confirmed wi
 `file_received`. On a mismatch, a dropped connection or a stall, the temp file is deleted.
 Several files (and texts) can be sent over one connection, one after another.
 
+A folder starts with `folder_offer` (name, file count, total size) and its listing in
+`folder_entries` frames (paths relative to the folder, `/`-separated, each checked: no `..`,
+`.`, empty parts, absolute paths, drive letters, backslashes, Windows-reserved names or
+characters, duplicates, or more than 100,000 files or 64 levels). An unsafe listing gets
+`error` `file_rejected` before the user is even asked. After `file_accept`, each file goes in
+listing order as its raw bytes and a `file_done`. The receiver writes them into a hidden
+`.opendrop-*.partdir` folder and renames it into place only after the last one checks out;
+anything else deletes the whole folder. Both sides report a tree SHA-256 over each file's hash
+and path.
+
+Either side can cancel midway. The receiver sends `cancel`. The sender, whose side of the
+stream is raw file bytes at that point, sends an empty encrypted record instead, which no
+other message produces. Both ends delete the partial file or folder and report `cancelled`,
+saying which side did it.
+
 ### Fetching
 
 Fetching flips the flow: the device that wants a file asks for it. A paired requester can
@@ -385,7 +403,9 @@ reuse the SHA-256 check and `.part` handling of ordinary transfers.
 
 Each device advertises one `_opendrop._tcp.local.` instance named after its device id, on its
 TCP port, with TXT properties `device_id`, `device_name` (cut to 200 bytes) and
-`protocol_version` (`2`). It browses for the same service type at the same time, ignores its
+`protocol_version` (`3`). Virtual adapters (WSL and Hyper-V `vEthernet`, Docker, VMs, VPNs,
+Apple's AWDL) are left out of the advertisement, since other devices can't reach them, and a
+peer's addresses on a network this device is also on are tried first. It browses for the same service type at the same time, ignores its
 own instance, adds peers when they resolve and drops them when their instance is removed
 (`listen` unregisters on Ctrl+C, so peers see it leave right away). A peer advertising a
 different `protocol_version` is still listed, marked incompatible.

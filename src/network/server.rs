@@ -33,11 +33,13 @@ use crate::audit::{AuditLog, Entry, Event};
 use crate::daemon::{Direction, Status, Transfer, TransferTable};
 use crate::pairing::store::PairedDevices;
 use crate::pairing::{self, PairOutcome, PairPrompts, PairResult, PairResults};
+use crate::protocol::FolderEntry;
 use crate::protocol::{
     ErrorCode, FetchDeclineReason, Message, ProtocolError, read_message, share_list_within_frame,
     write_message,
 };
 use crate::share::{ShareError, Shares};
+use crate::transfer::folder::{MAX_FOLDER_FILES, Staging, check_listing, folder_name, tree_hash};
 use crate::transfer::{PartFile, copy_hashed, sanitize_file_name};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -72,6 +74,9 @@ pub struct FileRequest {
     /// For an incoming file: firing it after a yes stops the download
     /// midway, tells the sender, and throws away what arrived.
     pub cancel: Option<oneshot::Sender<()>>,
+    /// Set when the offer is a folder: how many files it holds (`name` is
+    /// the folder's, `size` the total).
+    pub files: Option<u64>,
 }
 
 /// What a fetch request adds to a [`FileRequest`].
@@ -331,6 +336,7 @@ async fn serve_fetch(
                 size: file.size,
                 respond,
                 cancel: None,
+                files: None,
                 fetch: Some(FetchInfo {
                     peer_id: peer.peer.id.clone(),
                     reason: request.reason.clone(),
@@ -544,6 +550,36 @@ async fn handle_connection(
                     &name,
                     size,
                     None,
+                    None,
+                )
+                .await?;
+            }
+            Ok(Message::FolderOffer {
+                transfer_id,
+                name,
+                files,
+                size,
+            }) => {
+                let entries = match read_listing(stream, &transfer_id, files, size).await {
+                    Ok(entries) => entries,
+                    Err(why) => {
+                        println!("[{peer_addr}] refused folder \"{name}\" from {peer_name}: {why}");
+                        return reject(stream, ErrorCode::FileRejected, why).await;
+                    }
+                };
+                receive_file(
+                    stream,
+                    download_dir,
+                    approval,
+                    events,
+                    &peer,
+                    &options.audit,
+                    peer_addr,
+                    transfer_id,
+                    &name,
+                    size,
+                    None,
+                    Some(entries),
                 )
                 .await?;
             }
@@ -580,6 +616,7 @@ async fn handle_connection(
                     &name,
                     size,
                     stop,
+                    None,
                 )
                 .await?;
             }
@@ -708,10 +745,15 @@ async fn receive_file(
     offered_name: &str,
     size: u64,
     stop: Option<oneshot::Receiver<()>>,
+    folder: Option<Vec<FolderEntry>>,
 ) -> Result<(), BoxError> {
     let peer_name = peer.peer.name.as_str();
     let verified = peer.paired;
-    let Some(name) = sanitize_file_name(offered_name) else {
+    let usable = match folder {
+        Some(_) => folder_name(offered_name),
+        None => sanitize_file_name(offered_name),
+    };
+    let Some(name) = usable else {
         return reject(
             stream,
             ErrorCode::FileRejected,
@@ -742,6 +784,7 @@ async fn receive_file(
                 respond,
                 fetch: None,
                 cancel,
+                files: folder.as_ref().map(|f| f.len() as u64),
             };
             let accepted = requests.send(request).await.is_ok()
                 && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)));
@@ -777,17 +820,34 @@ async fn receive_file(
         name: name.clone(),
         size,
     });
-    let result = save_file(
-        stream,
-        download_dir,
-        &emit,
-        peer_addr,
-        &transfer_id,
-        &name,
-        size,
-        stop,
-    )
-    .await;
+    let result = match folder {
+        None => {
+            save_file(
+                stream,
+                download_dir,
+                &emit,
+                peer_addr,
+                &transfer_id,
+                &name,
+                size,
+                stop,
+            )
+            .await
+        }
+        Some(entries) => {
+            save_folder(
+                stream,
+                download_dir,
+                &emit,
+                peer_addr,
+                &transfer_id,
+                &name,
+                &entries,
+                stop,
+            )
+            .await
+        }
+    };
     emit(match &result {
         Ok((path, sha256)) => ReceiveEvent::Saved {
             transfer_id,
@@ -940,6 +1000,191 @@ async fn save_file(
     )
     .await?;
     Ok((saved, actual))
+}
+
+/// Read a folder's listing (`files` entries in `folder_entries` messages)
+/// and check it. The error says why it's refused.
+async fn read_listing(
+    stream: &mut Secure<'_>,
+    transfer_id: &str,
+    files: u64,
+    size: u64,
+) -> Result<Vec<FolderEntry>, String> {
+    if files == 0 || files > MAX_FOLDER_FILES as u64 {
+        return Err(format!("a folder must have 1 to {MAX_FOLDER_FILES} files"));
+    }
+    let mut entries = Vec::with_capacity(files as usize);
+    while (entries.len() as u64) < files {
+        match next_message(stream).await {
+            Ok(Message::FolderEntries {
+                transfer_id: id,
+                entries: more,
+            }) if id == transfer_id && !more.is_empty() => entries.extend(more),
+            Ok(other) => return Err(format!("expected folder_entries, got {other:?}")),
+            Err(e) => return Err(e.to_string()),
+        }
+        if entries.len() as u64 > files {
+            return Err("more files than offered".into());
+        }
+    }
+    check_listing(&entries)?;
+    if entries.iter().map(|e| e.size).sum::<u64>() != size {
+        return Err("the file sizes don't add up to the offered size".into());
+    }
+    Ok(entries)
+}
+
+/// [`save_file`] for a folder: each file in listing order (raw bytes, then
+/// `file_done`), written into a hidden staging folder that's moved into
+/// place once every file checks out. Returns the folder's path and
+/// [`tree_hash`].
+#[allow(clippy::too_many_arguments)]
+async fn save_folder(
+    stream: &mut Secure<'_>,
+    download_dir: &Path,
+    emit: &(impl Fn(ReceiveEvent) + Sync),
+    peer_addr: SocketAddr,
+    transfer_id: &str,
+    name: &str,
+    entries: &[FolderEntry],
+    stop: Option<oneshot::Receiver<()>>,
+) -> Result<(PathBuf, String), BoxError> {
+    let paths = match check_listing(entries) {
+        Ok(paths) => paths,
+        Err(why) => return reject(stream, ErrorCode::FileRejected, why).await,
+    };
+    let staging = match Staging::create(download_dir).await {
+        Ok(staging) => staging,
+        Err(e) => {
+            return reject(
+                stream,
+                ErrorCode::StorageError,
+                format!("cannot save files: {e}"),
+            )
+            .await;
+        }
+    };
+    write_message(
+        stream,
+        &Message::FileAccept {
+            transfer_id: transfer_id.to_owned(),
+        },
+    )
+    .await?;
+    let total: u64 = entries.iter().map(|e| e.size).sum();
+    println!(
+        "[{peer_addr}] receiving folder \"{name}\" ({} files, {total} bytes)",
+        entries.len()
+    );
+    let mut stop = stop;
+    let receive_all = async {
+        let mut hashes = Vec::with_capacity(entries.len());
+        let mut before = 0u64;
+        for (entry, relative) in entries.iter().zip(&paths) {
+            let mut file = staging
+                .create_file(relative)
+                .await
+                .map_err(|e| format!("could not save {}: {e}", entry.path))?;
+            let mut on_progress = |received| {
+                emit(ReceiveEvent::Progress {
+                    transfer_id: transfer_id.to_owned(),
+                    received: before + received,
+                })
+            };
+            let actual = copy_hashed(stream, &mut file, entry.size, &mut on_progress).await;
+            let actual = match actual {
+                Ok(actual) => actual,
+                Err(e) if is_peer_cancel(&e) => {
+                    return Err::<Vec<String>, BoxError>(ReceiveCancelled { by_peer: true }.into());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            file.sync_all().await?;
+            let expected = match next_message(stream).await {
+                Ok(Message::FileDone {
+                    transfer_id: id,
+                    sha256,
+                }) if id == transfer_id => sha256,
+                Ok(other) => return Err(format!("expected file_done, got {other:?}").into()),
+                Err(e) if is_peer_cancel(&e) => {
+                    return Err(ReceiveCancelled { by_peer: true }.into());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if !actual.eq_ignore_ascii_case(&expected) {
+                return Err(format!(
+                    "{} arrived corrupted (SHA-256 {actual}, expected {expected})",
+                    entry.path
+                )
+                .into());
+            }
+            before += entry.size;
+            hashes.push(actual);
+        }
+        Ok(hashes)
+    };
+    let received = tokio::select! {
+        received = receive_all => Some(received),
+        () = stop_signal(&mut stop) => None,
+    };
+    let hashes = match received {
+        Some(Ok(hashes)) => hashes,
+        None => {
+            println!("[{peer_addr}] stopped receiving folder \"{name}\": cancelled");
+            drop(staging);
+            let cancel = Message::Cancel {
+                transfer_id: transfer_id.to_owned(),
+            };
+            let _ = timeout(
+                std::time::Duration::from_secs(1),
+                write_message(stream, &cancel),
+            )
+            .await;
+            return Err(ReceiveCancelled { by_peer: false }.into());
+        }
+        Some(Err(e)) => {
+            drop(staging);
+            if let Some(cancelled) = e.downcast_ref::<ReceiveCancelled>() {
+                println!("[{peer_addr}] folder \"{name}\" cancelled by the sender");
+                return Err((*cancelled).into());
+            }
+            return reject(stream, ErrorCode::FileRejected, e.to_string()).await;
+        }
+    };
+    if stop.as_mut().is_some_and(|s| s.try_recv().is_ok()) {
+        return Err(ReceiveCancelled { by_peer: false }.into());
+    }
+    let saved = match staging.persist(download_dir, name).await {
+        Ok(path) => path,
+        Err(e) => {
+            return reject(
+                stream,
+                ErrorCode::StorageError,
+                format!("could not save folder \"{name}\": {e}"),
+            )
+            .await;
+        }
+    };
+    let sha256 = tree_hash(
+        entries
+            .iter()
+            .zip(&hashes)
+            .map(|(e, h)| (e.path.as_str(), h.as_str())),
+    );
+    println!(
+        "[{peer_addr}] saved folder {} ({} files, every SHA-256 verified)",
+        saved.display(),
+        entries.len()
+    );
+    write_message(
+        stream,
+        &Message::FileReceived {
+            transfer_id: transfer_id.to_owned(),
+            received_bytes: total,
+        },
+    )
+    .await?;
+    Ok((saved, sha256))
 }
 
 async fn next_message(stream: &mut Secure<'_>) -> Result<Message, ProtocolError> {

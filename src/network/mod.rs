@@ -36,6 +36,8 @@ pub struct PeerIdentity {
 #[cfg(test)]
 mod fetch_tests;
 #[cfg(test)]
+mod folder_tests;
+#[cfg(test)]
 mod secure_tests;
 
 #[cfg(test)]
@@ -48,11 +50,11 @@ mod tests {
         start_server_in(std::env::temp_dir().join("opendrop-tests-unused")).await
     }
 
-    async fn start_server_in(download_dir: std::path::PathBuf) -> std::net::SocketAddr {
+    pub(super) async fn start_server_in(download_dir: std::path::PathBuf) -> std::net::SocketAddr {
         start_server_with(download_dir, server::Approval::AcceptAll).await
     }
 
-    async fn start_server_with(
+    pub(super) async fn start_server_with(
         download_dir: std::path::PathBuf,
         approval: server::Approval,
     ) -> std::net::SocketAddr {
@@ -214,7 +216,7 @@ mod tests {
     }
 
     /// Connect and complete the handshake, for protocol-level tests.
-    async fn handshake(addr: std::net::SocketAddr) -> secure::SecureStream<TcpStream> {
+    pub(super) async fn handshake(addr: std::net::SocketAddr) -> secure::SecureStream<TcpStream> {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let done = handshake::connect(
             &mut stream,

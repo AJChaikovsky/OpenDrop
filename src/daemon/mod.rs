@@ -281,7 +281,7 @@ impl Daemon {
     /// transfer table. Returns the transfer id at once; the send runs in the
     /// background and can be cancelled through the table.
     pub async fn send_file(&self, addrs: &[SocketAddr], path: &Path) -> Result<String, BoxError> {
-        let size = file_size(path)?;
+        let size = send_size(path)?;
         let connection = connect(addrs, &self.identity, &self.paired).await?;
         Ok(self.start_send(connection, path, size))
     }
@@ -296,7 +296,7 @@ impl Daemon {
         path: &Path,
         paired_only: bool,
     ) -> Result<String, BoxError> {
-        let size = file_size(path)?;
+        let size = send_size(path)?;
         let addrs = self.addresses_of(device)?;
         let connection = connect(&addrs, &self.identity, &self.paired).await?;
         if paired_only && !connection.paired {
@@ -311,14 +311,22 @@ impl Daemon {
         Ok(self.start_send(connection, path, size))
     }
 
-    fn start_send(&self, connection: Connection, path: &Path, size: u64) -> String {
-        let (id, cancelled) = self.transfers.begin(Transfer::new(
-            Direction::Send,
-            Some(connection.peer.id.clone()),
-            connection.peer.name.clone(),
-            file_name(path),
-            size,
-        ));
+    fn start_send(
+        &self,
+        connection: Connection,
+        path: &Path,
+        (size, files): (u64, Option<u64>),
+    ) -> String {
+        let (id, cancelled) = self.transfers.begin(Transfer {
+            files,
+            ..Transfer::new(
+                Direction::Send,
+                Some(connection.peer.id.clone()),
+                connection.peer.name.clone(),
+                file_name(path),
+                size,
+            )
+        });
         tokio::spawn(run_send(
             Arc::clone(&self.transfers),
             Arc::clone(&self.audit),
@@ -447,13 +455,24 @@ impl Drop for Daemon {
 }
 
 /// The size of regular file `path`, or why it can't be sent.
-fn file_size(path: &Path) -> Result<u64, BoxError> {
+/// How much sending `path` means: its size, and for a folder how many files
+/// it holds.
+fn send_size(path: &Path) -> Result<(u64, Option<u64>), BoxError> {
     let meta =
         std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a file", path.display()).into());
+    if meta.is_dir() {
+        let listing = crate::transfer::folder::list_folder(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if listing.is_empty() {
+            return Err(format!("{} is an empty folder", path.display()).into());
+        }
+        let size = listing.iter().map(|(_, e)| e.size).sum();
+        return Ok((size, Some(listing.len() as u64)));
     }
-    Ok(meta.len())
+    if !meta.is_file() {
+        return Err(format!("{} is not a file or folder", path.display()).into());
+    }
+    Ok((meta.len(), None))
 }
 
 /// The shared file `query` names: its id, its path in the share, or its
@@ -602,10 +621,16 @@ async fn run_send(
             t.bytes = sent;
         })
     };
-    match connection
-        .send_file_until(&path, &mut on_progress, cancelled)
-        .await
-    {
+    let result = if path.is_dir() {
+        connection
+            .send_folder_until(&path, &mut on_progress, Some(cancelled))
+            .await
+    } else {
+        connection
+            .send_file_until(&path, &mut on_progress, cancelled)
+            .await
+    };
+    match result {
         Ok(FileResult::Delivered(outcome)) => transfers.update(&id, |t| {
             t.bytes = outcome.size;
             t.sha256 = Some(outcome.sha256);
@@ -644,13 +669,16 @@ async fn record_requests(
         };
         let (row, mut cancelled) = transfers.begin_with_id(
             request.transfer_id.clone(),
-            Transfer::new(
-                direction,
-                peer_id,
-                request.peer_name.clone(),
-                request.name.clone(),
-                request.size,
-            ),
+            Transfer {
+                files: request.files,
+                ..Transfer::new(
+                    direction,
+                    peer_id,
+                    request.peer_name.clone(),
+                    request.name.clone(),
+                    request.size,
+                )
+            },
         );
         let transfers = Arc::clone(&transfers);
         let approval = approval.clone();
@@ -665,6 +693,7 @@ async fn record_requests(
                 mut respond,
                 fetch,
                 cancel,
+                files,
             } = request;
             let accept = match approval {
                 // Auto-accept takes files in; sending one away always needs
@@ -682,6 +711,7 @@ async fn record_requests(
                         respond: answer_tx,
                         fetch,
                         cancel: None,
+                        files,
                     };
                     if ask.send(forwarded).await.is_err() {
                         false

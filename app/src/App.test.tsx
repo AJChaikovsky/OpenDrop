@@ -38,6 +38,33 @@ function fakeApi(devices: Device[] = [pc]) {
 }
 
 describe("App", () => {
+  it("asks once for a whole folder and shows it as one transfer", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    emit({
+      kind: "incoming_request",
+      transfer_id: "in-9",
+      peer_name: "AJ-PC",
+      peer_ip: "192.168.1.30",
+      verified: true,
+      name: "Project X",
+      size: 1_200_000_000,
+      fetch: null,
+      files: 500,
+    });
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Incoming folder")).toBeInTheDocument();
+    expect(within(dialog).getByText(/wants to send you the folder/)).toBeInTheDocument();
+    expect(within(dialog).getByText("500 files, 1.2 GB")).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: /Accept/ }));
+    expect(api.respond).toHaveBeenCalledWith("in-9", true, false);
+
+    emit({ kind: "send_waiting", transfer_id: "send-7", device_name: "AJ-PC", name: "Photos", size: 3000, files: 3 });
+    const row = screen.getByRole("listitem", { name: "Photos" });
+    expect(within(row).getByText(/folder, 3 files/)).toBeInTheDocument();
+  });
+
+
   it("cancels a transfer from its Cancel button and shows who cancelled", async () => {
     const { api, emit } = fakeApi();
     render(<App api={api} />);

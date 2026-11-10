@@ -3,7 +3,7 @@
 //!   opendrop listen [--port PORT] [--name NAME] [--dir DIR] [--auto-accept]
 //!   opendrop peers [--wait SECONDS]
 //!   opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
-//!   opendrop send-file <DEVICE|IP[:PORT]> <FILE>... [--name NAME]
+//!   opendrop send-file <DEVICE|IP[:PORT]> <FILE|FOLDER>... [--name NAME]
 //!   opendrop pair <DEVICE|IP[:PORT]>
 //!   opendrop devices [--wait SECONDS]
 //!   opendrop unpair <DEVICE>
@@ -46,7 +46,7 @@ USAGE:
                                     advertise, receive messages and files
     opendrop peers [--wait SECONDS] list devices on this network
     opendrop send <DEVICE|IP[:PORT]> <MESSAGE> [--name NAME]
-    opendrop send-file <DEVICE|IP[:PORT]> <FILE>... [--name NAME]
+    opendrop send-file <DEVICE|IP[:PORT]> <FILE|FOLDER>... [--name NAME]
     opendrop pair <DEVICE|IP[:PORT]>  pair with a device (both screens show a code)
     opendrop devices [--wait SECONDS] list nearby and paired devices
     opendrop unpair <DEVICE>          forget a paired device
@@ -369,12 +369,8 @@ async fn send_files(me: &Me, target: &str, files: &[&str], wait: Duration) -> Ex
     // Catch typos before connecting rather than halfway through a batch.
     for file in files {
         match std::fs::metadata(file) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => {
-                return fail(&format!(
-                    "{file} is not a file (folders aren't supported yet)"
-                ));
-            }
+            Ok(m) if m.is_file() || m.is_dir() => {}
+            Ok(_) => return fail(&format!("{file} is not a file or folder")),
             Err(e) => return fail(&format!("cannot read {file}: {e}")),
         }
     }
@@ -392,7 +388,19 @@ async fn send_files(me: &Me, target: &str, files: &[&str], wait: Duration) -> Ex
     let mut declined = 0;
     for file in files {
         let path = Path::new(file);
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let is_folder = path.is_dir();
+        let size = if is_folder {
+            match opendrop::transfer::folder::list_folder(path) {
+                Ok(listing) if !listing.is_empty() => {
+                    println!("{}: folder with {} file(s)", path.display(), listing.len());
+                    listing.iter().map(|(_, e)| e.size).sum()
+                }
+                Ok(_) => return fail(&format!("{file} is an empty folder")),
+                Err(e) => return fail(&format!("cannot read {file}: {e}")),
+            }
+        } else {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        };
         let mut bar = Progress::new(path, size);
         // Ctrl+C calls the file off and tells the receiver.
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -401,9 +409,15 @@ async fn send_files(me: &Me, target: &str, files: &[&str], wait: Duration) -> Ex
                 let _ = stop.send(());
             }
         });
-        let result = connection
-            .send_file_until(path, &mut |sent| bar.update(sent), stopped)
-            .await;
+        let result = if is_folder {
+            connection
+                .send_folder_until(path, &mut |sent| bar.update(sent), Some(stopped))
+                .await
+        } else {
+            connection
+                .send_file_until(path, &mut |sent| bar.update(sent), stopped)
+                .await
+        };
         ctrl_c.abort();
         match result {
             Ok(FileResult::Cancelled) => {
@@ -966,8 +980,14 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
             let (question, limit, mut respond, grant) = tokio::select! {
-                Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, .. }) = files.recv() => (
+                Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, files: count, .. }) = files.recv() => (
                     format!("{}{}", if verified { "" } else { "[unverified device] " }, match &fetch {
+                        None if count.is_some() => format!(
+                            "\"{peer_name}\" ({}) wants to send you the folder \"{name}\" ({} files, {}).\n  Accept?",
+                            peer_addr.ip(),
+                            count.unwrap_or_default(),
+                            human_size(size),
+                        ),
                         None => format!(
                             "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
                             peer_addr.ip(),

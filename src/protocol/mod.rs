@@ -14,6 +14,7 @@
 //! control frames: after a `file_accept`, the sender writes exactly the offered
 //! number of bytes, unframed, then resumes with a `file_done` frame.
 
+pub use crate::transfer::folder::FolderEntry;
 use serde::{Deserialize, Serialize};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -105,6 +106,21 @@ pub enum Message {
         transfer_id: String,
         name: String,
         size: u64,
+    },
+    /// Client proposes sending a folder: `files` files, `size` bytes in all.
+    /// The listing follows in `folder_entries` messages before the receiver
+    /// answers with `file_accept` / `file_decline`. Once accepted, each file
+    /// goes in listing order as its raw bytes followed by `file_done`.
+    FolderOffer {
+        transfer_id: String,
+        name: String,
+        files: u64,
+        size: u64,
+    },
+    /// Part of a folder's listing; paths are relative, separated by `/`.
+    FolderEntries {
+        transfer_id: String,
+        entries: Vec<FolderEntry>,
     },
     /// Receiver agrees; the client then sends exactly `size` raw bytes.
     FileAccept { transfer_id: String },

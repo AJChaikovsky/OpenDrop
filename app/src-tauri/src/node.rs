@@ -104,6 +104,8 @@ pub enum AppEvent {
         name: String,
         size: u64,
         fetch: Option<FetchDetails>,
+        /// Set for a folder: how many files it holds.
+        files: Option<u64>,
     },
     /// An incoming request was not answered in time or its sender gave up.
     IncomingExpired {
@@ -141,6 +143,8 @@ pub enum AppEvent {
         device_name: String,
         name: String,
         size: u64,
+        /// Set for a folder: how many files it holds.
+        files: Option<u64>,
     },
     SendProgress {
         transfer_id: String,
@@ -477,17 +481,28 @@ impl Node {
             .map(|path| {
                 let meta = std::fs::metadata(path)
                     .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-                if !meta.is_file() {
-                    return Err(format!(
-                        "{} is a folder; only files can be sent for now",
-                        file_name(path)
+                if meta.is_dir() {
+                    let listing = opendrop::transfer::folder::list_folder(path)
+                        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                    if listing.is_empty() {
+                        return Err(format!("{} is an empty folder", file_name(path)));
+                    }
+                    let size = listing.iter().map(|(_, e)| e.size).sum();
+                    return Ok((
+                        path.clone(),
+                        size,
+                        Some(listing.len() as u64),
+                        self.new_send_id(),
                     ));
                 }
-                Ok((path.clone(), meta.len(), self.new_send_id()))
+                if !meta.is_file() {
+                    return Err(format!("{} is not a file or folder", file_name(path)));
+                }
+                Ok((path.clone(), meta.len(), None, self.new_send_id()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut connection = connect(addrs, &self.identity, &self.paired).await?;
-        let ids = files.iter().map(|(_, _, id)| id.clone()).collect();
+        let ids = files.iter().map(|(_, _, _, id)| id.clone()).collect();
         let sink = self.sink.clone();
         let table = Arc::clone(&self.daemon.transfers);
         let (addrs, identity, paired) = (
@@ -497,48 +512,55 @@ impl Node {
         );
         tokio::spawn(async move {
             let mut files = files.into_iter();
-            while let Some((path, size, id)) = files.next() {
+            while let Some((path, size, count, id)) = files.next() {
                 // Cancelling (see `Node::cancel`) fires `stop`.
                 let (_, stop) = table.begin_with_id(
                     id.clone(),
-                    Transfer::new(
-                        Direction::Send,
-                        Some(connection.peer.id.clone()),
-                        connection.peer.name.clone(),
-                        file_name(&path),
-                        size,
-                    ),
+                    Transfer {
+                        files: count,
+                        ..Transfer::new(
+                            Direction::Send,
+                            Some(connection.peer.id.clone()),
+                            connection.peer.name.clone(),
+                            file_name(&path),
+                            size,
+                        )
+                    },
                 );
                 sink(AppEvent::SendWaiting {
                     transfer_id: id.clone(),
                     device_name: connection.peer.name.clone(),
                     name: file_name(&path),
                     size,
+                    files: count,
                 });
                 let mut meter = Meter::new(size);
                 let progress_sink = sink.clone();
                 let progress_id = id.clone();
                 let progress_table = Arc::clone(&table);
-                let result = connection
-                    .send_file_until(
-                        &path,
-                        &mut |sent| {
-                            progress_table.update(&progress_id, |t| {
-                                t.status = Status::Transferring;
-                                t.bytes = sent;
-                            });
-                            if let Some(bytes_per_sec) = meter.update(sent) {
-                                progress_sink(AppEvent::SendProgress {
-                                    transfer_id: progress_id.clone(),
-                                    bytes: sent,
-                                    size,
-                                    bytes_per_sec,
-                                });
-                            }
-                        },
-                        stop,
-                    )
-                    .await;
+                let mut on_progress = |sent| {
+                    progress_table.update(&progress_id, |t| {
+                        t.status = Status::Transferring;
+                        t.bytes = sent;
+                    });
+                    if let Some(bytes_per_sec) = meter.update(sent) {
+                        progress_sink(AppEvent::SendProgress {
+                            transfer_id: progress_id.clone(),
+                            bytes: sent,
+                            size,
+                            bytes_per_sec,
+                        });
+                    }
+                };
+                let result = if count.is_some() {
+                    connection
+                        .send_folder_until(&path, &mut on_progress, Some(stop))
+                        .await
+                } else {
+                    connection
+                        .send_file_until(&path, &mut on_progress, stop)
+                        .await
+                };
                 match result {
                     Ok(FileResult::Delivered(outcome)) => {
                         table.update(&id, |t| {
@@ -569,7 +591,7 @@ impl Node {
                         match connect(&addrs, &identity, &paired).await {
                             Ok(fresh) => connection = fresh,
                             Err(e) => {
-                                for (_, _, rest) in files {
+                                for (_, _, _, rest) in files {
                                     sink(AppEvent::SendFailed {
                                         transfer_id: rest,
                                         error: e.to_string(),
@@ -648,6 +670,7 @@ async fn forward_requests(
             size,
             respond,
             fetch,
+            files,
             ..
         } = request;
         let grant = fetch.as_ref().and_then(|f| f.grant.clone());
@@ -672,6 +695,7 @@ async fn forward_requests(
             verified,
             name,
             size,
+            files,
             fetch: fetch.map(|f| FetchDetails {
                 reason: f.reason,
                 via_assistant: f.via_assistant,

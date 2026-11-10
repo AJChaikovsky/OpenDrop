@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { tauriApi, type Api } from "./api";
-import { formatSize, formatSpeed, initialState, reducer, type Transfer } from "./transfers";
+import { formatSize, formatSpeed, initialState, plural, reducer, type Transfer } from "./transfers";
 import type { AuditEntry, Device, IncomingRequest, Me, PairCode } from "./types";
 import "./App.css";
 
@@ -360,7 +360,10 @@ function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: 
   return (
     <li className={`transfer ${t.status}`} aria-label={t.name}>
       <div className="transfer-line">
-        <span className="transfer-name">{t.name}</span>
+        <span className="transfer-name">
+          {t.name}
+          {t.files != null && <span className="transfer-files"> · folder, {plural(t.files, "file")}</span>}
+        </span>
         <span className="transfer-peer">{arrow}</span>
       </div>
       <progress max={100} value={t.status === "done" ? 100 : percent} />
@@ -392,6 +395,7 @@ function RequestDialog({
 }) {
   const [left, setLeft] = useState(ANSWER_SECONDS);
   const [allowFolder, setAllowFolder] = useState(false);
+  const folder = request.files != null;
   useEffect(() => {
     const timer = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(timer);
@@ -404,12 +408,17 @@ function RequestDialog({
   return (
     <div className="backdrop">
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="request-title">
-        <h2 id="request-title">{fetch ? "File request" : "Incoming file"}</h2>
+        <h2 id="request-title">{fetch ? "File request" : folder ? "Incoming folder" : "Incoming file"}</h2>
         <p>
-          <strong>{request.peer_name}</strong> ({request.peer_ip}) {fetch ? "asks for your file" : "wants to send you"}
+          <strong>{request.peer_name}</strong> ({request.peer_ip}){" "}
+          {fetch ? "asks for your file" : folder ? "wants to send you the folder" : "wants to send you"}
         </p>
         <p className="file">
-          {request.name} <span>{formatSize(request.size)}</span>
+          {request.name}{" "}
+          <span>
+            {folder ? `${plural(request.files ?? 0, "file")}, ` : ""}
+            {formatSize(request.size)}
+          </span>
         </p>
         {!request.verified && (
           <p className="unverified" role="note">

@@ -17,6 +17,8 @@ export interface Transfer {
   status: TransferStatus;
   /** Saved path (received), or the error. */
   detail?: string;
+  /** Set for a folder: how many files it holds. */
+  files?: number;
   sha256?: string;
 }
 
@@ -92,6 +94,7 @@ export function reducer(state: State, action: Action): State {
         bytes: 0,
         bytesPerSec: 0,
         status: "waiting",
+        files: action.files ?? undefined,
       });
     case "receive_progress":
     case "send_progress":
@@ -130,6 +133,10 @@ export function reducer(state: State, action: Action): State {
       };
     }
   }
+}
+
+export function plural(n: number, word: string): string {
+  return `${n.toLocaleString("en-US")} ${word}${n === 1 ? "" : "s"}`;
 }
 
 export function formatSize(bytes: number): string {

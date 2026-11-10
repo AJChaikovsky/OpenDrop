@@ -45,6 +45,8 @@ export type AppEvent =
       size: number;
       /** Set when the peer asks for one of our shared files instead. */
       fetch: FetchDetails | null;
+      /** Set for a folder: how many files it holds (`size` is the total). */
+      files?: number | null;
     }
   | { kind: "incoming_expired"; transfer_id: string }
   | { kind: "receive_started"; transfer_id: string; peer_name: string; name: string; size: number }
@@ -52,7 +54,7 @@ export type AppEvent =
   | { kind: "receive_done"; transfer_id: string; path: string; sha256: string }
   | { kind: "receive_failed"; transfer_id: string; error: string }
   | { kind: "receive_cancelled"; transfer_id: string; by_peer: boolean }
-  | { kind: "send_waiting"; transfer_id: string; device_name: string; name: string; size: number }
+  | { kind: "send_waiting"; transfer_id: string; device_name: string; name: string; size: number; files?: number | null }
   | { kind: "send_progress"; transfer_id: string; bytes: number; size: number; bytes_per_sec: number }
   | { kind: "send_done"; transfer_id: string; sha256: string }
   | { kind: "send_declined"; transfer_id: string }
