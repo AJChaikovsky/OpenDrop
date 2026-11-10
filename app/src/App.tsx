@@ -90,6 +90,15 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     api.cancelTransfer(t.id).catch(() => {});
   };
 
+  const sendClipboard = async (device: Device) => {
+    setError(null);
+    try {
+      await api.sendClipboard({ deviceId: device.id });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const pair = async (device: Device) => {
     setError(null);
     try {
@@ -141,6 +150,7 @@ export default function App({ api = tauriApi }: { api?: Api }) {
                 device={d}
                 hovered={hovered === d.id}
                 onPick={() => pickAndSend({ deviceId: d.id })}
+                onClipboard={() => sendClipboard(d)}
                 onPair={() => pair(d)}
                 onUnpair={() => unpair(d)}
               />
@@ -351,12 +361,14 @@ function DeviceCard({
   device,
   hovered,
   onPick,
+  onClipboard,
   onPair,
   onUnpair,
 }: {
   device: Device;
   hovered: boolean;
   onPick: () => void;
+  onClipboard: () => void;
   onPair: () => void;
   onUnpair: () => void;
 }) {
@@ -370,6 +382,11 @@ function DeviceCard({
         <span className="device-name">{device.name}</span>
         <span className="device-address">{device.compatible ? device.address ?? "no address" : "needs an update"}</span>
       </button>
+      {device.compatible && (
+        <button className="device-clipboard" onClick={onClipboard} title="Send the text on your clipboard">
+          Send clipboard
+        </button>
+      )}
       {device.compatible && (
         <div className="device-pairing">
           {device.paired ? (
@@ -520,6 +537,7 @@ function RequestDialog({
   const [left, setLeft] = useState(ANSWER_SECONDS);
   const [allowFolder, setAllowFolder] = useState(false);
   const folder = request.files != null;
+  const text = request.text ?? null;
   useEffect(() => {
     const timer = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(timer);
@@ -532,18 +550,32 @@ function RequestDialog({
   return (
     <div className="backdrop">
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="request-title">
-        <h2 id="request-title">{fetch ? "File request" : folder ? "Incoming folder" : "Incoming file"}</h2>
+        <h2 id="request-title">
+          {fetch ? "File request" : text !== null ? "Incoming text" : folder ? "Incoming folder" : "Incoming file"}
+        </h2>
         <p>
           <strong>{request.peer_name}</strong> ({request.peer_ip}){" "}
-          {fetch ? "asks for your file" : folder ? "wants to send you the folder" : "wants to send you"}
+          {fetch
+            ? "asks for your file"
+            : text !== null
+              ? "wants to put this text on your clipboard"
+              : folder
+                ? "wants to send you the folder"
+                : "wants to send you"}
         </p>
-        <p className="file">
-          {request.name}{" "}
-          <span>
-            {folder ? `${plural(request.files ?? 0, "file")}, ` : ""}
-            {formatSize(request.size)}
-          </span>
-        </p>
+        {text !== null ? (
+          <pre className="text-preview" aria-label="Text to receive">
+            {text.length > 2000 ? `${text.slice(0, 2000)}…` : text}
+          </pre>
+        ) : (
+          <p className="file">
+            {request.name}{" "}
+            <span>
+              {folder ? `${plural(request.files ?? 0, "file")}, ` : ""}
+              {formatSize(request.size)}
+            </span>
+          </p>
+        )}
         {!request.verified && (
           <p className="unverified" role="note">
             Unverified device: it isn't paired, so anyone could be using this name.
@@ -573,7 +605,7 @@ function RequestDialog({
         <div className="actions">
           <button onClick={() => onAnswer(request, false)}>Decline</button>
           <button className="primary" onClick={() => onAnswer(request, true, allowFolder)} autoFocus>
-            {fetch ? "Approve" : "Accept"}
+            {fetch ? "Approve" : text !== null ? "Accept and copy" : "Accept"}
           </button>
         </div>
       </div>

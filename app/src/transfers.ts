@@ -144,6 +144,18 @@ export function reducer(state: State, action: Action): State {
     }
     case "send_requested":
       return state;
+    case "text_received":
+      return add({
+        id: action.transfer_id,
+        direction: "receive",
+        name: "Clipboard text",
+        peer: action.peer_name,
+        size: new TextEncoder().encode(action.text).length,
+        bytes: new TextEncoder().encode(action.text).length,
+        bytesPerSec: 0,
+        status: "done",
+        detail: "Copied to the clipboard",
+      });
     case "set_history":
       return { ...state, history: action.entries };
     case "history_added":

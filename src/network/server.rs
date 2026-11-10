@@ -77,6 +77,9 @@ pub struct FileRequest {
     /// Set when the offer is a folder: how many files it holds (`name` is
     /// the folder's, `size` the total).
     pub files: Option<u64>,
+    /// Set when the offer is clipboard text: the text itself (`name` is
+    /// "Clipboard text", `size` its length in bytes).
+    pub text: Option<String>,
 }
 
 /// What a fetch request adds to a [`FileRequest`].
@@ -115,6 +118,12 @@ pub enum ReceiveEvent {
     /// Called off midway, by our side or (`by_peer`) the sender; nothing
     /// saved.
     Cancelled { transfer_id: String, by_peer: bool },
+    /// Clipboard text was accepted: put `text` on the clipboard.
+    Text {
+        transfer_id: String,
+        peer_name: String,
+        text: String,
+    },
 }
 
 /// Why a receive stopped early on purpose.
@@ -337,6 +346,7 @@ async fn serve_fetch(
                 respond,
                 cancel: None,
                 files: None,
+                text: None,
                 fetch: Some(FetchInfo {
                     peer_id: peer.peer.id.clone(),
                     reason: request.reason.clone(),
@@ -523,7 +533,23 @@ async fn handle_connection(
 
     loop {
         match next_message(stream).await {
-            Ok(Message::Text { body }) => {
+            Ok(Message::Text {
+                body,
+                transfer_id: Some(transfer_id),
+            }) => {
+                receive_text(
+                    stream,
+                    approval,
+                    events,
+                    &peer,
+                    &options.audit,
+                    peer_addr,
+                    transfer_id,
+                    body,
+                )
+                .await?;
+            }
+            Ok(Message::Text { body, .. }) => {
                 println!("[{peer_addr}] {peer_name}: {body}");
                 write_message(
                     stream,
@@ -732,6 +758,81 @@ async fn handle_connection(
 
 /// Take one offered file: ask the user, stream it into a temp file, check the
 /// hash, then move it into `download_dir`.
+/// The name clipboard text goes by in requests, transfer lists and history.
+pub const CLIPBOARD_NAME: &str = "Clipboard text";
+
+/// Ask whether to take clipboard text, and answer the sender: `TextAck` on
+/// a yes (after reporting [`ReceiveEvent::Text`]), `FileDecline` on a no.
+#[allow(clippy::too_many_arguments)]
+async fn receive_text(
+    stream: &mut Secure<'_>,
+    approval: &Approval,
+    events: Option<&ReceiveEvents>,
+    peer: &handshake::Handshake,
+    audit: &AuditLog,
+    peer_addr: SocketAddr,
+    transfer_id: String,
+    text: String,
+) -> Result<(), BoxError> {
+    let peer_name = peer.peer.name.as_str();
+    let size = text.len() as u64;
+    let accepted = match approval {
+        Approval::AcceptAll => true,
+        Approval::Ask(requests) => {
+            let (respond, decision) = oneshot::channel();
+            let request = FileRequest {
+                transfer_id: transfer_id.clone(),
+                peer_name: peer_name.to_owned(),
+                peer_addr,
+                verified: peer.paired,
+                name: CLIPBOARD_NAME.to_owned(),
+                size,
+                respond,
+                fetch: None,
+                cancel: None,
+                files: None,
+                text: Some(text.clone()),
+            };
+            requests.send(request).await.is_ok()
+                && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)))
+        }
+    };
+    audit.record(
+        Entry::new(
+            if accepted {
+                Event::Approve
+            } else {
+                Event::Decline
+            },
+            Some(&peer.peer.id),
+            peer_name,
+        )
+        .file(CLIPBOARD_NAME)
+        .detail("clipboard text"),
+    );
+    if !accepted {
+        println!("[{peer_addr}] declined clipboard text from {peer_name}");
+        write_message(stream, &Message::FileDecline { transfer_id }).await?;
+        return Ok(());
+    }
+    println!("[{peer_addr}] clipboard text from {peer_name} ({size} bytes)");
+    if let Some(events) = events {
+        let _ = events.send(ReceiveEvent::Text {
+            transfer_id,
+            peer_name: peer_name.to_owned(),
+            text,
+        });
+    }
+    write_message(
+        stream,
+        &Message::TextAck {
+            received_bytes: size as usize,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_file(
     stream: &mut Secure<'_>,
@@ -785,6 +886,7 @@ async fn receive_file(
                 fetch: None,
                 cancel,
                 files: folder.as_ref().map(|f| f.len() as u64),
+                text: None,
             };
             let accepted = requests.send(request).await.is_ok()
                 && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)));

@@ -129,3 +129,16 @@ input, button { font: inherit; }
   background: var(--accent-soft);
   overflow-wrap: anywhere;
 }
+
+.device-clipboard { margin: 6px 12px 0; font-size: 12px; }
+.text-preview {
+  max-height: 180px;
+  overflow: auto;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}

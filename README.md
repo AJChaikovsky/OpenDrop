@@ -159,6 +159,11 @@ window comes up and asks which device to send them to. On Windows this adds entr
 `HKCU\Software\Classes` (no admin needed). On macOS it adds
 `~/Library/Services/Send with OpenDrop.workflow`. *Remove from the menu* takes them away.
 
+**Send clipboard** on a device card offers the text on your clipboard. The other device
+shows the text and asks first; *Accept and copy* puts it on that device's clipboard.
+Clipboard text has to fit in one protocol message (about 64 KB). Anything longer is
+refused with a message saying to send it as a file.
+
 When you approve a fetch you can also let that device fetch from the same folder (and its
 subfolders) for 10 minutes without asking: answer `a` in the terminal, or tick the box in the
 app. Grants are kept in memory only, per device and folder; asking each time stays the default.
@@ -322,11 +327,11 @@ Keys, nonces and signatures travel as lowercase hex.
 | `pair_nonce` | server reply | `nonce` |
 | `pair_reveal` | client | `nonce` (the committed one) |
 | `pair_accept` / `pair_decline` | each side, exactly once | `pair_decline` has `timed_out` |
-| `text` | client to server | `body` |
-| `text_ack` | server reply to `text` | `received_bytes` |
+| `text` | client to server | `body`; with `transfer_id` it is clipboard text the receiver must approve |
+| `text_ack` | server reply to `text` (for clipboard text: accepted) | `received_bytes` |
 | `file_offer` | client to server | `transfer_id`, `name` (bare file name), `size` |
 | `file_accept` | server reply to `file_offer` | `transfer_id` |
-| `file_decline` | server reply to `file_offer`; connection stays open | `transfer_id` |
+| `file_decline` | server reply to `file_offer` or clipboard `text`; connection stays open | `transfer_id` |
 | `file_done` | client, after the raw bytes | `transfer_id`, `sha256` (lowercase hex) |
 | `file_received` | server, once verified and saved | `transfer_id`, `received_bytes` |
 | `share_list_request` | requester to owner (paired only) | `query` (optional, matches paths ignoring case) |

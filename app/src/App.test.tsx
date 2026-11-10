@@ -26,6 +26,7 @@ function fakeApi(devices: Device[] = [pc], history: HistoryEntry[] = []) {
     respondPair: vi.fn(async () => true),
     unpairDevice: vi.fn(async () => true),
     pickFiles: vi.fn(async () => ["/tmp/photo.jpg"]),
+    sendClipboard: vi.fn(async () => "send-clip"),
     audit: vi.fn(async (): Promise<AuditEntry[]> => [
       { at_ms: 1_762_000_000_000, event: "approve", peer_name: "AJ-PC", file: "q3.pdf", detail: "approved", via_assistant: true },
       { at_ms: 1_761_999_990_000, event: "request", peer_name: "AJ-PC", file: "q3.pdf", detail: "for the deck", via_assistant: true },
@@ -43,6 +44,45 @@ function fakeApi(devices: Device[] = [pc], history: HistoryEntry[] = []) {
 }
 
 describe("App", () => {
+  it("sends the clipboard to a device and shows incoming text before accepting", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await userEvent.click(within(await screen.findByLabelText("AJ-PC")).getByRole("button", { name: "Send clipboard" }));
+    expect(api.sendClipboard).toHaveBeenCalledWith({ deviceId: "device-pc" });
+    expect(api.pickFiles).not.toHaveBeenCalled();
+
+    const text = "Wi-Fi: correct horse battery staple\nline two";
+    emit({
+      kind: "incoming_request",
+      transfer_id: "in-clip",
+      peer_name: "AJ-PC",
+      peer_ip: "192.168.1.30",
+      verified: true,
+      name: "Clipboard text",
+      size: text.length,
+      fetch: null,
+      files: null,
+      text,
+    });
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Incoming text")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Text to receive").textContent).toBe(text);
+    await userEvent.click(within(dialog).getByRole("button", { name: "Accept and copy" }));
+    expect(api.respond).toHaveBeenCalledWith("in-clip", true, false);
+
+    emit({ kind: "text_received", transfer_id: "in-clip", peer_name: "AJ-PC", text });
+    const row = screen.getByText("Clipboard text").closest("li")!;
+    expect(row).toHaveTextContent("Copied to the clipboard");
+  });
+
+  it("shows why the clipboard couldn't be sent", async () => {
+    const { api } = fakeApi();
+    api.sendClipboard.mockRejectedValueOnce("the text is too long to send (100 KB)");
+    render(<App api={api} />);
+    await userEvent.click(within(await screen.findByLabelText("AJ-PC")).getByRole("button", { name: "Send clipboard" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("the text is too long to send (100 KB)");
+  });
+
   it("asks for a device for files from the right-click menu, then sends them", async () => {
     const { api, emit } = fakeApi();
     render(<App api={api} />);

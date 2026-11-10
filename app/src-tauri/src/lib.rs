@@ -80,6 +80,31 @@ async fn send_files(
     result.map_err(|e| e.to_string())
 }
 
+/// Offer this computer's clipboard text to a device (by id, or by address
+/// when it isn't discovered). Returns the transfer id.
+#[tauri::command]
+async fn send_clipboard<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    node: State<'_, Arc<Node>>,
+    device_id: Option<String>,
+    address: Option<String>,
+) -> Result<String, String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let text = app
+        .clipboard()
+        .read_text()
+        .map_err(|_| "the clipboard has no text".to_owned())?;
+    let result = match (device_id, address) {
+        (Some(id), _) => node.send_text_to_device(&id, &text).await,
+        (None, Some(address)) => {
+            let addr = parse_address(&address)?;
+            node.send_text_to_addrs(&[addr], &text).await
+        }
+        (None, None) => return Err("no device given".into()),
+    };
+    result.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn respond(
     node: State<'_, Arc<Node>>,
@@ -193,6 +218,7 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         history,
         show_in_folder,
         take_send_paths,
+        send_clipboard,
         context_menu_status,
         set_context_menu
     ])
@@ -211,6 +237,7 @@ pub fn run() {
         ))
         .manage(SendQueue::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             background::setup(app)?;
@@ -221,6 +248,12 @@ pub fn run() {
             let handle = app.handle().clone();
             let sink: EventSink = Arc::new(move |event: AppEvent| {
                 background::on_event(&handle, &event);
+                if let AppEvent::TextReceived { text, .. } = &event {
+                    use tauri_plugin_clipboard_manager::ClipboardExt;
+                    if let Err(e) = handle.clipboard().write_text(text.clone()) {
+                        eprintln!("cannot write the clipboard: {e}");
+                    }
+                }
                 let _ = handle.emit(EVENT, event);
             });
             // OPENDROP_NAME, OPENDROP_DIR and OPENDROP_CONFIG_DIR let two

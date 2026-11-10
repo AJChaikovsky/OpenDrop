@@ -7,7 +7,8 @@ use crate::pairing::store::PairedDevices;
 use crate::pairing::{self, PairOutcome, PairPrompts};
 use crate::protocol::FolderEntry;
 use crate::protocol::{
-    ErrorCode, FetchDeclineReason, Message, ProtocolError, SharedFile, read_message, write_message,
+    ErrorCode, FetchDeclineReason, MAX_FRAME_LEN, Message, ProtocolError, SharedFile, read_message,
+    write_message,
 };
 use crate::transfer::folder::{check_listing, folder_name, list_folder, tree_hash};
 use crate::transfer::{copy_hashed, sanitize_file_name};
@@ -114,11 +115,38 @@ impl Connection {
             &mut self.stream,
             &Message::Text {
                 body: body.to_owned(),
+                transfer_id: None,
             },
         )
         .await?;
         match recv(&mut self.stream).await? {
             Message::TextAck { received_bytes } => Ok(received_bytes),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Offer `text` for the receiver's clipboard and wait for their answer:
+    /// `true` if they accepted it. Text that doesn't fit in one message
+    /// (about 64 KB) is refused here with [`text_too_long`]'s error.
+    pub async fn send_clipboard(
+        &mut self,
+        transfer_id: &str,
+        text: &str,
+    ) -> Result<bool, BoxError> {
+        let message = Message::Text {
+            body: text.to_owned(),
+            transfer_id: Some(transfer_id.to_owned()),
+        };
+        let encoded = crate::protocol::encode(&message)
+            .map(|f| f.len())
+            .unwrap_or(usize::MAX);
+        if encoded > MAX_FRAME_LEN as usize {
+            return Err(text_too_long(text.len()).into());
+        }
+        write_message(&mut self.stream, &message).await?;
+        match recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT).await? {
+            Message::TextAck { .. } => Ok(true),
+            Message::FileDecline { .. } => Ok(false),
             other => Err(unexpected(other)),
         }
     }
@@ -555,4 +583,14 @@ fn new_transfer_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("transfer-{:012x}", nanos & 0xffff_ffff_ffff)
+}
+
+/// The error for clipboard text too long to send in one message.
+pub fn text_too_long(bytes: usize) -> String {
+    format!(
+        "the text is too long to send ({} KB); clipboard text can be at most about {} KB, \
+         so send it as a file instead",
+        bytes.div_ceil(1000),
+        MAX_FRAME_LEN / 1000 - 1
+    )
 }

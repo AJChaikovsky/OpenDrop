@@ -97,8 +97,14 @@ pub enum Message {
         #[serde(default)]
         timed_out: bool,
     },
-    /// A plain text message (Task 1 milestone; later reused for clipboard sharing).
-    Text { body: String },
+    /// A plain text message. With `transfer_id` it is clipboard text that
+    /// the receiver must approve: a `TextAck` means it was accepted (and put
+    /// on their clipboard), a `FileDecline` that it wasn't.
+    Text {
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transfer_id: Option<String>,
+    },
     /// Acknowledges a `Text` message.
     TextAck { received_bytes: usize },
     /// Client proposes sending a file. `name` is a bare file name, never a path.
@@ -444,6 +450,11 @@ mod tests {
             Message::PairAccept,
             Message::Text {
                 body: "héllo 👋".into(),
+                transfer_id: None,
+            },
+            Message::Text {
+                body: "from the clipboard".into(),
+                transfer_id: Some("clip-1".into()),
             },
             Message::TextAck { received_bytes: 11 },
             Message::FileOffer {
@@ -565,7 +576,11 @@ mod tests {
 
     #[test]
     fn wire_format_is_versioned_snake_case_json() {
-        let frame = encode(&Message::Text { body: "hi".into() }).unwrap();
+        let frame = encode(&Message::Text {
+            body: "hi".into(),
+            transfer_id: None,
+        })
+        .unwrap();
         let len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
         assert_eq!(len, frame.len() - 4);
         let json: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
@@ -590,6 +605,7 @@ mod tests {
     async fn handles_frames_split_across_reads() {
         let frame = encode(&Message::Text {
             body: "split".into(),
+            transfer_id: None,
         })
         .unwrap();
         let (mut a, mut b) = tokio::io::duplex(1024);
@@ -602,7 +618,8 @@ mod tests {
         assert_eq!(
             read_message(&mut b).await.unwrap(),
             Message::Text {
-                body: "split".into()
+                body: "split".into(),
+                transfer_id: None,
             }
         );
     }

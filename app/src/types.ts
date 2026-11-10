@@ -47,6 +47,8 @@ export type AppEvent =
       fetch: FetchDetails | null;
       /** Set for a folder: how many files it holds (`size` is the total). */
       files?: number | null;
+      /** Set for clipboard text: the text itself. */
+      text?: string | null;
     }
   | { kind: "incoming_expired"; transfer_id: string }
   | { kind: "receive_started"; transfer_id: string; peer_name: string; name: string; size: number }
@@ -65,7 +67,9 @@ export type AppEvent =
   | { kind: "pair_done"; device_id: string; device_name: string; status: PairStatus; error: string | null }
   | { kind: "history_added"; entry: HistoryEntry }
   /** "Send with OpenDrop" was picked; fetch the files with `takeSendPaths`. */
-  | { kind: "send_requested" };
+  | { kind: "send_requested" }
+  /** Clipboard text we accepted; it is already on the clipboard. */
+  | { kind: "text_received"; transfer_id: string; peer_name: string; text: string };
 
 /** One finished transfer (see `history::Entry` in src-tauri). */
 export interface HistoryEntry {

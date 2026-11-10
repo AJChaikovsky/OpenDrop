@@ -694,6 +694,7 @@ async fn record_requests(
                 fetch,
                 cancel,
                 files,
+                text,
             } = request;
             let accept = match approval {
                 // Auto-accept takes files in; sending one away always needs
@@ -712,6 +713,7 @@ async fn record_requests(
                         fetch,
                         cancel: None,
                         files,
+                        text,
                     };
                     if ask.send(forwarded).await.is_err() {
                         false
@@ -813,6 +815,10 @@ async fn record_receive_events(
                 Status::Cancelled,
                 by_peer.then(|| "the sender cancelled it".to_owned()),
             ),
+            ReceiveEvent::Text { transfer_id, .. } => transfers.update(&row(transfer_id), |t| {
+                t.bytes = t.size;
+                t.status = Status::Done;
+            }),
         }
         if let Some(forward) = &forward {
             let _ = forward.send(event);

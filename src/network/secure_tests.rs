@@ -249,9 +249,15 @@ async fn plaintext_after_the_handshake_is_refused() {
     )
     .await
     .unwrap();
-    write_message(&mut stream, &Message::Text { body: "hi".into() })
-        .await
-        .unwrap();
+    write_message(
+        &mut stream,
+        &Message::Text {
+            body: "hi".into(),
+            transfer_id: None,
+        },
+    )
+    .await
+    .unwrap();
     // The server can't open it, so it hangs up without answering.
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(

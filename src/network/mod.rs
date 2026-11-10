@@ -34,6 +34,8 @@ pub struct PeerIdentity {
 }
 
 #[cfg(test)]
+mod clipboard_tests;
+#[cfg(test)]
 mod fetch_tests;
 #[cfg(test)]
 mod folder_tests;
@@ -439,6 +441,7 @@ mod tests {
             &mut stream,
             &Message::Text {
                 body: "skip hello".into(),
+                transfer_id: None,
             },
         )
         .await
