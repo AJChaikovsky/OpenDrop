@@ -16,7 +16,7 @@
 use opendrop::DEFAULT_PORT;
 use opendrop::control::{Client, Request, Response};
 use opendrop::daemon::{self, Daemon, Direction, Status};
-use opendrop::discovery::{Discovery, Peer, PeerEvent, same_name};
+use opendrop::discovery::{Discovery, Peer, PeerEvent, netif, same_name};
 use opendrop::identity::default_config_dir;
 use opendrop::network::client::{Connection, FileResult};
 use opendrop::network::server::{Approval, FileRequest};
@@ -211,9 +211,17 @@ async fn listen(
         "\"{}\" ({}) listening on port {port}",
         daemon.identity.name, daemon.identity.id
     );
-    match local_ip() {
+    let local = netif::local_addrs();
+    match netif::best_lan_ip(&local).or_else(route_ip) {
         Some(ip) => println!("Other devices can reach this one at {ip}:{port}"),
         None => println!("Could not detect this device's LAN IP; check your network settings"),
+    }
+    let skipped = opendrop::discovery::virtual_interfaces();
+    if !skipped.is_empty() {
+        println!(
+            "Not advertising virtual adapters others can't reach: {}",
+            skipped.join(", ")
+        );
     }
     println!(
         "Received files are saved to {}",
@@ -897,10 +905,15 @@ async fn find_peer(
 }
 
 fn describe(peer: &Peer, paired: &PairedDevices) -> String {
-    let addr = peer
-        .socket_addr()
+    let addrs = peer.socket_addrs();
+    let addr = addrs
+        .first()
         .map_or_else(|| format!("?:{}", peer.port), |a| a.to_string());
     let mut line = format!("\"{}\" ({}) at {addr}", peer.name, peer.id);
+    if addrs.len() > 1 {
+        let others: Vec<String> = addrs[1..].iter().map(|a| a.ip().to_string()).collect();
+        line.push_str(&format!(" (also {})", others.join(", ")));
+    }
     if peer.protocol_version != opendrop::protocol::PROTOCOL_VERSION {
         line.push_str(&format!(
             " [protocol v{}, incompatible]",
@@ -1037,9 +1050,10 @@ fn default_device_name() -> String {
         .unwrap_or_else(|| "OpenDrop device".to_owned())
 }
 
-/// The LAN address the OS would use for outbound traffic. Connecting a UDP
-/// socket only picks a route; no packets are sent.
-fn local_ip() -> Option<IpAddr> {
+/// The address the OS would use for outbound traffic, for when no adapter
+/// looks like a LAN one. Connecting a UDP socket only picks a route; no
+/// packets are sent.
+fn route_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("192.168.0.1:9").ok()?;
     socket

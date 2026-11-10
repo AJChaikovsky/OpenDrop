@@ -13,9 +13,11 @@
 //! peers it has resolved, dropping them when their advertisement goes away.
 //! Our own advertisement is ignored.
 
+pub mod netif;
+
 use crate::network::{BoxError, DeviceIdentity};
 use crate::protocol::PROTOCOL_VERSION;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -49,21 +51,17 @@ impl Peer {
         self.socket_addrs().into_iter().next()
     }
 
-    /// Every advertised address, best first. IPv4 comes first because the
-    /// listener is IPv4-only for now (and IPv6 link-local addresses would
-    /// need an interface scope we don't track); within a family, LAN
-    /// addresses beat link-local and loopback.
+    /// Every advertised address, best first: LAN IPv4 before the rest
+    /// (the listener is IPv4-only, and IPv6 link-local addresses would need
+    /// an interface scope we don't track), and among those the ones on a
+    /// network we're on (so a PC's Wi-Fi address beats its WSL adapter's).
     pub fn socket_addrs(&self) -> Vec<SocketAddr> {
-        let rank = |ip: &IpAddr| match ip {
-            IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() => 0,
-            IpAddr::V4(v4) if v4.is_link_local() => 1,
-            IpAddr::V4(_) => 2,
-            IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unicast_link_local() => 3,
-            IpAddr::V6(_) => 4,
-        };
-        let mut addresses = self.addresses.clone();
-        addresses.sort_by_key(rank);
-        addresses
+        self.socket_addrs_from(&netif::local_addrs())
+    }
+
+    /// [`Peer::socket_addrs`], judged against the given local addresses.
+    pub fn socket_addrs_from(&self, local: &[netif::LocalAddr]) -> Vec<SocketAddr> {
+        netif::rank_peer(self.addresses.clone(), local)
             .into_iter()
             .map(|ip| SocketAddr::new(ip, self.port))
             .collect()
@@ -199,6 +197,14 @@ impl Discovery {
 
         let advertised = match advertise_port {
             Some(port) => {
+                // Keep virtual adapters (WSL, Hyper-V, Docker, VPNs) out of
+                // our records: nobody else on the LAN can reach them.
+                let skipped = virtual_interfaces();
+                if !skipped.is_empty() {
+                    daemon.disable_interface(
+                        skipped.into_iter().map(IfKind::Name).collect::<Vec<_>>(),
+                    )?;
+                }
                 let info = service_info(identity, port)?;
                 let fullname = info.get_fullname().to_owned();
                 daemon.register(info)?;
@@ -297,6 +303,19 @@ impl Drop for Discovery {
         }
         let _ = self.daemon.shutdown();
     }
+}
+
+/// Names of this device's interfaces that look virtual (see
+/// [`netif::is_virtual`]), each once.
+pub fn virtual_interfaces() -> Vec<String> {
+    let mut names: Vec<String> = netif::local_addrs()
+        .into_iter()
+        .filter(netif::LocalAddr::is_virtual)
+        .map(|a| a.name)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn service_info(identity: &DeviceIdentity, port: u16) -> Result<ServiceInfo, BoxError> {
@@ -430,7 +449,7 @@ mod tests {
             addresses: ips.iter().map(|ip| ip.parse().unwrap()).collect(),
             ..peer("device-a", "Laptop")
         };
-        let addr = |p: Peer| p.socket_addr().map(|a| a.ip().to_string());
+        let addr = |p: Peer| p.socket_addrs_from(&[]).first().map(|a| a.ip().to_string());
         assert_eq!(
             addr(with(&["127.0.0.1", "fe80::1", "192.168.1.20"])),
             Some("192.168.1.20".into())
@@ -443,7 +462,7 @@ mod tests {
         assert_eq!(addr(with(&["127.0.0.1"])), Some("127.0.0.1".into()));
         assert_eq!(addr(with(&[])), None);
         let ranked: Vec<String> = with(&["::1", "127.0.0.1", "fe80::1", "10.0.0.2"])
-            .socket_addrs()
+            .socket_addrs_from(&[])
             .iter()
             .map(|a| a.ip().to_string())
             .collect();
