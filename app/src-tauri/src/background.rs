@@ -23,8 +23,15 @@ pub fn notice(event: &AppEvent) -> Option<(String, String)> {
             name,
             fetch,
             files,
+            text,
             ..
         } => Some(match (fetch, files) {
+            // The text itself stays out of the notification (it may be a
+            // password); the window shows it.
+            _ if text.is_some() => (
+                format!("{peer_name} wants to send you text"),
+                "Open OpenDrop to see it and accept or decline.".to_owned(),
+            ),
             (Some(_), _) => (
                 format!("{peer_name} asks for a file"),
                 format!("{name}: open OpenDrop to answer."),
@@ -136,6 +143,7 @@ mod tests {
             size: 10,
             fetch,
             files,
+            text: None,
         }
     }
 
@@ -179,6 +187,20 @@ mod tests {
             ))
         );
         assert_eq!(notice(&code(false)), None);
+        let text = AppEvent::IncomingRequest {
+            transfer_id: "t".into(),
+            peer_name: "Windows".into(),
+            peer_ip: "192.168.1.177".into(),
+            verified: true,
+            name: "Clipboard text".into(),
+            size: 6,
+            fetch: None,
+            files: None,
+            text: Some("secret".into()),
+        };
+        let (title, body) = notice(&text).unwrap();
+        assert_eq!(title, "Windows wants to send you text");
+        assert!(!body.contains("secret"));
         assert_eq!(
             notice(&AppEvent::SendDone {
                 transfer_id: "t".into(),

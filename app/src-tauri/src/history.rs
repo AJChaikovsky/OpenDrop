@@ -135,6 +135,12 @@ impl History {
             AppEvent::ReceiveDone {
                 transfer_id, path, ..
             } => (transfer_id, Outcome::Done, Some(path.clone()), None),
+            AppEvent::TextReceived { transfer_id, .. } => (
+                transfer_id,
+                Outcome::Done,
+                None,
+                Some("copied to the clipboard".to_owned()),
+            ),
             AppEvent::ReceiveFailed { transfer_id, error } => {
                 (transfer_id, Outcome::Failed, None, Some(error.clone()))
             }

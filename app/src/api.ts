@@ -26,6 +26,9 @@ export interface Api {
   respondPair(pairId: string, accept: boolean): Promise<boolean>;
   unpairDevice(deviceId: string): Promise<boolean>;
   pickFiles(): Promise<string[]>;
+  /** Offer this computer's clipboard text to a device; returns the
+   * transfer id (its `send_*` events follow). */
+  sendClipboard(target: { deviceId?: string; address?: string }): Promise<string>;
   /** The audit log, newest first. */
   audit(): Promise<AuditEntry[]>;
   /** Finished transfers, newest first, kept across restarts. */
@@ -47,6 +50,8 @@ export const tauriApi: Api = {
   devices: () => invoke("devices"),
   sendFiles: (target, paths) =>
     invoke("send_files", { deviceId: target.deviceId ?? null, address: target.address ?? null, paths }),
+  sendClipboard: (target) =>
+    invoke("send_clipboard", { deviceId: target.deviceId ?? null, address: target.address ?? null }),
   respond: (transferId, accept, allowFolder) =>
     invoke("respond", { transferId, accept, allowFolder: allowFolder ?? false }),
   cancelTransfer: (transferId) => invoke("cancel_transfer", { transferId }),

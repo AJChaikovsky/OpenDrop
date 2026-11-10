@@ -981,8 +981,14 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
             let (question, limit, mut respond, grant) = tokio::select! {
-                Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, files: count, .. }) = files.recv() => (
+                Some(FileRequest { peer_name, peer_addr, verified, name, size, respond, fetch, files: count, text, .. }) = files.recv() => (
                     format!("{}{}", if verified { "" } else { "[unverified device] " }, match &fetch {
+                        None if text.is_some() => format!(
+                            "\"{peer_name}\" ({}) wants to send you text ({}):\n  {}\n  Accept?",
+                            peer_addr.ip(),
+                            human_size(size),
+                            preview(text.as_deref().unwrap_or_default()),
+                        ),
                         None if count.is_some() => format!(
                             "\"{peer_name}\" ({}) wants to send you the folder \"{name}\" ({} files, {}).\n  Accept?",
                             peer_addr.ip(),
@@ -1080,6 +1086,20 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
 }
 
 /// `~/Downloads/OpenDrop`, or `./OpenDrop` if there's no home folder.
+/// The start of some received text, on one line, for a prompt.
+fn preview(text: &str) -> String {
+    let line: String = text
+        .chars()
+        .take(200)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if text.chars().count() > 200 {
+        format!("{line}…")
+    } else {
+        line
+    }
+}
+
 fn default_download_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE")) // Windows

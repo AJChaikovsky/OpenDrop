@@ -107,6 +107,8 @@ pub enum AppEvent {
         fetch: Option<FetchDetails>,
         /// Set for a folder: how many files it holds.
         files: Option<u64>,
+        /// Set for clipboard text: the text (`name` is "Clipboard text").
+        text: Option<String>,
     },
     /// An incoming request was not answered in time or its sender gave up.
     IncomingExpired {
@@ -189,6 +191,12 @@ pub enum AppEvent {
         device_name: String,
         status: PairStatus,
         error: Option<String>,
+    },
+    /// Clipboard text we accepted: the shell puts it on the clipboard.
+    TextReceived {
+        transfer_id: String,
+        peer_name: String,
+        text: String,
     },
     /// "Send with OpenDrop" was picked in the file browser: the window
     /// should ask for a device (it fetches the paths with
@@ -496,6 +504,88 @@ impl Node {
         });
     }
 
+    /// Offer `text` for the clipboard of the discovered device `device_id`.
+    /// Like a file, it shows as `Send*` events under the returned id.
+    pub async fn send_text_to_device(
+        &self,
+        device_id: &str,
+        text: &str,
+    ) -> Result<String, BoxError> {
+        let addrs = self.addrs_of(device_id)?;
+        self.send_text_to_addrs(&addrs, text).await
+    }
+
+    /// Like [`Node::send_text_to_device`], to the first of `addrs` that
+    /// answers. Empty text and text too long for one message are refused
+    /// before connecting.
+    pub async fn send_text_to_addrs(
+        &self,
+        addrs: &[SocketAddr],
+        text: &str,
+    ) -> Result<String, BoxError> {
+        if text.is_empty() {
+            return Err("the clipboard has no text".into());
+        }
+        let probe = opendrop::protocol::Message::Text {
+            body: text.to_owned(),
+            transfer_id: Some("send-0000000000".into()),
+        };
+        if opendrop::protocol::encode(&probe).is_err() {
+            return Err(opendrop::network::client::text_too_long(text.len()).into());
+        }
+        let mut connection = connect(addrs, &self.identity, &self.paired).await?;
+        let id = self.new_send_id();
+        let size = text.len() as u64;
+        let name = opendrop::network::server::CLIPBOARD_NAME.to_owned();
+        self.daemon.transfers.begin_with_id(
+            id.clone(),
+            Transfer::new(
+                Direction::Send,
+                Some(connection.peer.id.clone()),
+                connection.peer.name.clone(),
+                name.clone(),
+                size,
+            ),
+        );
+        (self.sink)(AppEvent::SendWaiting {
+            transfer_id: id.clone(),
+            device_name: connection.peer.name.clone(),
+            name,
+            size,
+            files: None,
+        });
+        let (sink, table, text, transfer_id) = (
+            self.sink.clone(),
+            Arc::clone(&self.daemon.transfers),
+            text.to_owned(),
+            id.clone(),
+        );
+        tokio::spawn(async move {
+            let event = match connection.send_clipboard(&transfer_id, &text).await {
+                Ok(true) => {
+                    table.finish(&transfer_id, Status::Done, None);
+                    AppEvent::SendDone {
+                        transfer_id,
+                        sha256: opendrop::transfer::sha256_hex(text.as_bytes()),
+                    }
+                }
+                Ok(false) => {
+                    table.finish(&transfer_id, Status::Declined, None);
+                    AppEvent::SendDeclined { transfer_id }
+                }
+                Err(e) => {
+                    table.finish(&transfer_id, Status::Failed, Some(e.to_string()));
+                    AppEvent::SendFailed {
+                        transfer_id,
+                        error: e.to_string(),
+                    }
+                }
+            };
+            sink(event);
+        });
+        Ok(id)
+    }
+
     /// Like [`Node::send_to_device`], to the first of `addrs` that answers.
     pub async fn send_to_addrs(
         &self,
@@ -697,6 +787,7 @@ async fn forward_requests(
             respond,
             fetch,
             files,
+            text,
             ..
         } = request;
         let grant = fetch.as_ref().and_then(|f| f.grant.clone());
@@ -722,6 +813,7 @@ async fn forward_requests(
             name,
             size,
             files,
+            text,
             fetch: fetch.map(|f| FetchDetails {
                 reason: f.reason,
                 via_assistant: f.via_assistant,
@@ -859,6 +951,15 @@ async fn forward_receive_events(
                 meters.remove(&transfer_id);
                 sink(AppEvent::ReceiveFailed { transfer_id, error });
             }
+            ReceiveEvent::Text {
+                transfer_id,
+                peer_name,
+                text,
+            } => sink(AppEvent::TextReceived {
+                transfer_id,
+                peer_name,
+                text,
+            }),
             ReceiveEvent::Cancelled {
                 transfer_id,
                 by_peer,
@@ -1521,5 +1622,117 @@ mod tests {
         let (win, _) = node_with_config("Windows", win_root.path()).await;
         assert_eq!((mac.history.entries(100), win.history.entries(100)), before);
         assert_eq!(mac.history.entries(100).len(), 4);
+    }
+
+    /// Acceptance (#38): text copied on one side arrives exactly, as a
+    /// `TextReceived` (which the shell puts on the clipboard) well within
+    /// 2 s of the yes; a no reaches the sender; text over the frame limit is
+    /// refused before anyone is asked.
+    #[tokio::test]
+    async fn clipboard_text_arrives_exactly_after_approval() {
+        let mac_root = tempfile::tempdir().unwrap();
+        let win_root = tempfile::tempdir().unwrap();
+        let (mac, mut mac_events) = node_with_config("Mac", mac_root.path()).await;
+        let (win, mut win_events) = node_with_config("Windows", win_root.path()).await;
+        let text = "OpenDrop clipboard test ✓ 2026-11-10\n\t\"quoted\" and 🐎";
+
+        let id = mac.send_text_to_addrs(&addr(&win), text).await.unwrap();
+        let asked = until(&mut win_events, |e| {
+            matches!(e, AppEvent::IncomingRequest { .. })
+        })
+        .await;
+        let Some(AppEvent::IncomingRequest {
+            transfer_id,
+            name,
+            size,
+            text: offered,
+            ..
+        }) = asked.last()
+        else {
+            unreachable!()
+        };
+        assert_eq!(name, "Clipboard text");
+        assert_eq!(*size, text.len() as u64);
+        assert_eq!(offered.as_deref(), Some(text));
+        let approved = Instant::now();
+        assert!(win.respond(transfer_id, true, false));
+        let got = until(&mut win_events, |e| {
+            matches!(e, AppEvent::TextReceived { .. })
+        })
+        .await;
+        let elapsed = approved.elapsed();
+        let Some(AppEvent::TextReceived {
+            text: received,
+            peer_name,
+            ..
+        }) = got.last()
+        else {
+            unreachable!()
+        };
+        println!("clipboard text arrived {elapsed:?} after approval");
+        assert_eq!(received, text);
+        assert_eq!(peer_name, "Mac");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        let done = until(&mut mac_events, |e| {
+            matches!(
+                e,
+                AppEvent::SendDone { .. }
+                    | AppEvent::SendDeclined { .. }
+                    | AppEvent::SendFailed { .. }
+            )
+        })
+        .await;
+        assert!(
+            matches!(done.last(), Some(AppEvent::SendDone { transfer_id, .. }) if *transfer_id == id),
+            "{done:?}"
+        );
+
+        // A no.
+        mac.send_text_to_addrs(&addr(&win), "not this")
+            .await
+            .unwrap();
+        let asked = until(&mut win_events, |e| {
+            matches!(e, AppEvent::IncomingRequest { .. })
+        })
+        .await;
+        let Some(AppEvent::IncomingRequest { transfer_id, .. }) = asked.last() else {
+            unreachable!()
+        };
+        assert!(win.respond(transfer_id, false, false));
+        until(&mut mac_events, |e| {
+            matches!(e, AppEvent::SendDeclined { .. })
+        })
+        .await;
+
+        // Too long: refused with a clear error, nobody asked.
+        let err = mac
+            .send_text_to_addrs(&addr(&win), &"z".repeat(100_000))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("the text is too long to send (100 KB)"),
+            "{err}"
+        );
+        assert!(mac.send_text_to_addrs(&addr(&win), "").await.is_err());
+
+        // Both histories show the two texts.
+        let results = |node: &Node| {
+            node.history
+                .entries(10)
+                .iter()
+                .map(|e| (e.name.clone(), e.result))
+                .collect::<Vec<_>>()
+        };
+        use history::Outcome::{Declined, Done};
+        let expected = vec![
+            ("Clipboard text".to_owned(), Declined),
+            ("Clipboard text".to_owned(), Done),
+        ];
+        assert_eq!(results(&mac), expected);
+        assert_eq!(results(&win), expected);
+        assert!(
+            std::fs::read_dir(win_root.path().join("dl")).map_or(true, |mut d| d.next().is_none())
+        );
     }
 }
