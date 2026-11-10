@@ -41,3 +41,8 @@ tokio = { version = "1.54.1", features = ["full", "test-util"] }
 # and SHA-256. Our own code stays quick to compile and debuggable.
 [profile.dev.package."*"]
 opt-level = 2
+
+# Tests stream gigabytes over loopback (#33's 1 GB cancel test); lightly
+# optimizing our own code too keeps that to seconds instead of minutes.
+[profile.test]
+opt-level = 1

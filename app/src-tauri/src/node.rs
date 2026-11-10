@@ -130,6 +130,11 @@ pub enum AppEvent {
         transfer_id: String,
         error: String,
     },
+    /// Called off midway: by us, or (`by_peer`) by the sender. Nothing kept.
+    ReceiveCancelled {
+        transfer_id: String,
+        by_peer: bool,
+    },
     /// A file we're sending, waiting for the receiver to accept it.
     SendWaiting {
         transfer_id: String,
@@ -153,6 +158,11 @@ pub enum AppEvent {
     SendFailed {
         transfer_id: String,
         error: String,
+    },
+    /// Called off midway: by us, or (`by_peer`) by the receiver.
+    SendCancelled {
+        transfer_id: String,
+        by_peer: bool,
     },
     /// Show `code` and ask whether the other screen shows the same; answer
     /// with [`Node::respond_pair`]. `incoming` if the other device asked.
@@ -367,6 +377,15 @@ impl Node {
         respond.send(accept).is_ok()
     }
 
+    /// Call off transfer `transfer_id`, in either direction, waiting or
+    /// midway. The other device is told; a `*Cancelled` event follows.
+    pub fn cancel(&self, transfer_id: &str) -> Result<(), String> {
+        self.daemon
+            .transfers
+            .cancel(transfer_id)
+            .map_err(|e| e.to_string())
+    }
+
     /// Send `paths` to the discovered device `device_id`, one after another
     /// over one connection. Progress arrives as `Send*` events; the returned
     /// ids match them, in the order of `paths`.
@@ -471,10 +490,16 @@ impl Node {
         let ids = files.iter().map(|(_, _, id)| id.clone()).collect();
         let sink = self.sink.clone();
         let table = Arc::clone(&self.daemon.transfers);
+        let (addrs, identity, paired) = (
+            addrs.to_vec(),
+            self.identity.clone(),
+            Arc::clone(&self.paired),
+        );
         tokio::spawn(async move {
-            for (path, size, id) in files {
-                // The app has no cancel button yet, so the handle goes unused.
-                let _ = table.begin_with_id(
+            let mut files = files.into_iter();
+            while let Some((path, size, id)) = files.next() {
+                // Cancelling (see `Node::cancel`) fires `stop`.
+                let (_, stop) = table.begin_with_id(
                     id.clone(),
                     Transfer::new(
                         Direction::Send,
@@ -495,20 +520,24 @@ impl Node {
                 let progress_id = id.clone();
                 let progress_table = Arc::clone(&table);
                 let result = connection
-                    .send_file(&path, &mut |sent| {
-                        progress_table.update(&progress_id, |t| {
-                            t.status = Status::Transferring;
-                            t.bytes = sent;
-                        });
-                        if let Some(bytes_per_sec) = meter.update(sent) {
-                            progress_sink(AppEvent::SendProgress {
-                                transfer_id: progress_id.clone(),
-                                bytes: sent,
-                                size,
-                                bytes_per_sec,
+                    .send_file_until(
+                        &path,
+                        &mut |sent| {
+                            progress_table.update(&progress_id, |t| {
+                                t.status = Status::Transferring;
+                                t.bytes = sent;
                             });
-                        }
-                    })
+                            if let Some(bytes_per_sec) = meter.update(sent) {
+                                progress_sink(AppEvent::SendProgress {
+                                    transfer_id: progress_id.clone(),
+                                    bytes: sent,
+                                    size,
+                                    bytes_per_sec,
+                                });
+                            }
+                        },
+                        stop,
+                    )
                     .await;
                 match result {
                     Ok(FileResult::Delivered(outcome)) => {
@@ -525,6 +554,30 @@ impl Node {
                     Ok(FileResult::Declined) => {
                         table.finish(&id, Status::Declined, None);
                         sink(AppEvent::SendDeclined { transfer_id: id })
+                    }
+                    Ok(result @ (FileResult::Cancelled | FileResult::CancelledByPeer)) => {
+                        let by_peer = matches!(result, FileResult::CancelledByPeer);
+                        let error =
+                            by_peer.then(|| format!("{} cancelled it", connection.peer.name));
+                        table.finish(&id, Status::Cancelled, error);
+                        sink(AppEvent::SendCancelled {
+                            transfer_id: id,
+                            by_peer,
+                        });
+                        // That connection is done; the rest of the batch
+                        // goes over a new one.
+                        match connect(&addrs, &identity, &paired).await {
+                            Ok(fresh) => connection = fresh,
+                            Err(e) => {
+                                for (_, _, rest) in files {
+                                    sink(AppEvent::SendFailed {
+                                        transfer_id: rest,
+                                        error: e.to_string(),
+                                    });
+                                }
+                                return;
+                            }
+                        }
                     }
                     Err(e) => {
                         table.finish(&id, Status::Failed, Some(e.to_string()));
@@ -595,6 +648,7 @@ async fn forward_requests(
             size,
             respond,
             fetch,
+            ..
         } = request;
         let grant = fetch.as_ref().and_then(|f| f.grant.clone());
         let grant_folder = grant.as_ref().map(|g| g.folder.display().to_string());
@@ -754,6 +808,16 @@ async fn forward_receive_events(
             ReceiveEvent::Failed { transfer_id, error } => {
                 meters.remove(&transfer_id);
                 sink(AppEvent::ReceiveFailed { transfer_id, error });
+            }
+            ReceiveEvent::Cancelled {
+                transfer_id,
+                by_peer,
+            } => {
+                meters.remove(&transfer_id);
+                sink(AppEvent::ReceiveCancelled {
+                    transfer_id,
+                    by_peer,
+                });
             }
         }
     }

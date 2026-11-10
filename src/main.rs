@@ -306,6 +306,22 @@ async fn listen(
             Err(e) => fail(&format!("server stopped: {e}")),
         },
         _ = tokio::signal::ctrl_c() => {
+            // Call off anything still running, so the other side hears it
+            // was cancelled rather than finding a dropped connection.
+            let running: Vec<String> = daemon
+                .transfers
+                .list()
+                .into_iter()
+                .filter(|t| !t.status.is_final())
+                .map(|t| t.transfer_id)
+                .collect();
+            for id in &running {
+                let _ = daemon.transfers.cancel(id);
+            }
+            if !running.is_empty() {
+                println!("\nCancelling {} transfer(s)...", running.len());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             println!("\nShutting down.");
             ExitCode::SUCCESS
         }
@@ -378,10 +394,26 @@ async fn send_files(me: &Me, target: &str, files: &[&str], wait: Duration) -> Ex
         let path = Path::new(file);
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let mut bar = Progress::new(path, size);
-        match connection
-            .send_file(path, &mut |sent| bar.update(sent))
-            .await
-        {
+        // Ctrl+C calls the file off and tells the receiver.
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let ctrl_c = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = stop.send(());
+            }
+        });
+        let result = connection
+            .send_file_until(path, &mut |sent| bar.update(sent), stopped)
+            .await;
+        ctrl_c.abort();
+        match result {
+            Ok(FileResult::Cancelled) => {
+                bar.finish("cancelled");
+                return fail("cancelled; the receiver was told and kept nothing");
+            }
+            Ok(FileResult::CancelledByPeer) => {
+                bar.finish("cancelled by the receiver");
+                return fail("the receiver cancelled the transfer");
+            }
             Ok(FileResult::Delivered(outcome)) => bar.finish(&format!(
                 "done, verified (SHA-256 {}...)",
                 &outcome.sha256[..12]

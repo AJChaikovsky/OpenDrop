@@ -583,7 +583,7 @@ async fn run_fetch(
 }
 
 /// Send one file over `connection`, keeping its row up to date. Cancelling
-/// drops the connection, which the receiver sees as an interrupted transfer.
+/// tells the receiver, which throws away what it has.
 async fn run_send(
     transfers: Arc<TransferTable>,
     audit: Arc<AuditLog>,
@@ -602,18 +602,23 @@ async fn run_send(
             t.bytes = sent;
         })
     };
-    let send = connection.send_file(&path, &mut on_progress);
-    tokio::select! {
-        result = send => match result {
-            Ok(FileResult::Delivered(outcome)) => transfers.update(&id, |t| {
-                t.bytes = outcome.size;
-                t.sha256 = Some(outcome.sha256);
-                t.status = Status::Done;
-            }),
-            Ok(FileResult::Declined) => transfers.finish(&id, Status::Declined, None),
-            Err(e) => transfers.finish(&id, Status::Failed, Some(e.to_string())),
-        },
-        _ = cancelled => transfers.finish(&id, Status::Cancelled, None),
+    match connection
+        .send_file_until(&path, &mut on_progress, cancelled)
+        .await
+    {
+        Ok(FileResult::Delivered(outcome)) => transfers.update(&id, |t| {
+            t.bytes = outcome.size;
+            t.sha256 = Some(outcome.sha256);
+            t.status = Status::Done;
+        }),
+        Ok(FileResult::Declined) => transfers.finish(&id, Status::Declined, None),
+        Ok(FileResult::Cancelled) => transfers.finish(&id, Status::Cancelled, None),
+        Ok(FileResult::CancelledByPeer) => transfers.finish(
+            &id,
+            Status::Cancelled,
+            Some(format!("{peer_name} cancelled it")),
+        ),
+        Err(e) => transfers.finish(&id, Status::Failed, Some(e.to_string())),
     }
     if let Some(row) = transfers.get(&id) {
         audit.record(
@@ -637,7 +642,7 @@ async fn record_requests(
             Some(fetch) => (Direction::Send, Some(fetch.peer_id.clone())),
             None => (Direction::Receive, None),
         };
-        let (row, cancelled) = transfers.begin_with_id(
+        let (row, mut cancelled) = transfers.begin_with_id(
             request.transfer_id.clone(),
             Transfer::new(
                 direction,
@@ -659,6 +664,7 @@ async fn record_requests(
                 size,
                 mut respond,
                 fetch,
+                cancel,
             } = request;
             let accept = match approval {
                 // Auto-accept takes files in; sending one away always needs
@@ -675,13 +681,14 @@ async fn record_requests(
                         size,
                         respond: answer_tx,
                         fetch,
+                        cancel: None,
                     };
                     if ask.send(forwarded).await.is_err() {
                         false
                     } else {
                         tokio::select! {
                             answer = answer => answer.unwrap_or(false),
-                            _ = cancelled => {
+                            _ = &mut cancelled => {
                                 transfers.finish(&row, Status::Cancelled, None);
                                 false
                             }
@@ -700,6 +707,17 @@ async fn record_requests(
                 });
             }
             let _ = respond.send(accept);
+            // Once the file is coming in, a cancel stops the download. The
+            // row is marked first so the receive's own report of it doesn't
+            // replace the status; the table drops the handle when the row
+            // ends any other way.
+            if accept
+                && let Some(cancel) = cancel
+                && cancelled.await.is_ok()
+            {
+                transfers.finish(&row, Status::Cancelled, None);
+                let _ = cancel.send(());
+            }
         });
     }
 }
@@ -757,6 +775,14 @@ async fn record_receive_events(
             ReceiveEvent::Failed { transfer_id, error } => {
                 transfers.finish(&row(transfer_id), Status::Failed, Some(error.clone()))
             }
+            ReceiveEvent::Cancelled {
+                transfer_id,
+                by_peer,
+            } => transfers.finish(
+                &row(transfer_id),
+                Status::Cancelled,
+                by_peer.then(|| "the sender cancelled it".to_owned()),
+            ),
         }
         if let Some(forward) = &forward {
             let _ = forward.send(event);
@@ -790,5 +816,7 @@ fn file_name(path: &Path) -> String {
     )
 }
 
+#[cfg(test)]
+mod cancel_tests;
 #[cfg(test)]
 mod tests;

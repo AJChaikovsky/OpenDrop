@@ -19,6 +19,9 @@ export interface Api {
   /** `allowFolder`: with a yes to a fetch, let that device fetch from the
    * file's folder for 10 minutes without asking. */
   respond(transferId: string, accept: boolean, allowFolder?: boolean): Promise<boolean>;
+  /** Call off a transfer that's waiting or midway, in either direction;
+   * the other device is told. A `*_cancelled` event follows. */
+  cancelTransfer(transferId: string): Promise<void>;
   pairDevice(deviceId: string): Promise<void>;
   respondPair(pairId: string, accept: boolean): Promise<boolean>;
   unpairDevice(deviceId: string): Promise<boolean>;
@@ -36,6 +39,7 @@ export const tauriApi: Api = {
     invoke("send_files", { deviceId: target.deviceId ?? null, address: target.address ?? null, paths }),
   respond: (transferId, accept, allowFolder) =>
     invoke("respond", { transferId, accept, allowFolder: allowFolder ?? false }),
+  cancelTransfer: (transferId) => invoke("cancel_transfer", { transferId }),
   pairDevice: (deviceId) => invoke("pair_device", { deviceId }),
   respondPair: (pairId, accept) => invoke("respond_pair", { pairId, accept }),
   unpairDevice: (deviceId) => invoke("unpair_device", { deviceId }),

@@ -27,7 +27,7 @@ use super::client::{Connection, FileResult};
 use super::fetch::{Claim, PendingFetches};
 use super::grants::{GrantOffer, Grants};
 use super::limit::RateLimit;
-use super::secure::SecureStream;
+use super::secure::{SecureStream, is_peer_cancel};
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, handshake};
 use crate::audit::{AuditLog, Entry, Event};
 use crate::daemon::{Direction, Status, Transfer, TransferTable};
@@ -69,6 +69,9 @@ pub struct FileRequest {
     /// Set when the peer asks to fetch one of our shared files rather than
     /// offering us one: approving sends the file to them.
     pub fetch: Option<FetchInfo>,
+    /// For an incoming file: firing it after a yes stops the download
+    /// midway, tells the sender, and throws away what arrived.
+    pub cancel: Option<oneshot::Sender<()>>,
 }
 
 /// What a fetch request adds to a [`FileRequest`].
@@ -104,7 +107,28 @@ pub enum ReceiveEvent {
     },
     /// Dropped connection, checksum mismatch or storage error; nothing saved.
     Failed { transfer_id: String, error: String },
+    /// Called off midway, by our side or (`by_peer`) the sender; nothing
+    /// saved.
+    Cancelled { transfer_id: String, by_peer: bool },
 }
+
+/// Why a receive stopped early on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiveCancelled {
+    by_peer: bool,
+}
+
+impl std::fmt::Display for ReceiveCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.by_peer {
+            write!(f, "cancelled by the sender")
+        } else {
+            write!(f, "cancelled")
+        }
+    }
+}
+
+impl std::error::Error for ReceiveCancelled {}
 
 /// Where [`run_with_events`] reports [`ReceiveEvent`]s.
 pub type ReceiveEvents = mpsc::UnboundedSender<ReceiveEvent>;
@@ -206,9 +230,14 @@ pub async fn serve(listener: TcpListener, options: Options) -> std::io::Result<(
         let (mut stream, peer_addr) = listener.accept().await?;
         let options = Arc::clone(&options);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(&mut stream, peer_addr, &options).await {
-                eprintln!("[{peer_addr}] connection ended with error: {e}");
-                close_after_error(stream).await;
+            match handle_connection(&mut stream, peer_addr, &options).await {
+                Ok(()) => {}
+                // Already reported when it happened.
+                Err(e) if e.downcast_ref::<ReceiveCancelled>().is_some() => {}
+                Err(e) => {
+                    eprintln!("[{peer_addr}] connection ended with error: {e}");
+                    close_after_error(stream).await;
+                }
             }
         });
     }
@@ -301,6 +330,7 @@ async fn serve_fetch(
                 name: file.name.clone(),
                 size: file.size,
                 respond,
+                cancel: None,
                 fetch: Some(FetchInfo {
                     peer_id: peer.peer.id.clone(),
                     reason: request.reason.clone(),
@@ -430,6 +460,13 @@ async fn push_fetched(
             })
         }
         Ok(FileResult::Declined) => record(&|t| t.status = Status::Declined),
+        Ok(FileResult::Cancelled | FileResult::CancelledByPeer) => {
+            println!("[{reply_to}] fetched file cancelled by the device that asked");
+            record(&|t| {
+                t.status = Status::Cancelled;
+                t.error = Some("cancelled by the device that asked".into());
+            })
+        }
         Err(e) => {
             eprintln!("[{reply_to}] could not send fetched file: {e}");
             record(&|t| {
@@ -442,6 +479,7 @@ async fn push_fetched(
     log.record(entry.detail(match &result {
         Ok(FileResult::Delivered(_)) => "fetched: done".to_owned(),
         Ok(FileResult::Declined) => "fetched: declined".to_owned(),
+        Ok(FileResult::Cancelled | FileResult::CancelledByPeer) => "fetched: cancelled".to_owned(),
         Err(e) => format!("fetched: failed ({e})"),
     }));
 }
@@ -681,6 +719,15 @@ async fn receive_file(
         )
         .await;
     };
+    // Whoever approves a pushed file also gets a way to stop it midway; a
+    // fetch we started already has one.
+    let (cancel, stop) = match stop {
+        Some(stop) => (None, Some(stop)),
+        None => {
+            let (cancel, stop) = oneshot::channel();
+            (Some(cancel), Some(stop))
+        }
+    };
     let accepted = match approval {
         Approval::AcceptAll => true,
         Approval::Ask(requests) => {
@@ -694,6 +741,7 @@ async fn receive_file(
                 size,
                 respond,
                 fetch: None,
+                cancel,
             };
             let accepted = requests.send(request).await.is_ok()
                 && matches!(timeout(APPROVAL_TIMEOUT, decision).await, Ok(Ok(true)));
@@ -745,6 +793,12 @@ async fn receive_file(
             transfer_id,
             path: path.clone(),
             sha256: sha256.clone(),
+        },
+        Err(e) if e.downcast_ref::<ReceiveCancelled>().is_some() => ReceiveEvent::Cancelled {
+            transfer_id,
+            by_peer: e
+                .downcast_ref::<ReceiveCancelled>()
+                .is_some_and(|c| c.by_peer),
         },
         Err(e) => ReceiveEvent::Failed {
             transfer_id,
@@ -814,9 +868,27 @@ async fn save_file(
     let Some(actual) = copied else {
         println!("[{peer_addr}] stopped receiving \"{name}\": cancelled");
         part.discard().await;
-        return Err("cancelled".into());
+        // Tell the sender, so it stops too instead of finding out from a
+        // dropped connection.
+        let cancel = Message::Cancel {
+            transfer_id: transfer_id.to_owned(),
+        };
+        let _ = timeout(
+            std::time::Duration::from_secs(1),
+            write_message(stream, &cancel),
+        )
+        .await;
+        return Err(ReceiveCancelled { by_peer: false }.into());
     };
-    let actual = actual?;
+    let actual = match actual {
+        Ok(actual) => actual,
+        Err(e) if is_peer_cancel(&e) => {
+            println!("[{peer_addr}] \"{name}\" cancelled by the sender");
+            part.discard().await;
+            return Err(ReceiveCancelled { by_peer: true }.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
     let expected = match next_message(stream).await {
         Ok(Message::FileDone {
             transfer_id: id,
@@ -837,7 +909,7 @@ async fn save_file(
     if stop.as_mut().is_some_and(|s| s.try_recv().is_ok()) {
         println!("[{peer_addr}] stopped receiving \"{name}\": cancelled");
         part.discard().await;
-        return Err("cancelled".into());
+        return Err(ReceiveCancelled { by_peer: false }.into());
     }
     if !actual.eq_ignore_ascii_case(&expected) {
         return reject(

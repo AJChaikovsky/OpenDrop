@@ -78,6 +78,11 @@ fn respond(
 
 /// The audit log, newest first (the Activity view).
 #[tauri::command]
+fn cancel_transfer(node: State<'_, Arc<Node>>, transfer_id: String) -> Result<(), String> {
+    node.cancel(&transfer_id)
+}
+
+#[tauri::command]
 fn audit(node: State<'_, Arc<Node>>) -> Vec<opendrop::audit::Entry> {
     node.audit(500)
 }
@@ -124,7 +129,8 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         pair_device,
         respond_pair,
         unpair_device,
-        audit
+        audit,
+        cancel_transfer
     ])
 }
 

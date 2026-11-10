@@ -219,7 +219,61 @@ impl<S> SecureStream<S> {
             .decrypt_inout_detached(&nonce, &header, self.plain.as_mut_slice().into(), &tag)
             .map_err(|_| invalid("encrypted record failed authentication"))?;
         self.rx_start += HEADER_LEN + len;
+        // An empty record is the peer calling the transfer off (see
+        // `SecureStream::cancel`); nothing else sends one.
+        if self.plain.is_empty() {
+            return Err(cancelled());
+        }
         Ok(true)
+    }
+}
+
+/// The peer stopped the transfer on purpose: what reading returns after the
+/// other side calls [`SecureStream::cancel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCancelled;
+
+impl std::fmt::Display for PeerCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the other device cancelled the transfer")
+    }
+}
+
+impl std::error::Error for PeerCancelled {}
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, PeerCancelled)
+}
+
+/// Whether `error` (or anything it wraps) is [`PeerCancelled`].
+pub fn is_peer_cancel(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(error);
+    while let Some(e) = next {
+        if e.is::<PeerCancelled>() {
+            return true;
+        }
+        if let Some(io) = e.downcast_ref::<io::Error>()
+            && io
+                .get_ref()
+                .is_some_and(|inner| inner.is::<PeerCancelled>())
+        {
+            return true;
+        }
+        next = e.source();
+    }
+    false
+}
+
+impl<S: AsyncWrite + Unpin> SecureStream<S> {
+    /// Tell the peer we're calling the transfer off: finish any record
+    /// already on its way, then send an empty one, which the peer's next
+    /// read reports as [`PeerCancelled`]. The stream is done after this.
+    pub async fn cancel(&mut self) -> io::Result<()> {
+        std::future::poll_fn(|cx| self.poll_drain(cx)).await?;
+        self.unacked = None;
+        self.seal(&[])?;
+        std::future::poll_fn(|cx| self.poll_drain(cx)).await?;
+        std::future::poll_fn(|cx| Pin::new(&mut self.inner).poll_flush(cx)).await
     }
 }
 
@@ -324,6 +378,27 @@ mod tests {
         let client = a.agree(&b_pub, b"transcript", true).unwrap();
         let server = b.agree(&a_pub, b"transcript", false).unwrap();
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reaches_the_reader_after_the_data_before_it() {
+        let (client, server) = pair();
+        let (a, b) = duplex(1 << 20);
+        let mut writer = SecureStream::new(a, &client);
+        let mut reader = SecureStream::new(b, &server);
+        writer.write_all(b"first part").await.unwrap();
+        writer.cancel().await.unwrap();
+        let mut buf = [0u8; 10];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"first part");
+        let err = reader.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(is_peer_cancel(&err));
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+        assert!(is_peer_cancel(boxed.as_ref()));
+        assert!(!is_peer_cancel(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
     }
 
     #[tokio::test]

@@ -1,17 +1,18 @@
 //! Connects to another device and talks to it.
 
-use super::secure::SecureStream;
+use super::secure::{SecureStream, is_peer_cancel};
 use super::{APPROVAL_TIMEOUT, BoxError, DeviceIdentity, IO_TIMEOUT, PeerIdentity, handshake};
 use crate::error::{self, coded};
 use crate::pairing::store::PairedDevices;
 use crate::pairing::{self, PairOutcome, PairPrompts};
 use crate::protocol::{
-    ErrorCode, FetchDeclineReason, Message, SharedFile, read_message, write_message,
+    ErrorCode, FetchDeclineReason, Message, ProtocolError, SharedFile, read_message, write_message,
 };
 use crate::transfer::{copy_hashed, sanitize_file_name};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 /// Result of a successful `send_text`.
@@ -37,6 +38,10 @@ pub enum FileResult {
     /// The receiver said no (or didn't answer in time). Nothing was sent, and
     /// the connection is still usable.
     Declined,
+    /// We called it off midway (and told the receiver).
+    Cancelled,
+    /// The receiver called it off midway.
+    CancelledByPeer,
 }
 
 /// An open, introduced connection to a peer. Several texts and files can be
@@ -124,7 +129,18 @@ impl Connection {
         path: &Path,
         progress: &mut (dyn FnMut(u64) + Send),
     ) -> Result<FileResult, BoxError> {
-        self.offer(path, None, progress).await
+        self.offer(path, None, progress, None).await
+    }
+
+    /// [`Connection::send_file`] that stops when `stop` fires, telling the
+    /// receiver so it can clean up ([`FileResult::Cancelled`]).
+    pub async fn send_file_until(
+        &mut self,
+        path: &Path,
+        progress: &mut (dyn FnMut(u64) + Send),
+        stop: oneshot::Receiver<()>,
+    ) -> Result<FileResult, BoxError> {
+        self.offer(path, None, progress, Some(stop)).await
     }
 
     /// [`Connection::send_file`] in answer to the peer's fetch `fetch_id`
@@ -135,7 +151,7 @@ impl Connection {
         fetch_id: &str,
         progress: &mut (dyn FnMut(u64) + Send),
     ) -> Result<FileResult, BoxError> {
-        self.offer(path, Some(fetch_id), progress).await
+        self.offer(path, Some(fetch_id), progress, None).await
     }
 
     /// The files the peer shares with us (if we're paired), and whether the
@@ -194,6 +210,7 @@ impl Connection {
         path: &Path,
         fetch_id: Option<&str>,
         progress: &mut (dyn FnMut(u64) + Send),
+        mut stop: Option<oneshot::Receiver<()>>,
     ) -> Result<FileResult, BoxError> {
         let mut file = tokio::fs::File::open(path)
             .await
@@ -226,7 +243,14 @@ impl Connection {
         write_message(&mut self.stream, &offer).await?;
         // The receiver may be asking its user, so allow for that on top of
         // the usual network delay.
-        match recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT).await? {
+        let answer = recv_within(&mut self.stream, APPROVAL_TIMEOUT + IO_TIMEOUT);
+        let answer = tokio::select! {
+            answer = answer => answer?,
+            // Not started yet: hanging up is enough, the receiver's prompt
+            // goes away when the connection does.
+            () = stop_signal(&mut stop) => return Ok(FileResult::Cancelled),
+        };
+        match answer {
             Message::FileAccept { transfer_id: id } if id == transfer_id => {}
             Message::FileDecline { transfer_id: id } if id == transfer_id => {
                 return Ok(FileResult::Declined);
@@ -234,14 +258,31 @@ impl Connection {
             other => return Err(unexpected(other)),
         }
 
-        let sha256 = match copy_hashed(&mut file, &mut self.stream, size, progress).await {
-            Ok(hash) => hash,
+        // Stream the bytes while listening for the receiver calling it off.
+        // It sends nothing else until we're done, so the read below never
+        // has half a message in hand when the copy wins.
+        let streamed = {
+            let (mut reader, mut writer) = tokio::io::split(&mut self.stream);
+            tokio::select! {
+                copied = copy_hashed(&mut file, &mut writer, size, progress) => Streamed::Copied(copied),
+                said = read_message(&mut reader) => Streamed::Interrupted(said),
+                () = stop_signal(&mut stop) => Streamed::Stopped,
+            }
+        };
+        let sha256 = match streamed {
+            Streamed::Copied(Ok(hash)) => hash,
+            Streamed::Stopped => {
+                let _ = timeout(CANCEL_TIMEOUT, self.stream.cancel()).await;
+                return Ok(FileResult::Cancelled);
+            }
+            Streamed::Interrupted(said) => return interrupted(said),
             // If the peer hung up mid-transfer it probably said why first.
-            Err(e) => {
-                return Err(match recv(&mut self.stream).await {
-                    Ok(reply) => unexpected(reply),
-                    Err(_) => format!("transfer interrupted: {e}").into(),
-                });
+            Streamed::Copied(Err(e)) => {
+                return match recv(&mut self.stream).await {
+                    Ok(Message::Cancel { .. }) => Ok(FileResult::CancelledByPeer),
+                    Ok(reply) => Err(unexpected(reply)),
+                    Err(_) => Err(format!("transfer interrupted: {e}").into()),
+                };
             }
         };
         write_message(
@@ -262,6 +303,36 @@ impl Connection {
             other => Err(unexpected(other)),
         }
     }
+}
+
+/// How long telling the other side about a cancel may take.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
+
+enum Streamed {
+    Copied(std::io::Result<String>),
+    Interrupted(Result<Message, ProtocolError>),
+    Stopped,
+}
+
+/// The receiver said something (or hung up) while the file was streaming.
+fn interrupted(said: Result<Message, ProtocolError>) -> Result<FileResult, BoxError> {
+    match said {
+        Ok(Message::Cancel { .. }) => Ok(FileResult::CancelledByPeer),
+        Ok(other) => Err(unexpected(other)),
+        Err(e) if is_peer_cancel(&e) => Ok(FileResult::CancelledByPeer),
+        Err(e) => Err(format!("transfer interrupted: {e}").into()),
+    }
+}
+
+/// Resolves when `stop` fires; never, if there's no stop or its sender went
+/// away without firing.
+async fn stop_signal(stop: &mut Option<oneshot::Receiver<()>>) {
+    if let Some(rx) = stop
+        && rx.await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
 }
 
 /// Connect to `addr`, introduce ourselves, send `body`, and wait for the

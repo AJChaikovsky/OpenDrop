@@ -3,7 +3,7 @@ use crate::pairing::store::PairedDevices;
 use std::time::Duration;
 
 /// A daemon on loopback without mDNS.
-async fn daemon(name: &str, downloads: &Path, approval: Approval) -> Arc<Daemon> {
+pub(super) async fn daemon(name: &str, downloads: &Path, approval: Approval) -> Arc<Daemon> {
     Daemon::start(Options {
         port: 0,
         discover: false,
@@ -13,7 +13,7 @@ async fn daemon(name: &str, downloads: &Path, approval: Approval) -> Arc<Daemon>
     .unwrap()
 }
 
-fn loopback(daemon: &Daemon) -> Vec<SocketAddr> {
+pub(super) fn loopback(daemon: &Daemon) -> Vec<SocketAddr> {
     vec![SocketAddr::from(([127, 0, 0, 1], daemon.port))]
 }
 

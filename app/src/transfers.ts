@@ -3,7 +3,7 @@
 
 import type { AppEvent, Device, IncomingRequest, PairCode, PairStatus } from "./types";
 
-export type TransferStatus = "waiting" | "active" | "done" | "declined" | "failed";
+export type TransferStatus = "waiting" | "active" | "done" | "declined" | "failed" | "cancelled";
 
 export interface Transfer {
   id: string;
@@ -107,6 +107,12 @@ export function reducer(state: State, action: Action): State {
     case "receive_failed":
     case "send_failed":
       return update(action.transfer_id, { status: "failed", detail: action.error });
+    case "receive_cancelled":
+    case "send_cancelled": {
+      const t = state.transfers.find((x) => x.id === action.transfer_id);
+      const detail = action.by_peer && t ? `${t.peer} cancelled it` : undefined;
+      return update(action.transfer_id, { status: "cancelled", detail });
+    }
     case "pair_code":
       return { ...state, pairing: { ...action, confirmed: false }, pairNotice: null };
     case "pair_answered":

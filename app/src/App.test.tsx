@@ -21,6 +21,7 @@ function fakeApi(devices: Device[] = [pc]) {
     devices: vi.fn(async () => devices),
     sendFiles: vi.fn(async () => ["send-1"]),
     respond: vi.fn(async () => true),
+    cancelTransfer: vi.fn(async () => {}),
     pairDevice: vi.fn(async () => {}),
     respondPair: vi.fn(async () => true),
     unpairDevice: vi.fn(async () => true),
@@ -37,6 +38,29 @@ function fakeApi(devices: Device[] = [pc]) {
 }
 
 describe("App", () => {
+  it("cancels a transfer from its Cancel button and shows who cancelled", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    emit({ kind: "send_waiting", transfer_id: "send-1", device_name: "AJ-PC", name: "movie.mp4", size: 1_000_000_000 });
+    emit({ kind: "send_progress", transfer_id: "send-1", bytes: 500_000_000, size: 1_000_000_000, bytes_per_sec: 50_000_000 });
+    const row = screen.getByRole("listitem", { name: "movie.mp4" });
+    await userEvent.click(within(row).getByRole("button", { name: "Cancel movie.mp4" }));
+    expect(api.cancelTransfer).toHaveBeenCalledWith("send-1");
+    emit({ kind: "send_cancelled", transfer_id: "send-1", by_peer: false });
+    expect(within(row).getByText("Cancelled")).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: /Cancel/ })).not.toBeInTheDocument();
+
+    // An incoming file the sender calls off says so, and has no button left.
+    emit({ kind: "receive_started", transfer_id: "in-1", peer_name: "AJ-PC", name: "big.zip", size: 1000 });
+    const incoming = screen.getByRole("listitem", { name: "big.zip" });
+    expect(within(incoming).getByRole("button", { name: "Cancel big.zip" })).toBeInTheDocument();
+    emit({ kind: "receive_cancelled", transfer_id: "in-1", by_peer: true });
+    expect(within(incoming).getByText("Cancelled")).toBeInTheDocument();
+    expect(within(incoming).getByText("AJ-PC cancelled it")).toBeInTheDocument();
+    expect(within(incoming).queryByRole("button", { name: /Cancel/ })).not.toBeInTheDocument();
+  });
+
+
   it("lists nearby devices and sends picked files to the clicked one", async () => {
     const { api } = fakeApi();
     render(<App api={api} />);

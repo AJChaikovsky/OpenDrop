@@ -51,11 +51,13 @@ export type AppEvent =
   | { kind: "receive_progress"; transfer_id: string; bytes: number; size: number; bytes_per_sec: number }
   | { kind: "receive_done"; transfer_id: string; path: string; sha256: string }
   | { kind: "receive_failed"; transfer_id: string; error: string }
+  | { kind: "receive_cancelled"; transfer_id: string; by_peer: boolean }
   | { kind: "send_waiting"; transfer_id: string; device_name: string; name: string; size: number }
   | { kind: "send_progress"; transfer_id: string; bytes: number; size: number; bytes_per_sec: number }
   | { kind: "send_done"; transfer_id: string; sha256: string }
   | { kind: "send_declined"; transfer_id: string }
   | { kind: "send_failed"; transfer_id: string; error: string }
+  | { kind: "send_cancelled"; transfer_id: string; by_peer: boolean }
   | { kind: "pair_code"; pair_id: string; device_id: string; device_name: string; code: string; incoming: boolean }
   | { kind: "pair_expired"; pair_id: string }
   | { kind: "pair_done"; device_id: string; device_name: string; status: PairStatus; error: string | null };

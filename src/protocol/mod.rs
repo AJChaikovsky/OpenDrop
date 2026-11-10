@@ -118,6 +118,11 @@ pub enum Message {
         transfer_id: String,
         received_bytes: u64,
     },
+    /// The receiver calls off a file it's taking in (its user pressed
+    /// Cancel). The sender stops sending; the receiver throws away what it
+    /// has. A sender calls a transfer off with an empty encrypted record
+    /// instead, since its side of the stream is raw file bytes.
+    Cancel { transfer_id: String },
     /// Requester asks which files the owner shares (only paired devices
     /// may), optionally only those whose path contains `query`.
     ShareListRequest {
@@ -262,7 +267,15 @@ impl std::fmt::Display for ProtocolError {
     }
 }
 
-impl std::error::Error for ProtocolError {}
+impl std::error::Error for ProtocolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Json(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for ProtocolError {
     fn from(e: io::Error) -> Self {

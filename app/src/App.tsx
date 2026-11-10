@@ -59,6 +59,12 @@ export default function App({ api = tauriApi }: { api?: Api }) {
     api.respond(request.transfer_id, accept, accept && allowFolder);
   };
 
+  // The row turns "cancelled" when the matching event arrives; a transfer
+  // that ended in the meantime just keeps its final state.
+  const cancel = (t: Transfer) => {
+    api.cancelTransfer(t.id).catch(() => {});
+  };
+
   const pair = async (device: Device) => {
     setError(null);
     try {
@@ -135,7 +141,7 @@ export default function App({ api = tauriApi }: { api?: Api }) {
           <h2>Transfers</h2>
           <ul className="transfers">
             {state.transfers.map((t) => (
-              <TransferRow key={t.id} transfer={t} />
+              <TransferRow key={t.id} transfer={t} onCancel={cancel} />
             ))}
           </ul>
         </section>
@@ -345,9 +351,10 @@ const STATUS_TEXT: Record<Transfer["status"], string> = {
   done: "Done",
   declined: "Declined",
   failed: "Failed",
+  cancelled: "Cancelled",
 };
 
-function TransferRow({ transfer: t }: { transfer: Transfer }) {
+function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: (t: Transfer) => void }) {
   const percent = t.size > 0 ? Math.floor((t.bytes / t.size) * 100) : 100;
   const arrow = t.direction === "send" ? `to ${t.peer}` : `from ${t.peer}`;
   return (
@@ -367,6 +374,11 @@ function TransferRow({ transfer: t }: { transfer: Transfer }) {
         </span>
       </div>
       {t.detail && <div className="transfer-detail">{t.detail}</div>}
+      {(t.status === "waiting" || t.status === "active") && (
+        <button className="transfer-cancel" aria-label={`Cancel ${t.name}`} onClick={() => onCancel(t)}>
+          Cancel
+        </button>
+      )}
     </li>
   );
 }
