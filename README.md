@@ -7,6 +7,38 @@ No accounts, no cloud: every device runs the same app and talks directly to its 
 local network over mDNS and send each other messages and files over TCP, by device name or IP
 address. Files are verified with SHA-256 before they're saved.
 
+## Install
+
+Download the installer for your system from the
+[latest release](https://github.com/AJChaikovsky/OpenDrop/releases/latest):
+
+| System | File | Notes |
+|---|---|---|
+| macOS (Apple silicon and Intel) | `OpenDrop_<version>_universal.dmg` | Open it and drag OpenDrop to Applications. |
+| Windows 10/11 | `OpenDrop_<version>_x64-setup.exe` (or the `.msi`) | Run it; no admin rights needed for the `.exe`. |
+| Linux (Debian/Ubuntu) | `OpenDrop_<version>_amd64.deb` | `sudo apt install ./OpenDrop_<version>_amd64.deb` |
+| Linux (any) | `OpenDrop_<version>_amd64.AppImage` | `chmod +x` it, then run it. |
+
+The builds aren't code-signed yet, so the first launch needs one extra step:
+
+- **macOS:** right-click OpenDrop in Applications, choose **Open**, then **Open** again. If
+  macOS says the app "is damaged", run `xattr -cr /Applications/OpenDrop.app` once.
+- **Windows:** if SmartScreen says "Windows protected your PC", click **More info**, then
+  **Run anyway**.
+
+Then:
+
+1. Open OpenDrop on two devices on the same Wi-Fi or wired network. Each lists the other
+   within a few seconds.
+2. Drag a file onto the other device (or click it and pick one).
+3. Press **Accept** on the other device. The file lands in `Downloads/OpenDrop`.
+
+The first time, your system may ask whether OpenDrop can use the local network (macOS) or
+get through the firewall (Windows): allow it, or the devices can't see each other. On
+Windows, allow it for the network type you're on (Private or Public).
+
+To build it yourself instead, see [Desktop app](#desktop-app).
+
 ## Desktop app
 
 `app/` is a Tauri 2 + React + TypeScript app on top of the same crate. It lists nearby
