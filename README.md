@@ -7,6 +7,10 @@ No accounts, no cloud: every device runs the same app and talks directly to its 
 local network over mDNS and send each other messages and files over TCP, by device name or IP
 address. Files are verified with SHA-256 before they're saved.
 
+<p align="center">
+  <img src="docs/screenshots/main.png" width="640" alt="OpenDrop's main window: nearby devices, finished transfers and history">
+</p>
+
 ## Install
 
 Download the installer for your system from the
@@ -36,6 +40,10 @@ Then:
 The first time, your system may ask whether OpenDrop can use the local network (macOS) or
 get through the firewall (Windows): allow it, or the devices can't see each other. On
 Windows, allow it for the network type you're on (Private or Public).
+
+| Accepting a file | Pairing with a code |
+|---|---|
+| <img src="docs/screenshots/incoming-file.png" width="400" alt="Incoming file dialog with Accept and Decline"> | <img src="docs/screenshots/pairing.png" width="400" alt="Pairing dialog showing a 6-digit code to compare"> |
 
 To build it yourself instead, see [Desktop app](#desktop-app).
 
