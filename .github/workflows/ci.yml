@@ -65,5 +65,8 @@ jobs:
       - name: Core tests
         run: cargo test -p opendrop
 
+      - name: Relay tests
+        run: cargo test -p opendrop-relay
+
       - name: App tests
         run: cargo test -p opendrop-app

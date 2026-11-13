@@ -62,6 +62,8 @@ pub struct Options {
     pub allow_unpaired_fetch: bool,
     /// Where lists, requests, decisions, grants and sends are recorded.
     pub audit: Arc<AuditLog>,
+    /// Stay connected to this relay (opt-in, after `opendrop relay login`).
+    pub relay: Option<crate::relay::Config>,
 }
 
 impl Options {
@@ -80,6 +82,7 @@ impl Options {
             shares: None,
             allow_unpaired_fetch: false,
             audit: Arc::new(AuditLog::in_memory()),
+            relay: None,
         }
     }
 }
@@ -126,6 +129,8 @@ pub struct Daemon {
     control_error: Mutex<Option<String>>,
     control: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
     server: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
+    relay_status: Option<tokio::sync::watch::Receiver<crate::relay::Status>>,
+    relay_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Daemon {
@@ -146,6 +151,7 @@ impl Daemon {
             shares,
             allow_unpaired_fetch,
             audit,
+            relay,
         } = options;
         let listener = TcpListener::bind(("0.0.0.0", port))
             .await
@@ -196,8 +202,18 @@ impl Daemon {
         } else {
             (None, None)
         };
+        let (relay_status, relay_task) = match relay {
+            Some(config) => {
+                let (tx, rx) = tokio::sync::watch::channel(crate::relay::Status::Connecting);
+                let task = tokio::spawn(crate::relay::run(config, identity.clone(), tx));
+                (Some(rx), Some(task))
+            }
+            None => (None, None),
+        };
         let daemon = Arc::new(Self {
             identity,
+            relay_status,
+            relay_task: Mutex::new(relay_task),
             port,
             download_dir,
             paired,
@@ -227,6 +243,11 @@ impl Daemon {
             }
         }
         Ok(daemon)
+    }
+
+    /// Changes to the relay connection; `None` when the relay is off.
+    pub fn relay_status(&self) -> Option<tokio::sync::watch::Receiver<crate::relay::Status>> {
+        self.relay_status.clone()
     }
 
     pub fn discovery(&self) -> Option<&Discovery> {
@@ -447,6 +468,9 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         if let Some(server) = self.server.lock().unwrap().take() {
             server.abort();
+        }
+        if let Some(relay) = self.relay_task.lock().unwrap().take() {
+            relay.abort();
         }
         if let Some(control) = self.control.lock().unwrap().take() {
             control.abort();

@@ -60,6 +60,11 @@ USAGE:
     opendrop fetch <DEVICE> <FILE> [--reason TEXT]
                                     ask a device for a shared file (by name, path or id);
                                     needs `listen` running here, the owner approves it
+    opendrop relay login <EMAIL> --relay <URL>
+                                    sign in to a relay (opt-in) so this device shows
+                                    online to your other devices from anywhere
+    opendrop relay status             your devices on the relay, online or not
+    opendrop relay logout             stop using the relay
     opendrop mcp                      MCP server on stdin/stdout for AI assistants
                                     (Claude Code: claude mcp add opendrop -- opendrop mcp);
                                     needs `listen` (or the app) running here
@@ -100,6 +105,8 @@ async fn main() -> ExitCode {
     let auto_accept = take_switch(&mut args, "--auto-accept");
     let allow_unpaired_fetch = take_switch(&mut args, "--allow-unpaired-fetch");
     let reason = take_flag(&mut args, "--reason").unwrap_or_default();
+    let relay_url =
+        take_flag(&mut args, "--relay").or_else(|| std::env::var("OPENDROP_RELAY").ok());
     let config_dir = take_flag(&mut args, "--config")
         .map(PathBuf::from)
         .unwrap_or_else(default_config_dir);
@@ -154,6 +161,9 @@ async fn main() -> ExitCode {
         ["share", "list"] => share_list(&me, &download_dir),
         ["share", "remove", path] => share_remove(&me, &download_dir, path),
         ["unpair", target] => unpair(&me, target),
+        ["relay", "login", email] => relay_login(&me, relay_url.as_deref(), email).await,
+        ["relay", "status"] => relay_status(&me).await,
+        ["relay", "logout"] => relay_logout(&me),
         ["help"] | ["--help"] | ["-h"] => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -162,6 +172,76 @@ async fn main() -> ExitCode {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
         }
+    }
+}
+
+async fn relay_login(me: &Me, url: Option<&str>, email: &str) -> ExitCode {
+    let saved = opendrop::relay::Config::load(&me.config_dir).ok().flatten();
+    let Some(url) = url.map(str::to_owned).or(saved.map(|c| c.url)) else {
+        return fail(
+            "say which relay: opendrop relay login EMAIL --relay https://relay.example.com",
+        );
+    };
+    println!("Signing in to the relay at {url} as {email}...");
+    let result = opendrop::relay::login(&url, email, &me.identity, || {
+        println!("Open the sign-in link sent to {email} (it works for 15 minutes).");
+        println!("Waiting for you to open it...");
+    })
+    .await;
+    match result.and_then(|config| config.save(&me.config_dir).map(|()| config)) {
+        Ok(config) => {
+            println!(
+                "Signed in as {}. \"{}\" is registered and connects whenever `opendrop listen` (or the app) runs.",
+                config.account, me.identity.name
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+async fn relay_status(me: &Me) -> ExitCode {
+    let config = match opendrop::relay::Config::load(&me.config_dir) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            println!(
+                "Not signed in to a relay (the relay is off). Sign in with `opendrop relay login`."
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => return fail(&e.to_string()),
+    };
+    println!("Relay {} as {}", config.url, config.account);
+    match opendrop::relay::devices(&config).await {
+        Ok(devices) => {
+            for d in devices {
+                let me_mark = if d.device_id == me.identity.id {
+                    " (this device)"
+                } else {
+                    ""
+                };
+                let state = if d.online { "online" } else { "offline" };
+                println!("  {state:7}  \"{}\" ({}){me_mark}", d.name, d.device_id);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+fn relay_logout(me: &Me) -> ExitCode {
+    match opendrop::relay::Config::remove(&me.config_dir) {
+        Ok(true) => {
+            println!(
+                "Signed out. This device no longer uses the relay (restart `opendrop listen` if it's running)."
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("Not signed in to a relay.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
     }
 }
 
@@ -191,8 +271,16 @@ async fn listen(
     } else {
         Approval::Ask(file_prompts)
     };
+    let relay = match opendrop::relay::Config::load(&config_dir) {
+        Ok(relay) => relay,
+        Err(e) => {
+            eprintln!("warning: {e}; not using the relay");
+            None
+        }
+    };
     let daemon = match Daemon::start(daemon::Options {
         port,
+        relay,
         paired: Arc::clone(&paired),
         pair_prompts: Some(pair_prompts),
         audit: Arc::new(opendrop::audit::AuditLog::open(&config_dir)),
@@ -232,6 +320,29 @@ async fn listen(
         println!("Accepting every incoming file without asking (--auto-accept).");
     } else {
         println!("You'll be asked before any incoming file is saved.");
+    }
+    if let Some(mut status) = daemon.relay_status() {
+        tokio::spawn(async move {
+            let mut last = None;
+            loop {
+                let now = status.borrow_and_update().clone();
+                // Retries repeat the same error; say it once.
+                let line = match &now {
+                    opendrop::relay::Status::Connecting => None,
+                    opendrop::relay::Status::Online => Some("Relay: online".to_owned()),
+                    opendrop::relay::Status::Offline { error } => {
+                        Some(format!("Relay: offline ({error}); retrying"))
+                    }
+                };
+                if line.is_some() && line != last {
+                    println!("{}", line.as_deref().unwrap_or_default());
+                    last = line;
+                }
+                if status.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
     }
     match paired.list().len() {
         0 => println!("No paired devices yet; others can pair with `opendrop pair`."),

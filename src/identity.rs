@@ -154,7 +154,7 @@ pub fn random_bytes() -> [u8; 32] {
 /// Create `path` holding `bytes`, readable only by this user. Fails if the
 /// file already exists, so two processes starting at once can't both write
 /// a key.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
