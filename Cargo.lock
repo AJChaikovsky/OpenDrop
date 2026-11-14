@@ -3111,8 +3111,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "chacha20poly1305",
  "futures-util",
  "opendrop",
+ "rmcp",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3732,21 +3734,30 @@ version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8be15815186873ea063bf005011d16c356804973489e40c39116ae3a2878d1f"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
  "indexmap 2.14.2",
  "libc",
  "pastey",
  "pin-project-lite",
+ "rand 0.10.3",
+ "reqwest",
  "rmcp-macros",
  "schemars 1.2.3",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
  "uuid",
 ]
@@ -4339,6 +4350,19 @@ checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
 dependencies = [
  "cc",
  "rsqlite-vfs",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

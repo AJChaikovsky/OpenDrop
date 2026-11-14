@@ -10,6 +10,8 @@
 //! `opendrop::relay::proto`); the only other routes are the sign-in link a
 //! person opens in a browser and a health check.
 
+pub mod inbox;
+pub mod mcp;
 pub mod store;
 
 use axum::Router;
@@ -20,7 +22,8 @@ use axum::routing::get;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use opendrop::relay::proto::{ClientMsg, DeviceStatus, ServerMsg, codes};
-use opendrop::relay::proto::{hello_message, register_message};
+use opendrop::relay::proto::{hello_message, register_message, upload_message};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,6 +45,27 @@ impl Mailer for LogMailer {
     }
 }
 
+/// What time it is, in milliseconds since the Unix epoch. Tests pass a
+/// fake clock to check expiry without waiting a day.
+#[derive(Clone)]
+pub struct Clock(pub Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl Clock {
+    pub fn system() -> Self {
+        Self(Arc::new(store::now_ms))
+    }
+
+    pub fn now(&self) -> u64 {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Clock({})", self.now())
+    }
+}
+
 /// Timings and addresses. Tests shorten the timings.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -57,6 +81,8 @@ pub struct Config {
     pub request_timeout: Duration,
     /// Sign-in links one email address may request per 15 minutes.
     pub logins_per_window: usize,
+    /// Used for inbox expiry.
+    pub clock: Clock,
 }
 
 impl Config {
@@ -67,12 +93,14 @@ impl Config {
             idle_timeout: Duration::from_secs(25),
             request_timeout: Duration::from_secs(15),
             logins_per_window: 5,
+            clock: Clock::system(),
         }
     }
 }
 
 pub struct Relay {
     store: Store,
+    blobs: inbox::Blobs,
     mailer: Box<dyn Mailer>,
     config: Config,
     /// Connections per online device id.
@@ -84,15 +112,46 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub fn new(store: Store, mailer: Box<dyn Mailer>, config: Config) -> Arc<Self> {
+    pub fn new(
+        store: Store,
+        blobs: inbox::Blobs,
+        mailer: Box<dyn Mailer>,
+        config: Config,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
+            blobs,
             mailer,
             config,
             online: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             recent_logins: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn now(&self) -> u64 {
+        self.config.clock.now()
+    }
+
+    /// Delete files that expired, rows and blobs. Returns how many.
+    pub fn expire_inbox(&self) -> usize {
+        match self.store.expire_inbox(self.now()) {
+            Ok(ids) => {
+                for id in &ids {
+                    self.blobs.delete(id);
+                }
+                ids.len()
+            }
+            Err(e) => {
+                eprintln!("inbox cleanup: {e}");
+                0
+            }
+        }
+    }
+
+    /// The raw stored bytes of an inbox file (tests check they're sealed).
+    pub fn sealed_blob(&self, inbox_id: &str) -> Option<Vec<u8>> {
+        self.blobs.sealed(inbox_id)
     }
 
     pub fn is_online(&self, device_id: &str) -> bool {
@@ -130,11 +189,26 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/v1/ws", get(ws))
         .route("/v1/login/verify", get(verify))
         .route("/healthz", get(|| async { "ok" }))
+        .nest("/mcp", mcp::router(Arc::clone(&relay)))
         .with_state(relay)
 }
 
-/// Serve on `listener` until the task is dropped.
+/// Serve on `listener` until the task is dropped. Expired inbox files are
+/// swept every minute (and are never served once expired, sweep or not).
 pub async fn serve(listener: tokio::net::TcpListener, relay: Arc<Relay>) -> std::io::Result<()> {
+    let sweeper = Arc::downgrade(&relay);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match sweeper.upgrade() {
+                Some(relay) => {
+                    relay.expire_inbox();
+                }
+                None => return,
+            }
+        }
+    });
     axum::serve(listener, router(relay)).await
 }
 
@@ -286,8 +360,167 @@ async fn handle(relay: Arc<Relay>, mut socket: WebSocket) -> Done {
                 device_id,
                 signature,
             } => return hello(&relay, socket, &nonce, &device_id, &signature).await,
+            ClientMsg::InboxUpload {
+                device_id,
+                name,
+                size,
+                sha256,
+                signature,
+            } => {
+                upload(
+                    &relay,
+                    &mut socket,
+                    &nonce,
+                    &device_id,
+                    &name,
+                    size,
+                    &sha256,
+                    &signature,
+                )
+                .await?
+            }
+            ClientMsg::CreateToken { session, label } => {
+                let Some((account_id, _)) = relay.store.session_account(&session)? else {
+                    return refuse(&mut socket, codes::BAD_SESSION, "not signed in").await;
+                };
+                let token = random_token();
+                let label: String = label.chars().take(100).collect();
+                relay.store.create_token(account_id, &token, &label)?;
+                send(&mut socket, &ServerMsg::Token { token }).await?;
+            }
+            ClientMsg::RevokeTokens { session } => {
+                let Some((account_id, _)) = relay.store.session_account(&session)? else {
+                    return refuse(&mut socket, codes::BAD_SESSION, "not signed in").await;
+                };
+                let count = relay.store.revoke_tokens(account_id)? as u64;
+                send(&mut socket, &ServerMsg::TokensRevoked { count }).await?;
+            }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload(
+    relay: &Relay,
+    socket: &mut WebSocket,
+    nonce: &[u8],
+    device_id: &str,
+    name: &str,
+    size: u64,
+    sha256: &str,
+    signature: &str,
+) -> Done {
+    let Some(device) = relay.store.device(device_id)? else {
+        return refuse(
+            socket,
+            codes::UNKNOWN_DEVICE,
+            "this device isn't registered; run `opendrop relay login`",
+        )
+        .await;
+    };
+    let Some(sig) = decode_signature(signature) else {
+        return refuse(socket, codes::BAD_REQUEST, "malformed signature").await;
+    };
+    if !opendrop::identity::verify(
+        &device.public_key,
+        &upload_message(device_id, name, size, sha256, nonce),
+        &sig,
+    ) {
+        return refuse(
+            socket,
+            codes::BAD_SIGNATURE,
+            "the device's signature doesn't match its key",
+        )
+        .await;
+    }
+    // Only the base name, and nothing a file system or a chat would trip on.
+    let name: String = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    if name.is_empty() || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return refuse(socket, codes::BAD_REQUEST, "missing file name or SHA-256").await;
+    }
+    if size > inbox::MAX_FILE {
+        return refuse(
+            socket,
+            codes::TOO_LARGE,
+            &format!(
+                "files sent to the assistant can be at most {} MB",
+                inbox::MAX_FILE / 1024 / 1024
+            ),
+        )
+        .await;
+    }
+    let now = relay.now();
+    if relay.store.inbox_usage(device.account_id, now)? + size > inbox::ACCOUNT_QUOTA {
+        return refuse(
+            socket,
+            codes::QUOTA,
+            &format!(
+                "the assistant inbox is full ({} MB); files leave it when read or after 24 hours",
+                inbox::ACCOUNT_QUOTA / 1024 / 1024
+            ),
+        )
+        .await;
+    }
+    send(socket, &ServerMsg::UploadReady).await?;
+    let mut data = Vec::with_capacity(size as usize);
+    while (data.len() as u64) < size {
+        let frame = tokio::time::timeout(relay.config.request_timeout, socket.recv())
+            .await
+            .map_err(|_| "upload stalled".to_owned())?;
+        match frame {
+            Some(Ok(Message::Binary(chunk))) => {
+                if data.len() as u64 + chunk.len() as u64 > size {
+                    return refuse(socket, codes::BAD_UPLOAD, "more data than announced").await;
+                }
+                data.extend_from_slice(&chunk);
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            _ => return Err("upload ended early".to_owned()),
+        }
+    }
+    let digest: String = Sha256::digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !digest.eq_ignore_ascii_case(sha256) {
+        return refuse(
+            socket,
+            codes::BAD_UPLOAD,
+            "the file's SHA-256 doesn't match; nothing was saved",
+        )
+        .await;
+    }
+    let item = inbox::Item {
+        inbox_id: format!("in_{}", &random_token()[..22]),
+        account_id: device.account_id,
+        mime: inbox::mime_for(&name).to_owned(),
+        name,
+        size,
+        sha256: digest,
+        from_device: device.name.clone(),
+        sent_ms: now,
+        expires_ms: now + inbox::TTL_MS,
+    };
+    let wrapped = relay.blobs.put(&item.inbox_id, &data)?;
+    if let Err(e) = relay.store.add_inbox_item(&item, &wrapped) {
+        relay.blobs.delete(&item.inbox_id);
+        return Err(e);
+    }
+    send(
+        socket,
+        &ServerMsg::Uploaded {
+            inbox_id: item.inbox_id,
+            expires_ms: item.expires_ms,
+        },
+    )
+    .await
 }
 
 async fn login(relay: &Relay, socket: &mut WebSocket, email: &str) -> Done {

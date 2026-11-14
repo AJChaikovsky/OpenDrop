@@ -253,6 +253,108 @@ pub async fn devices(config: &Config) -> Result<Vec<DeviceStatus>, BoxError> {
     }
 }
 
+/// Bytes per binary frame when uploading (the relay takes frames up to
+/// 64 KiB).
+const UPLOAD_CHUNK: usize = 32 * 1024;
+
+/// A file that reached the assistant inbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uploaded {
+    pub inbox_id: String,
+    pub sha256: String,
+    pub size: u64,
+    pub expires_ms: u64,
+}
+
+/// Put the file at `path` in the account's assistant inbox, as this device.
+pub async fn upload(
+    config: &Config,
+    identity: &DeviceIdentity,
+    path: &Path,
+) -> Result<Uploaded, BoxError> {
+    use sha2::{Digest, Sha256};
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("{} isn't a file", path.display()))?;
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let size = data.len() as u64;
+    let sha256: String = Sha256::digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut connection = Connection::open(&config.url).await?;
+    let signature = identity.sign(&proto::upload_message(
+        &identity.id,
+        &name,
+        size,
+        &sha256,
+        &connection.nonce,
+    ));
+    connection
+        .send(&ClientMsg::InboxUpload {
+            device_id: identity.id.clone(),
+            name,
+            size,
+            sha256: sha256.clone(),
+            signature: B64.encode(signature),
+        })
+        .await?;
+    match connection.receive(REPLY_TIMEOUT).await? {
+        ServerMsg::UploadReady => {}
+        other => return Err(unexpected(&other)),
+    }
+    for chunk in data.chunks(UPLOAD_CHUNK) {
+        connection
+            .socket
+            .send(Message::binary(chunk.to_vec()))
+            .await?;
+    }
+    match connection.receive(REPLY_TIMEOUT).await? {
+        ServerMsg::Uploaded {
+            inbox_id,
+            expires_ms,
+        } => Ok(Uploaded {
+            inbox_id,
+            sha256,
+            size,
+            expires_ms,
+        }),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// A new token for the hosted MCP server; the relay shows it only once.
+pub async fn create_token(config: &Config, label: &str) -> Result<String, BoxError> {
+    let mut connection = Connection::open(&config.url).await?;
+    connection
+        .send(&ClientMsg::CreateToken {
+            session: config.session.clone(),
+            label: label.to_owned(),
+        })
+        .await?;
+    match connection.receive(REPLY_TIMEOUT).await? {
+        ServerMsg::Token { token } => Ok(token),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Revoke every MCP token of the account; returns how many there were.
+pub async fn revoke_tokens(config: &Config) -> Result<u64, BoxError> {
+    let mut connection = Connection::open(&config.url).await?;
+    connection
+        .send(&ClientMsg::RevokeTokens {
+            session: config.session.clone(),
+        })
+        .await?;
+    match connection.receive(REPLY_TIMEOUT).await? {
+        ServerMsg::TokensRevoked { count } => Ok(count),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Where the device's relay connection stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {

@@ -64,6 +64,11 @@ USAGE:
                                     sign in to a relay (opt-in) so this device shows
                                     online to your other devices from anywhere
     opendrop relay status             your devices on the relay, online or not
+    opendrop send-file --to assistant <FILE>...
+                                    put files in your assistant inbox on the relay
+                                    (read once, or deleted after 24 hours)
+    opendrop relay token              a token for the relay's MCP server (/mcp)
+    opendrop relay revoke-tokens      revoke all of those tokens
     opendrop relay logout             stop using the relay
     opendrop mcp                      MCP server on stdin/stdout for AI assistants
                                     (Claude Code: claude mcp add opendrop -- opendrop mcp);
@@ -149,6 +154,9 @@ async fn main() -> ExitCode {
         ["fetch", device, file] => fetch(&me, device, file, &reason).await,
         ["peers"] => peers(&me, wait).await,
         ["send", target, message] => send(&me, target, message, wait).await,
+        ["send-file", "--to", "assistant", files @ ..] if !files.is_empty() => {
+            send_to_assistant(&me, files).await
+        }
         ["send-file", target, files @ ..] if !files.is_empty() => {
             send_files(&me, target, files, wait).await
         }
@@ -164,6 +172,8 @@ async fn main() -> ExitCode {
         ["relay", "login", email] => relay_login(&me, relay_url.as_deref(), email).await,
         ["relay", "status"] => relay_status(&me).await,
         ["relay", "logout"] => relay_logout(&me),
+        ["relay", "token"] => relay_token(&me).await,
+        ["relay", "revoke-tokens"] => relay_revoke(&me).await,
         ["help"] | ["--help"] | ["-h"] => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -223,6 +233,79 @@ async fn relay_status(me: &Me) -> ExitCode {
                 let state = if d.online { "online" } else { "offline" };
                 println!("  {state:7}  \"{}\" ({}){me_mark}", d.name, d.device_id);
             }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+fn signed_in(me: &Me) -> Result<opendrop::relay::Config, ExitCode> {
+    match opendrop::relay::Config::load(&me.config_dir) {
+        Ok(Some(config)) => Ok(config),
+        Ok(None) => Err(fail(
+            "this device isn't signed in to a relay; run `opendrop relay login EMAIL --relay URL` first",
+        )),
+        Err(e) => Err(fail(&e.to_string())),
+    }
+}
+
+async fn send_to_assistant(me: &Me, files: &[&str]) -> ExitCode {
+    let config = match signed_in(me) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    let mut failed = 0;
+    for file in files {
+        let path = Path::new(file);
+        match opendrop::relay::upload(&config, &me.identity, path).await {
+            Ok(up) => println!(
+                "{file}: in your assistant inbox as {} ({} bytes, SHA-256 {}...). Ask your assistant to read it within 24 hours.",
+                up.inbox_id,
+                up.size,
+                &up.sha256[..12]
+            ),
+            Err(e) => {
+                eprintln!("{file}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+async fn relay_token(me: &Me) -> ExitCode {
+    let config = match signed_in(me) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    match opendrop::relay::create_token(&config, &me.identity.name).await {
+        Ok(token) => {
+            println!(
+                "Token for the hosted MCP server at {}/mcp (shown once; keep it secret):",
+                config.url
+            );
+            println!("{token}");
+            println!(
+                "Use it as \"Authorization: Bearer <token>\". `opendrop relay revoke-tokens` revokes all of them."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+async fn relay_revoke(me: &Me) -> ExitCode {
+    let config = match signed_in(me) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    match opendrop::relay::revoke_tokens(&config).await {
+        Ok(n) => {
+            println!("Revoked {n} token(s).");
             ExitCode::SUCCESS
         }
         Err(e) => fail(&e.to_string()),

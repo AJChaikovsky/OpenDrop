@@ -231,16 +231,21 @@ sending by IP still works.
 
 ## Relay (preview, opt-in)
 
-The relay is the first piece of the "send to my assistant" inbox (Phase 9, option B in
+The relay is the "send to my assistant" inbox (Phase 9, option B in
 [the design doc](docs/design/ai-file-requests.md)). It's off unless you sign in, and the
-local-network sharing above never uses it. Today it only shows which of your devices are
-online from anywhere; the inbox and the claude.ai / ChatGPT connector come next.
+local-network sharing above never uses it. It shows which of your devices are online from
+anywhere, and it holds files you send to your assistant until the assistant reads them. The
+claude.ai / ChatGPT connector (OAuth) comes next; for now any MCP client that can send a
+bearer token works.
 
 Run a relay yourself:
 
 ```bash
-cargo run -p opendrop-relay -- --bind 0.0.0.0:8787 --public-url http://<this machine's IP>:8787
+cargo run -p opendrop-relay -- --bind 0.0.0.0:8787 --data relay-data --public-url http://<this machine's IP>:8787
 ```
+
+`--data` holds the account database (`relay.db`), the inbox master key (`relay.key`) and the
+encrypted inbox files (`inbox/`).
 
 Then on each device:
 
@@ -253,7 +258,27 @@ opendrop relay logout    # stop using the relay
 ```
 
 Devices prove who they are with the same key they use for pairing, so a device can't be
-impersonated on the relay, and the relay never sees file contents in this stage.
+impersonated on the relay.
+
+### Send a file to your assistant
+
+```bash
+opendrop send-file --to assistant report.pdf   # lands in your inbox on the relay
+opendrop relay token                           # a token for the relay's MCP server, shown once
+```
+
+Point an MCP client at `http://<relay IP>:8787/mcp` (Streamable HTTP) with the header
+`Authorization: Bearer <token>`. It gets three tools: `list_inbox`, `get_inbox_file` and
+`delete_inbox_file`. For example, with the MCP Inspector:
+
+```bash
+npx @modelcontextprotocol/inspector --cli http://<relay IP>:8787/mcp --transport http \
+  --header "Authorization: Bearer <token>" --method tools/call --tool-name list_inbox
+```
+
+Inbox files are encrypted at rest, each with its own key. A file is deleted as soon as it's
+read, and after 24 hours if it never is. Files can be up to 25 MB, with up to 100 MB waiting
+per account. `opendrop relay revoke-tokens` revokes every token you've made.
 
 ## Use it from an AI assistant (MCP)
 
