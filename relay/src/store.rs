@@ -88,6 +88,25 @@ impl Store {
                  name TEXT NOT NULL,
                  public_key BLOB NOT NULL,
                  last_seen_ms INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS api_tokens (
+                 token_hash BLOB PRIMARY KEY,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id),
+                 label TEXT NOT NULL,
+                 created_ms INTEGER NOT NULL,
+                 revoked INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS inbox (
+                 inbox_id TEXT PRIMARY KEY,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id),
+                 name TEXT NOT NULL,
+                 size INTEGER NOT NULL,
+                 mime TEXT NOT NULL,
+                 sha256 TEXT NOT NULL,
+                 from_device TEXT NOT NULL,
+                 sent_ms INTEGER NOT NULL,
+                 expires_ms INTEGER NOT NULL,
+                 file_key BLOB NOT NULL
              );",
         )
         .map_err(err)?;
@@ -268,6 +287,168 @@ impl Store {
             .map_err(err)?;
         Ok(())
     }
+}
+
+impl Store {
+    /// A token for the hosted MCP server, until OAuth (B3) replaces it.
+    pub fn create_token(&self, account_id: i64, token: &str, label: &str) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO api_tokens (token_hash, account_id, label, created_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![hash(token), account_id, label, now_ms() as i64],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// The account a (not revoked) token belongs to.
+    pub fn token_account(&self, token: &str) -> Result<Option<i64>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT account_id FROM api_tokens WHERE token_hash = ?1 AND revoked = 0",
+                params![hash(token)],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// Revoke every token of the account; returns how many.
+    pub fn revoke_tokens(&self, account_id: i64) -> Result<usize> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE api_tokens SET revoked = 1 WHERE account_id = ?1 AND revoked = 0",
+                params![account_id],
+            )
+            .map_err(err)
+    }
+
+    pub fn add_inbox_item(&self, item: &crate::inbox::Item, file_key: &[u8]) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO inbox (inbox_id, account_id, name, size, mime, sha256, from_device,
+                                    sent_ms, expires_ms, file_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    item.inbox_id,
+                    item.account_id,
+                    item.name,
+                    item.size as i64,
+                    item.mime,
+                    item.sha256,
+                    item.from_device,
+                    item.sent_ms as i64,
+                    item.expires_ms as i64,
+                    file_key
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// The account's files that haven't expired at `now`, newest first.
+    pub fn inbox(&self, account_id: i64, now: u64) -> Result<Vec<crate::inbox::Item>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db
+            .prepare(
+                "SELECT inbox_id, account_id, name, size, mime, sha256, from_device, sent_ms, expires_ms
+                 FROM inbox WHERE account_id = ?1 AND expires_ms > ?2 ORDER BY sent_ms DESC, rowid DESC",
+            )
+            .map_err(err)?;
+        let rows = stmt
+            .query_map(params![account_id, now as i64], row_to_item)
+            .map_err(err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(err)?;
+        Ok(rows)
+    }
+
+    /// One of the account's files with its wrapped key, if it hasn't
+    /// expired. Another account's id finds nothing.
+    pub fn inbox_item(
+        &self,
+        account_id: i64,
+        inbox_id: &str,
+        now: u64,
+    ) -> Result<Option<(crate::inbox::Item, Vec<u8>)>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT inbox_id, account_id, name, size, mime, sha256, from_device, sent_ms, expires_ms,
+                        file_key
+                 FROM inbox WHERE account_id = ?1 AND inbox_id = ?2 AND expires_ms > ?3",
+                params![account_id, inbox_id, now as i64],
+                |r| Ok((row_to_item(r)?, r.get(9)?)),
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// Remove one file's row; true if it was there.
+    pub fn remove_inbox_item(&self, inbox_id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM inbox WHERE inbox_id = ?1", params![inbox_id])
+            .map_err(err)?
+            > 0)
+    }
+
+    /// Remove expired rows; returns their ids so the blobs go too.
+    pub fn expire_inbox(&self, now: u64) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let ids = db
+            .prepare("SELECT inbox_id FROM inbox WHERE expires_ms <= ?1")
+            .map_err(err)?
+            .query_map(params![now as i64], |r| r.get(0))
+            .map_err(err)?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(err)?;
+        db.execute(
+            "DELETE FROM inbox WHERE expires_ms <= ?1",
+            params![now as i64],
+        )
+        .map_err(err)?;
+        Ok(ids)
+    }
+
+    /// Bytes the account has waiting at `now`.
+    pub fn inbox_usage(&self, account_id: i64, now: u64) -> Result<u64> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM inbox WHERE account_id = ?1 AND expires_ms > ?2",
+                params![account_id, now as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .map_err(err)
+    }
+}
+
+fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::inbox::Item> {
+    Ok(crate::inbox::Item {
+        inbox_id: r.get(0)?,
+        account_id: r.get(1)?,
+        name: r.get(2)?,
+        size: r.get::<_, i64>(3)? as u64,
+        mime: r.get(4)?,
+        sha256: r.get(5)?,
+        from_device: r.get(6)?,
+        sent_ms: r.get::<_, i64>(7)? as u64,
+        expires_ms: r.get::<_, i64>(8)? as u64,
+    })
 }
 
 fn row_to_device(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
