@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod network;
 pub mod pairing;
 pub mod protocol;
+pub mod relay;
 pub mod share;
 pub mod transfer;
 

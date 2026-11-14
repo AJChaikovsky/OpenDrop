@@ -229,6 +229,32 @@ prompt the first time; on Windows allow it in the Defender dialog). If `peers` f
 the network may block multicast (common on guest and corporate Wi-Fi, and with some VPNs);
 sending by IP still works.
 
+## Relay (preview, opt-in)
+
+The relay is the first piece of the "send to my assistant" inbox (Phase 9, option B in
+[the design doc](docs/design/ai-file-requests.md)). It's off unless you sign in, and the
+local-network sharing above never uses it. Today it only shows which of your devices are
+online from anywhere; the inbox and the claude.ai / ChatGPT connector come next.
+
+Run a relay yourself:
+
+```bash
+cargo run -p opendrop-relay -- --bind 0.0.0.0:8787 --public-url http://<this machine's IP>:8787
+```
+
+Then on each device:
+
+```bash
+opendrop relay login you@example.com --relay http://<relay IP>:8787
+# open the sign-in link (for now the relay prints it in its own window instead of emailing it)
+opendrop listen          # stays connected to the relay while it runs
+opendrop relay status    # your devices, online or offline
+opendrop relay logout    # stop using the relay
+```
+
+Devices prove who they are with the same key they use for pairing, so a device can't be
+impersonated on the relay, and the relay never sees file contents in this stage.
+
 ## Use it from an AI assistant (MCP)
 
 `opendrop mcp` lets Claude Code, Claude Desktop or any other MCP client get files from your
