@@ -30,6 +30,20 @@ pub enum ServerMsg {
     Welcome {
         account: String,
     },
+    /// Send the file now, as binary frames.
+    UploadReady,
+    /// The file is in the assistant inbox.
+    Uploaded {
+        inbox_id: String,
+        expires_ms: u64,
+    },
+    /// A new token for the hosted MCP server (shown once).
+    Token {
+        token: String,
+    },
+    TokensRevoked {
+        count: u64,
+    },
     /// The request was refused; the relay closes the connection after this.
     Error {
         code: String,
@@ -64,6 +78,25 @@ pub enum ClientMsg {
         device_id: String,
         signature: String,
     },
+    /// Put a file in the account's assistant inbox. `sha256` is hex;
+    /// `signature` covers [`upload_message`]. After `upload_ready` the
+    /// device sends exactly `size` bytes as binary frames.
+    InboxUpload {
+        device_id: String,
+        name: String,
+        size: u64,
+        sha256: String,
+        signature: String,
+    },
+    /// Make a token the assistant connector can use (until OAuth, in B3).
+    CreateToken {
+        session: String,
+        label: String,
+    },
+    /// Revoke all of the account's connector tokens.
+    RevokeTokens {
+        session: String,
+    },
 }
 
 /// One of the account's devices.
@@ -86,6 +119,9 @@ pub mod codes {
     pub const DEVICE_TAKEN: &str = "device_taken";
     pub const LOGIN_EXPIRED: &str = "login_expired";
     pub const RATE_LIMITED: &str = "rate_limited";
+    pub const TOO_LARGE: &str = "too_large";
+    pub const QUOTA: &str = "quota";
+    pub const BAD_UPLOAD: &str = "bad_upload";
 }
 
 /// What a device signs to register to `account` on the connection whose
@@ -106,6 +142,24 @@ pub fn hello_message(device_id: &str, nonce: &[u8]) -> Vec<u8> {
     let mut m = b"opendrop-relay-hello\0".to_vec();
     m.extend_from_slice(device_id.as_bytes());
     m.push(0);
+    m.extend_from_slice(nonce);
+    m
+}
+
+/// What a device signs to put a file in its account's inbox, on the
+/// connection whose challenge was `nonce`.
+pub fn upload_message(
+    device_id: &str,
+    name: &str,
+    size: u64,
+    sha256: &str,
+    nonce: &[u8],
+) -> Vec<u8> {
+    let mut m = b"opendrop-relay-upload\0".to_vec();
+    for part in [device_id, name, &size.to_string(), sha256] {
+        m.extend_from_slice(part.as_bytes());
+        m.push(0);
+    }
     m.extend_from_slice(nonce);
     m
 }

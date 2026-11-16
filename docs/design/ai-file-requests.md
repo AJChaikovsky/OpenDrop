@@ -314,7 +314,8 @@ Pieces:
 
 - **Relay service** (new, Rust, `opendrop-relay` crate in the same workspace). Axum + Tokio,
   Postgres for accounts and device registry, S3-compatible object storage for inbox blobs.
-  Small enough to run on one container.
+  Small enough to run on one container. (B1 and B2 use SQLite and a local folder of encrypted
+  blobs instead; the hosting choice before B3 decides whether to move.)
 - **Device gateway.** Daemons that opt in keep one outbound WebSocket to the relay, since home
   and phone networks sit behind NAT. Devices authenticate with the same key pair Phase 4
   pairing uses; the relay only learns public keys.

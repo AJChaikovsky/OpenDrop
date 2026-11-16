@@ -53,7 +53,12 @@ async fn start_relay() -> TestRelay {
         idle_timeout: Duration::from_millis(800),
         ..Config::new(&url)
     };
-    let relay = Relay::new(Store::in_memory().unwrap(), Box::new(inbox.clone()), config);
+    let relay = Relay::new(
+        Store::in_memory().unwrap(),
+        opendrop_relay::inbox::Blobs::in_memory(),
+        Box::new(inbox.clone()),
+        config,
+    );
     tokio::spawn(opendrop_relay::serve(listener, Arc::clone(&relay)));
     TestRelay { url, relay, inbox }
 }
