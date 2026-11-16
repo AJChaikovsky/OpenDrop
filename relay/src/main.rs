@@ -14,7 +14,9 @@ USAGE:
     --data DIR         where accounts, devices and the encrypted inbox are kept
                        (default relay-data)
     --public-url URL   how devices and browsers reach this relay, used in sign-in
-                       links (default http://<bind address>)
+                       links (default $OPENDROP_RELAY_PUBLIC_URL, else
+                       https://$FLY_APP_NAME.fly.dev on Fly.io, else
+                       http://<bind address>)
 
 Sign-in links are printed here rather than emailed. The hosted MCP server for
 assistants is at <public URL>/mcp (needs a token from `opendrop relay token`).";
@@ -70,7 +72,15 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let public_url = public_url.unwrap_or_else(|| format!("http://{bind}"));
+    let public_url = public_url
+        .or_else(|| std::env::var("OPENDROP_RELAY_PUBLIC_URL").ok())
+        .or_else(|| {
+            // Fly.io sets FLY_APP_NAME; its HTTPS address follows from it.
+            std::env::var("FLY_APP_NAME")
+                .ok()
+                .map(|app| format!("https://{app}.fly.dev"))
+        })
+        .unwrap_or_else(|| format!("http://{bind}"));
     println!("OpenDrop relay listening on {bind}, reachable as {public_url}");
     let relay = Relay::new(store, blobs, Box::new(LogMailer), Config::new(public_url));
     match serve(listener, relay).await {
