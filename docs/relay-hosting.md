@@ -7,6 +7,10 @@ one machine with a 1 GB volume mounted at `/data`. Fly gives it HTTPS at
 `https://<app>.fly.dev`, which is what claude.ai and ChatGPT need to reach
 the hosted MCP server at `/mcp`.
 
+OpenDrop's own relay runs as the Fly app `opendrop-relay-aj` at
+`https://opendrop-relay-aj.fly.dev` (`opendrop-relay` was taken). The
+commands below use `opendrop-relay`; swap in your app's name.
+
 The files: `relay/Dockerfile` (multi-stage Rust build, about 128 MB image)
 and `fly.toml` at the repo root.
 

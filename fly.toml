@@ -1,7 +1,7 @@
 # Fly.io config for the OpenDrop relay. See docs/relay-hosting.md.
 # `app` is a placeholder: `fly launch --no-deploy` (or editing it) sets the
 # real name, and the relay's public URL becomes https://<app>.fly.dev.
-app = "opendrop-relay"
+app = "opendrop-relay-aj"
 primary_region = "sjc"
 
 [build]

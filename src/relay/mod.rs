@@ -112,6 +112,12 @@ pub fn ws_url(base: &str) -> Result<String, BoxError> {
     Ok(format!("{rest}/v1/ws"))
 }
 
+/// rustls needs a process-wide crypto backend before any `wss://`
+/// connection, or it panics. Installing it twice is harmless.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// One connection to the relay, past its challenge.
 struct Connection {
     socket: Socket,
@@ -121,6 +127,7 @@ struct Connection {
 impl Connection {
     async fn open(base: &str) -> Result<Self, BoxError> {
         let url = ws_url(base)?;
+        install_crypto_provider();
         let (socket, _) =
             tokio::time::timeout(REPLY_TIMEOUT, tokio_tungstenite::connect_async(&url))
                 .await
@@ -421,6 +428,23 @@ async fn stay_connected(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `wss://` relay must fail with an error, never panic for want of a
+    /// rustls crypto provider (as the first Fly.io deploy found).
+    #[tokio::test]
+    async fn https_relays_fail_cleanly_instead_of_panicking() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept and hang up: the TLS handshake can't succeed.
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let result = Connection::open(&format!("https://127.0.0.1:{port}")).await;
+        let error = result.err().expect("no TLS server there").to_string();
+        assert!(error.contains("cannot reach the relay"), "{error}");
+    }
 
     #[test]
     fn relay_addresses_become_websocket_urls() {
