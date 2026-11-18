@@ -261,10 +261,10 @@ pub fn run() {
             let download_dir = std::env::var_os("OPENDROP_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
-                    app.path()
-                        .download_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("OpenDrop")
+                    opendrop::paths::default_download_dir(
+                        app.path().download_dir().ok(),
+                        app.path().home_dir().ok().as_deref(),
+                    )
                 });
             let name = std::env::var("OPENDROP_NAME").unwrap_or_else(|_| default_device_name());
             let config_dir = default_config_dir();

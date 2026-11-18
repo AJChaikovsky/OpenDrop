@@ -1295,11 +1295,7 @@ fn preview(text: &str) -> String {
 }
 
 fn default_download_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE")) // Windows
-        .map(|home| PathBuf::from(home).join("Downloads"))
-        .unwrap_or_default()
-        .join("OpenDrop")
+    opendrop::paths::default_download_dir(None, opendrop::paths::home_dir().as_deref())
 }
 
 /// The address the OS would use for outbound traffic, for when no adapter
