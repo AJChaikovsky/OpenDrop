@@ -14,6 +14,9 @@ pub type Result<T> = std::result::Result<T, String>;
 /// How long a sign-in link works.
 pub const LOGIN_TTL_MS: u64 = 15 * 60 * 1000;
 
+/// How long an OAuth authorization code works.
+pub const OAUTH_CODE_TTL_MS: u64 = 10 * 60 * 1000;
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -107,6 +110,35 @@ impl Store {
                  sent_ms INTEGER NOT NULL,
                  expires_ms INTEGER NOT NULL,
                  file_key BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS oauth_clients (
+                 client_id TEXT PRIMARY KEY,
+                 client_name TEXT NOT NULL,
+                 redirect_uris TEXT NOT NULL,
+                 created_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS oauth_requests (
+                 token_hash BLOB PRIMARY KEY,
+                 grant_json TEXT NOT NULL,
+                 email TEXT NOT NULL,
+                 created_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS oauth_codes (
+                 code_hash BLOB PRIMARY KEY,
+                 grant_json TEXT NOT NULL,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id),
+                 created_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS oauth_tokens (
+                 token_hash BLOB PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 family TEXT NOT NULL,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id),
+                 client_id TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 resource TEXT NOT NULL,
+                 expires_ms INTEGER NOT NULL,
+                 revoked INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(err)?;
@@ -317,16 +349,23 @@ impl Store {
             .map_err(err)
     }
 
-    /// Revoke every token of the account; returns how many.
+    /// Revoke every token of the account, `relay token` ones and OAuth
+    /// ones (access and refresh); returns how many.
     pub fn revoke_tokens(&self, account_id: i64) -> Result<usize> {
-        self.db
-            .lock()
-            .unwrap()
+        let db = self.db.lock().unwrap();
+        let api = db
             .execute(
                 "UPDATE api_tokens SET revoked = 1 WHERE account_id = ?1 AND revoked = 0",
                 params![account_id],
             )
-            .map_err(err)
+            .map_err(err)?;
+        let oauth = db
+            .execute(
+                "UPDATE oauth_tokens SET revoked = 1 WHERE account_id = ?1 AND revoked = 0",
+                params![account_id],
+            )
+            .map_err(err)?;
+        Ok(api + oauth)
     }
 
     pub fn add_inbox_item(&self, item: &crate::inbox::Item, file_key: &[u8]) -> Result<()> {
@@ -434,6 +473,241 @@ impl Store {
             )
             .map(|n| n as u64)
             .map_err(err)
+    }
+}
+
+/// An OAuth token as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthToken {
+    pub kind: String,
+    pub family: String,
+    pub account_id: i64,
+    pub client_id: String,
+    pub scope: String,
+    pub resource: String,
+    pub expires_ms: u64,
+    pub revoked: bool,
+}
+
+/// OAuth state (stage B3). Grants are kept as JSON so the OAuth module owns
+/// their shape; codes and tokens are stored hashed, like everything secret.
+impl Store {
+    pub fn add_oauth_client(
+        &self,
+        client_id: &str,
+        client_name: &str,
+        redirect_uris: &[String],
+        now: u64,
+    ) -> Result<()> {
+        let uris = serde_json::to_string(redirect_uris).map_err(|e| e.to_string())?;
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![client_id, client_name, uris, now as i64],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `(client_name, redirect_uris)` of a registered client.
+    pub fn oauth_client(&self, client_id: &str) -> Result<Option<(String, Vec<String>)>> {
+        let row: Option<(String, String)> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
+                params![client_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        Ok(row.map(|(name, uris)| (name, serde_json::from_str(&uris).unwrap_or_default())))
+    }
+
+    /// An authorization waiting for `email`'s owner to open the link with `token`.
+    pub fn add_oauth_request(&self, token: &str, grant: &str, email: &str, now: u64) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "DELETE FROM oauth_requests WHERE created_ms < ?1",
+            params![now.saturating_sub(LOGIN_TTL_MS) as i64],
+        )
+        .map_err(err)?;
+        db.execute(
+            "INSERT INTO oauth_requests (token_hash, grant_json, email, created_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![hash(token), grant, email, now as i64],
+        )
+        .map_err(err)?;
+        Ok(())
+    }
+
+    /// `(grant, email)` of a pending request still within its 15 minutes.
+    pub fn oauth_request(&self, token: &str, now: u64) -> Result<Option<(String, String)>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT grant_json, email FROM oauth_requests
+                 WHERE token_hash = ?1 AND created_ms >= ?2",
+                params![hash(token), now.saturating_sub(LOGIN_TTL_MS) as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// Use up a pending request: `(grant, account id)`, creating the
+    /// email's account if it's new (opening the link proved the address).
+    pub fn take_oauth_request(&self, token: &str, now: u64) -> Result<Option<(String, i64)>> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(err)?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT grant_json, email FROM oauth_requests
+                 WHERE token_hash = ?1 AND created_ms >= ?2",
+                params![hash(token), now.saturating_sub(LOGIN_TTL_MS) as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        let Some((grant, email)) = row else {
+            return Ok(None);
+        };
+        tx.execute(
+            "DELETE FROM oauth_requests WHERE token_hash = ?1",
+            params![hash(token)],
+        )
+        .map_err(err)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO accounts (email, created_ms) VALUES (?1, ?2)",
+            params![email, now as i64],
+        )
+        .map_err(err)?;
+        let account_id: i64 = tx
+            .query_row(
+                "SELECT id FROM accounts WHERE email = ?1",
+                params![email],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(Some((grant, account_id)))
+    }
+
+    pub fn add_oauth_code(&self, code: &str, grant: &str, account_id: i64, now: u64) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "DELETE FROM oauth_codes WHERE created_ms < ?1",
+            params![now.saturating_sub(OAUTH_CODE_TTL_MS) as i64],
+        )
+        .map_err(err)?;
+        db.execute(
+            "INSERT INTO oauth_codes (code_hash, grant_json, account_id, created_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![hash(code), grant, account_id, now as i64],
+        )
+        .map_err(err)?;
+        Ok(())
+    }
+
+    /// Use up an authorization code (valid once, for 10 minutes):
+    /// `(grant, account id)`.
+    pub fn take_oauth_code(&self, code: &str, now: u64) -> Result<Option<(String, i64)>> {
+        let db = self.db.lock().unwrap();
+        let row: Option<(String, i64, i64)> = db
+            .query_row(
+                "SELECT grant_json, account_id, created_ms FROM oauth_codes WHERE code_hash = ?1",
+                params![hash(code)],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        db.execute(
+            "DELETE FROM oauth_codes WHERE code_hash = ?1",
+            params![hash(code)],
+        )
+        .map_err(err)?;
+        Ok(row.and_then(|(grant, account, created)| {
+            (now.saturating_sub(created as u64) <= OAUTH_CODE_TTL_MS).then_some((grant, account))
+        }))
+    }
+
+    pub fn add_oauth_token(&self, token: &str, t: &OAuthToken) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO oauth_tokens
+                 (token_hash, kind, family, account_id, client_id, scope, resource, expires_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    hash(token),
+                    t.kind,
+                    t.family,
+                    t.account_id,
+                    t.client_id,
+                    t.scope,
+                    t.resource,
+                    t.expires_ms as i64
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    pub fn oauth_token(&self, token: &str) -> Result<Option<OAuthToken>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT kind, family, account_id, client_id, scope, resource, expires_ms, revoked
+                 FROM oauth_tokens WHERE token_hash = ?1",
+                params![hash(token)],
+                |r| {
+                    Ok(OAuthToken {
+                        kind: r.get(0)?,
+                        family: r.get(1)?,
+                        account_id: r.get(2)?,
+                        client_id: r.get(3)?,
+                        scope: r.get(4)?,
+                        resource: r.get(5)?,
+                        expires_ms: r.get::<_, i64>(6)? as u64,
+                        revoked: r.get::<_, i64>(7)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    pub fn revoke_oauth_token(&self, token: &str) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ?1",
+                params![hash(token)],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Revoke every token issued from one authorization (after a refresh
+    /// token was replayed, which means it leaked).
+    pub fn revoke_oauth_family(&self, family: &str) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE oauth_tokens SET revoked = 1 WHERE family = ?1",
+                params![family],
+            )
+            .map_err(err)?;
+        Ok(())
     }
 }
 

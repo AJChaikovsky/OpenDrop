@@ -237,8 +237,7 @@ The relay is the "send to my assistant" inbox (Phase 9, option B in
 [the design doc](docs/design/ai-file-requests.md)). It's off unless you sign in, and the
 local-network sharing above never uses it. It shows which of your devices are online from
 anywhere, and it holds files you send to your assistant until the assistant reads them. The
-claude.ai / ChatGPT connector (OAuth) comes next; for now any MCP client that can send a
-bearer token works.
+assistant connects to it as a claude.ai connector or a ChatGPT app, with OAuth.
 
 Run a relay yourself:
 
@@ -282,7 +281,22 @@ npx @modelcontextprotocol/inspector --cli http://<relay IP>:8787/mcp --transport
 
 Inbox files are encrypted at rest, each with its own key. A file is deleted as soon as it's
 read, and after 24 hours if it never is. Files can be up to 25 MB, with up to 100 MB waiting
-per account. `opendrop relay revoke-tokens` revokes every token you've made.
+per account. `opendrop relay revoke-tokens` revokes every token you've made, and every
+assistant you've connected.
+
+### Connect claude.ai or ChatGPT
+
+The relay is an OAuth 2.1 server for its own MCP endpoint, so assistants connect without a
+token from you. This needs the relay on public HTTPS ([docs/relay-hosting.md](docs/relay-hosting.md)).
+
+- **claude.ai:** Settings > Connectors > Add custom connector, with the URL
+  `https://<your relay>/mcp`.
+- **ChatGPT:** turn on developer mode (Settings > Apps > Advanced), then create an app with
+  the same URL and OAuth authentication.
+
+Connecting opens the relay's page: enter your OpenDrop email, open the sign-in link it sends
+(for now it's in the relay's log), and press Allow. Then send a file with
+`opendrop send-file --to assistant` and ask the assistant about it.
 
 ## Use it from an AI assistant (MCP)
 

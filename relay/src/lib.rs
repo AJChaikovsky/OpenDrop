@@ -12,6 +12,7 @@
 
 pub mod inbox;
 pub mod mcp;
+pub mod oauth;
 pub mod store;
 
 use axum::Router;
@@ -190,6 +191,7 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/v1/login/verify", get(verify))
         .route("/healthz", get(|| async { "ok" }))
         .nest("/mcp", mcp::router(Arc::clone(&relay)))
+        .merge(oauth::router())
         .with_state(relay)
 }
 
