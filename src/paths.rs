@@ -38,8 +38,10 @@ mod tests {
     /// app saved into `./OpenDrop`, relative to wherever it was launched.
     #[test]
     fn falls_back_to_home_downloads_not_the_working_directory() {
-        let dir = default_download_dir(None, Some(Path::new("/home/a")));
-        assert_eq!(dir, PathBuf::from("/home/a/Downloads/OpenDrop"));
+        // An absolute home on every OS (`/home/a` isn't absolute on Windows).
+        let home = std::env::temp_dir();
+        let dir = default_download_dir(None, Some(&home));
+        assert_eq!(dir, home.join("Downloads").join("OpenDrop"));
         assert!(dir.is_absolute());
     }
 
