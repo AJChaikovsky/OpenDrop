@@ -254,7 +254,7 @@ Then on each device:
 
 ```bash
 opendrop relay login you@example.com --relay http://<relay IP>:8787
-# open the sign-in link (for now the relay prints it in its own window instead of emailing it)
+# open the sign-in link from your email (a relay without an email key prints it in its log)
 opendrop listen          # stays connected to the relay while it runs
 opendrop relay status    # your devices, online or offline
 opendrop relay logout    # stop using the relay
@@ -295,7 +295,7 @@ token from you. This needs the relay on public HTTPS ([docs/relay-hosting.md](do
   the same URL and OAuth authentication.
 
 Connecting opens the relay's page: enter your OpenDrop email, open the sign-in link it sends
-(for now it's in the relay's log), and press Allow. Then send a file with
+(by email, or in the relay's log if it has no email key), and press Allow. Then send a file with
 `opendrop send-file --to assistant` and ask the assistant about it.
 
 ## Use it from an AI assistant (MCP)

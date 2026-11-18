@@ -10,6 +10,7 @@
 //! `opendrop::relay::proto`); the only other routes are the sign-in link a
 //! person opens in a browser and a health check.
 
+pub mod email;
 pub mod inbox;
 pub mod mcp;
 pub mod oauth;

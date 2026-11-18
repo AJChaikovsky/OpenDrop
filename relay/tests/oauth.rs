@@ -68,6 +68,7 @@ async fn start_relay() -> TestRelay {
         config,
     );
     tokio::spawn(opendrop_relay::serve(listener, relay));
+    opendrop_relay::email::install_crypto_provider();
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()

@@ -10,7 +10,9 @@ base64 = "0.22"
 chacha20poly1305 = "0.11.0"
 opendrop = { path = ".." }
 rmcp = { version = "3.8.0", features = ["server", "macros", "transport-streamable-http-server"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "http2"] }
 rusqlite = { version = "0.42", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
@@ -21,4 +23,3 @@ rmcp = { version = "3.8.0", features = ["client", "transport-streamable-http-cli
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
-reqwest = { version = "0.13", default-features = false }
