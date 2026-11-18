@@ -63,23 +63,49 @@ impl Listener {
 
     /// Wait up to 10 s for a line containing `text`; returns it.
     fn wait_for(&mut self, text: &str) -> String {
+        self.try_wait_for(text).unwrap_or_else(|| {
+            panic!(
+                "never saw {text:?}; output so far:\n{}",
+                self.seen.join("\n")
+            )
+        })
+    }
+
+    /// Like `wait_for`, but `None` after 10 s without the line.
+    fn try_wait_for(&mut self, text: &str) -> Option<String> {
         if let Some(line) = self.seen.iter().find(|l| l.contains(text)) {
-            return line.clone();
+            return Some(line.clone());
         }
         loop {
             match self.lines.recv_timeout(Duration::from_secs(10)) {
                 Ok(line) => {
                     self.seen.push(line.clone());
                     if line.contains(text) {
-                        return line;
+                        return Some(line);
                     }
                 }
-                Err(_) => panic!(
-                    "never saw {text:?}; output so far:\n{}",
-                    self.seen.join("\n")
-                ),
+                Err(_) => return None,
             }
         }
+    }
+
+    /// Wait for the pairing prompt that `pairing` (an `opendrop pair` run in
+    /// the background) should cause. If it never comes, the panic shows the
+    /// pair command's own output too, so a failure says why.
+    fn wait_for_pairing_prompt(&mut self, pairing: &mpsc::Receiver<Output>) -> String {
+        let started = std::time::Instant::now();
+        if let Some(line) = self.try_wait_for("Pairing code:") {
+            return line;
+        }
+        let waited = started.elapsed();
+        let pair = match pairing.recv_timeout(Duration::from_secs(5)) {
+            Ok(output) => format!("exited with {}:\n{}", output.status, text(&output)),
+            Err(_) => "still running 5 s later".to_owned(),
+        };
+        panic!(
+            "never saw \"Pairing code:\" after {waited:?}; listener output:\n{}\n\n`opendrop pair` {pair}",
+            self.seen.join("\n")
+        )
     }
 
     fn answer(&mut self, text: &str) {
@@ -112,6 +138,19 @@ fn run(config: &Path, args: &[&str], input: &str) -> Output {
         .write_all(input.as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+/// `run` on another thread; the output arrives on the returned channel.
+fn run_in_background(config: &Path, args: &[&str], input: &str) -> mpsc::Receiver<Output> {
+    let (tx, rx) = mpsc::channel();
+    let config = config.to_owned();
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let input = input.to_owned();
+    std::thread::spawn(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let _ = tx.send(run(&config, &args, &input));
+    });
+    rx
 }
 
 fn text(output: &Output) -> String {
@@ -154,15 +193,11 @@ fn pair_restart_devices_and_unpair() {
     // Pair: the Mac asks, both users answer yes.
     let mut pc = Listener::start(&pc_config, "PC", port, &downloads);
     let pc_id = device_id(&pc.wait_for("listening on port"));
-    let pairing = std::thread::spawn({
-        let mac_config = mac_config.clone();
-        let target = target.clone();
-        move || run(&mac_config, &["pair", &target, "--name", "Mac"], "y\n")
-    });
-    let prompt = pc.wait_for("Pairing code:");
+    let pairing = run_in_background(&mac_config, &["pair", &target, "--name", "Mac"], "y\n");
+    let prompt = pc.wait_for_pairing_prompt(&pairing);
     assert!(prompt.contains("\"Mac\""), "{prompt}");
     pc.answer("y");
-    let paired = pairing.join().unwrap();
+    let paired = pairing.recv().unwrap();
     let mac_output = text(&paired);
     assert!(paired.status.success(), "{mac_output}");
     assert!(
@@ -239,13 +274,11 @@ fn declined_pairing_leaves_both_unpaired() {
     let (pc_config, mac_config) = (root.path().join("pc"), root.path().join("mac"));
     let port = free_port();
     let mut pc = Listener::start(&pc_config, "PC", port, &root.path().join("dl"));
-    let pairing = std::thread::spawn({
-        let mac_config = mac_config.clone();
-        move || run(&mac_config, &["pair", &format!("127.0.0.1:{port}")], "y\n")
-    });
-    pc.wait_for("Pairing code:");
+    let target = format!("127.0.0.1:{port}");
+    let pairing = run_in_background(&mac_config, &["pair", &target], "y\n");
+    pc.wait_for_pairing_prompt(&pairing);
     pc.answer("n");
-    let output = pairing.join().unwrap();
+    let output = pairing.recv().unwrap();
     assert!(!output.status.success());
     assert!(text(&output).contains("declined"), "{}", text(&output));
     pc.stop();
@@ -349,14 +382,10 @@ fn fetch_end_to_end(size: usize) {
     let mac_port = free_port();
     let mac_target = format!("127.0.0.1:{mac_port}");
     let mut mac = Listener::start(&mac_config, "Mac", mac_port, &mac_downloads);
-    let pairing = std::thread::spawn({
-        let pc_config = pc_config.clone();
-        let mac_target = mac_target.clone();
-        move || run(&pc_config, &["pair", &mac_target, "--name", "PC"], "y\n")
-    });
-    mac.wait_for("Pairing code:");
+    let pairing = run_in_background(&pc_config, &["pair", &mac_target, "--name", "PC"], "y\n");
+    mac.wait_for_pairing_prompt(&pairing);
     mac.answer("y");
-    let paired = pairing.join().unwrap();
+    let paired = pairing.recv().unwrap();
     assert!(paired.status.success(), "{}", text(&paired));
     mac.wait_for("Paired");
     let pc = Listener::start(&pc_config, "PC", 0, &pc_downloads);

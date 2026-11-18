@@ -248,6 +248,8 @@ cargo run -p opendrop-relay -- --bind 0.0.0.0:8787 --data relay-data --public-ur
 
 `--data` holds the account database (`relay.db`), the inbox master key (`relay.key`) and the
 encrypted inbox files (`inbox/`).
+To host it on Fly.io with HTTPS (needed for claude.ai and ChatGPT), see
+[docs/relay-hosting.md](docs/relay-hosting.md).
 
 Then on each device:
 
