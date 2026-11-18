@@ -88,11 +88,22 @@ impl Grants {
 
 /// The grant a fetch approval can include: the requesting device and the
 /// requested file's folder. Accepting it starts the 10 minutes.
+///
+/// Over the relay the offer is bigger: with `always` set, accepting gives
+/// the requester standing access to the whole device (except OpenDrop's
+/// own settings) until it is revoked, and `folder` is the home folder.
 #[derive(Clone)]
 pub struct GrantOffer {
     grants: Arc<Grants>,
     pub peer_id: String,
     pub folder: PathBuf,
+    /// Accepting gives standing access to the whole device, not 10 minutes
+    /// of one folder.
+    pub always: bool,
+    standing: Option<(
+        Arc<crate::relay::access::Access>,
+        crate::relay::proto::Requester,
+    )>,
     /// Where to record the grant, with the device's name.
     audit: Option<(Arc<AuditLog>, String)>,
 }
@@ -103,6 +114,23 @@ impl GrantOffer {
             grants,
             peer_id,
             folder,
+            always: false,
+            standing: None,
+            audit: None,
+        }
+    }
+
+    /// Standing access for `requester`, kept in `access` until revoked.
+    pub fn standing(
+        access: Arc<crate::relay::access::Access>,
+        requester: crate::relay::proto::Requester,
+    ) -> Self {
+        Self {
+            grants: Arc::new(Grants::new()),
+            peer_id: requester.id.clone(),
+            folder: crate::relay::access::home(),
+            always: true,
+            standing: Some((access, requester)),
             audit: None,
         }
     }
@@ -114,8 +142,21 @@ impl GrantOffer {
     }
 
     /// Give the grant.
-    pub fn accept(&self) -> Grant {
-        let grant = self
+    pub fn accept(&self) {
+        if let Some((access, requester)) = &self.standing {
+            if let Err(e) = access.grant(requester) {
+                eprintln!("could not save standing access for {}: {e}", requester.name);
+                return;
+            }
+            if let Some((audit, peer_name)) = &self.audit {
+                audit.record(
+                    Entry::new(Event::Grant, Some(&self.peer_id), peer_name)
+                        .detail("any file on this device, until revoked"),
+                );
+            }
+            return;
+        }
+        let _grant = self
             .grants
             .allow(&self.peer_id, &self.folder, GRANT_DURATION);
         if let Some((audit, peer_name)) = &self.audit {
@@ -127,7 +168,6 @@ impl GrantOffer {
                 )),
             );
         }
-        grant
     }
 }
 
@@ -136,13 +176,14 @@ impl std::fmt::Debug for GrantOffer {
         f.debug_struct("GrantOffer")
             .field("peer_id", &self.peer_id)
             .field("folder", &self.folder)
+            .field("always", &self.always)
             .finish()
     }
 }
 
 impl PartialEq for GrantOffer {
     fn eq(&self, other: &Self) -> bool {
-        self.peer_id == other.peer_id && self.folder == other.folder
+        self.peer_id == other.peer_id && self.folder == other.folder && self.always == other.always
     }
 }
 

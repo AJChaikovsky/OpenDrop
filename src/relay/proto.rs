@@ -44,6 +44,65 @@ pub enum ServerMsg {
     TokensRevoked {
         count: u64,
     },
+    /// On a device's hello connection: someone asks for the file at `path`
+    /// on this device. Answer with `job_answer`; after a yes, send the file
+    /// on a new connection with `job_upload`.
+    FetchAsk {
+        job_id: String,
+        requester: Requester,
+        path: String,
+        reason: String,
+        /// Where the file will go: "the assistant" or another device's name.
+        deliver_to: String,
+    },
+    /// On a device's hello connection: someone wants to see what is in
+    /// `folder` (home when absent), or to find files named like `query`.
+    /// Answer with `list_answer`, or `job_answer` to refuse.
+    ListAsk {
+        job_id: String,
+        requester: Requester,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// On a device's hello connection: a file for this device is waiting at
+    /// the relay. Answer with `job_answer`; after a yes, collect it on a new
+    /// connection with `job_download`. `request_id` is set when this device
+    /// asked for the file itself.
+    Deliver {
+        job_id: String,
+        requester: Requester,
+        from_device: String,
+        name: String,
+        size: u64,
+        sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+    /// On a device's hello connection: the answer to its `remote_list`.
+    ListResult {
+        request_id: String,
+        device_name: String,
+        folder: String,
+        entries: Vec<RemoteEntry>,
+        truncated: bool,
+    },
+    /// On a device's hello connection: its `remote_fetch` or `remote_list`
+    /// didn't work out (declined, offline, not found...).
+    RequestFailed {
+        request_id: String,
+        code: String,
+        message: String,
+    },
+    /// A job's file reached the relay.
+    JobUploaded,
+    /// On a `job_download` connection: the file follows as binary frames.
+    DownloadReady {
+        name: String,
+        size: u64,
+        sha256: String,
+    },
     /// The request was refused; the relay closes the connection after this.
     Error {
         code: String,
@@ -97,6 +156,94 @@ pub enum ClientMsg {
     RevokeTokens {
         session: String,
     },
+    /// On the hello connection: yes or no to a `fetch_ask`, `list_ask` or
+    /// `deliver`. A no carries a code and a message for whoever asked.
+    JobAnswer {
+        job_id: String,
+        accepted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// On the hello connection: what a `list_ask` asked to see.
+    ListAnswer {
+        job_id: String,
+        folder: String,
+        entries: Vec<RemoteEntry>,
+        truncated: bool,
+    },
+    /// On the hello connection: ask another device of the account (id or
+    /// name) for the file at `path`. It arrives as a `deliver` carrying
+    /// `request_id`, or a `request_failed` explains why not.
+    RemoteFetch {
+        request_id: String,
+        device: String,
+        path: String,
+        #[serde(default)]
+        reason: String,
+    },
+    /// On the hello connection: list a folder of another device, or find
+    /// files there. Answered with `list_result` or `request_failed`.
+    RemoteList {
+        request_id: String,
+        device: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// Send the file a `fetch_ask` approved. `signature` covers
+    /// [`job_upload_message`]; after `upload_ready`, exactly `size` bytes
+    /// follow as binary frames, and the relay answers `job_uploaded`.
+    JobUpload {
+        device_id: String,
+        job_id: String,
+        name: String,
+        size: u64,
+        sha256: String,
+        signature: String,
+    },
+    /// Collect the file a `deliver` announced. `signature` covers
+    /// [`job_download_message`]; the relay answers `download_ready`, then
+    /// the bytes as binary frames.
+    JobDownload {
+        device_id: String,
+        job_id: String,
+        signature: String,
+    },
+}
+
+/// Who is asking a device for something over the relay.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Requester {
+    pub kind: RequesterKind,
+    /// Stable for one requester: `device:<device id>`, `oauth:<client id>`
+    /// or `token:<id>`. Standing access is given to this.
+    pub id: String,
+    /// What to call it, e.g. "Claude" or "AJ's MacBook Air".
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequesterKind {
+    /// An AI assistant connected to the hosted MCP server.
+    Assistant,
+    /// Another device signed in to the same account.
+    Device,
+}
+
+/// One entry of a remote folder listing or search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteEntry {
+    pub name: String,
+    /// The full path on that device, to pass back in a fetch.
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// Last modified, Unix seconds (0 if unknown).
+    pub modified: u64,
 }
 
 /// One of the account's devices.
@@ -122,6 +269,12 @@ pub mod codes {
     pub const TOO_LARGE: &str = "too_large";
     pub const QUOTA: &str = "quota";
     pub const BAD_UPLOAD: &str = "bad_upload";
+    pub const DECLINED: &str = "declined";
+    pub const TIMEOUT: &str = "timeout";
+    pub const OFFLINE: &str = "offline";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const REFUSED: &str = "refused";
+    pub const UNKNOWN_JOB: &str = "unknown_job";
 }
 
 /// What a device signs to register to `account` on the connection whose
@@ -157,6 +310,35 @@ pub fn upload_message(
 ) -> Vec<u8> {
     let mut m = b"opendrop-relay-upload\0".to_vec();
     for part in [device_id, name, &size.to_string(), sha256] {
+        m.extend_from_slice(part.as_bytes());
+        m.push(0);
+    }
+    m.extend_from_slice(nonce);
+    m
+}
+
+/// What a device signs to send the file of job `job_id`.
+pub fn job_upload_message(
+    device_id: &str,
+    job_id: &str,
+    name: &str,
+    size: u64,
+    sha256: &str,
+    nonce: &[u8],
+) -> Vec<u8> {
+    let mut m = b"opendrop-relay-job-upload\0".to_vec();
+    for part in [device_id, job_id, name, &size.to_string(), sha256] {
+        m.extend_from_slice(part.as_bytes());
+        m.push(0);
+    }
+    m.extend_from_slice(nonce);
+    m
+}
+
+/// What a device signs to collect the file of job `job_id`.
+pub fn job_download_message(device_id: &str, job_id: &str, nonce: &[u8]) -> Vec<u8> {
+    let mut m = b"opendrop-relay-job-download\0".to_vec();
+    for part in [device_id, job_id] {
         m.extend_from_slice(part.as_bytes());
         m.push(0);
     }

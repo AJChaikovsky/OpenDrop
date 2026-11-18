@@ -298,6 +298,24 @@ Connecting opens the relay's page: enter your OpenDrop email, open the sign-in l
 (by email, or in the relay's log if it has no email key), and press Allow. Then send a file with
 `opendrop send-file --to assistant` and ask the assistant about it.
 
+### Get files from your devices from anywhere
+
+A device signed in to the relay (with `opendrop listen` or the desktop app running) answers
+requests from your other devices and your connected assistants wherever you are:
+
+- From claude.ai or ChatGPT: `list_devices`, `list_files` (browse or search a device) and
+  `request_file` (by path; the file comes back into the chat, or with `send_to` is copied to
+  another of your devices).
+- From another device: `opendrop relay files <DEVICE> [FOLDER] [--find TEXT]` and
+  `opendrop relay fetch <DEVICE> <PATH>`, or the local MCP tools `list_remote_files` and
+  `request_remote_file`.
+
+The first request from each assistant or device is asked on the device that has the file. With
+that yes you can give it **standing access**: it may then fetch any file on the device without
+asking, until you revoke it (`opendrop relay access`, `opendrop relay revoke <NAME|all>`, or
+Standing access in the app). OpenDrop's own settings and keys are never served, granted or not.
+Files over the relay can be up to 25 MB.
+
 ## Use it from an AI assistant (MCP)
 
 `opendrop mcp` lets Claude Code, Claude Desktop or any other MCP client get files from your

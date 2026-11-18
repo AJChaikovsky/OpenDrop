@@ -74,15 +74,55 @@ impl Relay {
 
     /// The account a bearer token gives access to: an unexpired, unrevoked
     /// OAuth access token for `/mcp`, or a `relay token` one.
-    pub(crate) fn bearer_account(&self, token: &str) -> Result<Option<i64>, String> {
+    ///
+    /// Also who is asking: the OAuth client (claude.ai, ChatGPT...) or the
+    /// token, which standing access on devices is given to.
+    pub(crate) fn bearer_account(
+        &self,
+        token: &str,
+    ) -> Result<Option<(i64, opendrop::relay::proto::Requester)>, String> {
+        use opendrop::relay::proto::{Requester, RequesterKind};
         if let Some(t) = self.store.oauth_token(token)? {
             let ok = t.kind == "access"
                 && !t.revoked
                 && t.expires_ms > self.now()
                 && t.resource == self.mcp_resource();
-            return Ok(ok.then_some(t.account_id));
+            if !ok {
+                return Ok(None);
+            }
+            let name = self
+                .store
+                .oauth_client(&t.client_id)?
+                .map(|(name, _)| name)
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| "AI assistant".to_owned());
+            return Ok(Some((
+                t.account_id,
+                Requester {
+                    kind: RequesterKind::Assistant,
+                    id: format!("oauth:{}", t.client_id),
+                    name,
+                },
+            )));
         }
-        self.store.token_account(token)
+        Ok(self.store.token_info(token)?.map(|(account, label)| {
+            let id: String = crate::store::hash(token)[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            (
+                account,
+                Requester {
+                    kind: RequesterKind::Assistant,
+                    id: format!("token:{id}"),
+                    name: if label.trim().is_empty() {
+                        "AI assistant (token)".to_owned()
+                    } else {
+                        label
+                    },
+                },
+            )
+        }))
     }
 
     /// The `401` that tells a client where to start OAuth.

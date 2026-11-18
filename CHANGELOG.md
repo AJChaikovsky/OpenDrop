@@ -6,6 +6,16 @@ All notable changes to OpenDrop. The format follows
 
 ## [Unreleased]
 
+### Added
+- Relay (opt-in): get files from your signed-in devices from anywhere, from claude.ai or
+  ChatGPT (`list_devices`, `list_files`, `request_file`, optionally copying to another device)
+  or from another device (`opendrop relay files`, `opendrop relay fetch`). Each request is
+  approved on the device that has the file, which can give the requester standing access
+  until revoked (`opendrop relay access` / `revoke`, or in the app). OpenDrop's own settings
+  are never served.
+- The desktop app connects to the relay when this device is signed in.
+- Relay: sign-in links are emailed through Resend when `RESEND_API_KEY` is set.
+
 ### Fixed
 - Linux: on systems without XDG user folders (WSL, minimal installs) the desktop app saved
   received files to `./OpenDrop` relative to wherever it was started. They now go to

@@ -79,6 +79,24 @@ pub enum Request {
         #[serde(default)]
         paired_only: bool,
     },
+    /// Over the relay: list `folder` (home by default) on the account's
+    /// device `device`, or find files there named like `query`. May wait
+    /// for that device's owner to allow it: call with [`REMOTE_TIMEOUT`].
+    RemoteList {
+        device: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// Over the relay: ask the account's device `device` for the file at
+    /// `path`. Answers at once with the transfer id.
+    RemoteFetch {
+        device: String,
+        path: String,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +125,12 @@ pub enum Response {
     },
     SendStarted {
         transfer_id: String,
+    },
+    RemoteFiles {
+        device_name: String,
+        folder: String,
+        entries: Vec<crate::relay::proto::RemoteEntry>,
+        truncated: bool,
     },
     Error {
         message: String,
@@ -165,6 +189,48 @@ pub async fn handle(daemon: &Daemon, request: Request) -> Response {
             Ok(transfer_id) => Response::SendStarted { transfer_id },
             Err(e) => failed(&e),
         },
+        Request::RemoteList {
+            device,
+            folder,
+            query,
+        } => match daemon.remote() {
+            None => relay_off(),
+            Some(remote) => match remote
+                .list(&device, folder.as_deref(), query.as_deref())
+                .await
+            {
+                Ok(listing) => Response::RemoteFiles {
+                    device_name: listing.device_name,
+                    folder: listing.folder,
+                    entries: listing.entries,
+                    truncated: listing.truncated,
+                },
+                Err(e) => failed(&e),
+            },
+        },
+        Request::RemoteFetch {
+            device,
+            path,
+            reason,
+        } => match daemon.remote() {
+            None => relay_off(),
+            Some(remote) => match remote.fetch(&device, &path, &reason) {
+                Ok(transfer_id) => Response::FetchStarted { transfer_id },
+                Err(e) => failed(&e),
+            },
+        },
+    }
+}
+
+/// How long a client waits for a [`Request::RemoteList`]: the other
+/// device's owner may have to say yes first.
+pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn relay_off() -> Response {
+    Response::Error {
+        message: "this device isn't using the relay; run `opendrop relay login` and restart it"
+            .into(),
+        code: Some(ErrorCode::DeviceOffline),
     }
 }
 
@@ -257,12 +323,25 @@ impl Client {
     }
 
     pub async fn call(&mut self, request: &Request) -> Result<Response, BoxError> {
+        let limit = match request {
+            Request::RemoteList { .. } => REMOTE_TIMEOUT,
+            _ => CALL_TIMEOUT,
+        };
+        self.call_within(request, limit).await
+    }
+
+    /// [`call`](Self::call), waiting up to `limit` for the answer.
+    pub async fn call_within(
+        &mut self,
+        request: &Request,
+        limit: Duration,
+    ) -> Result<Response, BoxError> {
         let payload = serde_json::to_vec(request)?;
         let exchange = async {
             write_frame(&mut self.stream, &payload).await?;
             read_frame(&mut self.stream).await
         };
-        let reply = tokio::time::timeout(CALL_TIMEOUT, exchange)
+        let reply = tokio::time::timeout(limit, exchange)
             .await
             .map_err(|_| "the daemon did not answer in time")?
             .map_err(|e| match e {

@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AppEvent, AuditEntry, Device, HistoryEntry, Me } from "./types";
+import type { AppEvent, AuditEntry, Device, HistoryEntry, Me, StandingAccess } from "./types";
 
 /** Where a file drag is, in CSS pixels, and which files it carries. */
 export type DragEvent =
@@ -41,6 +41,10 @@ export interface Api {
    * it isn't available. */
   contextMenuStatus(): Promise<boolean | null>;
   setContextMenu(enabled: boolean): Promise<void>;
+  /** Who may fetch any file here over the relay without asking. */
+  relayAccess(): Promise<StandingAccess[]>;
+  /** Take that standing access away; true if it was there. */
+  revokeRelayAccess(id: string): Promise<boolean>;
   onEvent(handler: (event: AppEvent) => void): Promise<() => void>;
   onDrag(handler: (event: DragEvent) => void): Promise<() => void>;
 }
@@ -64,6 +68,8 @@ export const tauriApi: Api = {
   takeSendPaths: () => invoke("take_send_paths"),
   contextMenuStatus: () => invoke("context_menu_status"),
   setContextMenu: (enabled) => invoke("set_context_menu", { enabled }),
+  relayAccess: () => invoke("relay_access"),
+  revokeRelayAccess: (id) => invoke("revoke_relay_access", { id }),
   async pickFiles() {
     const picked = await open({ multiple: true, directory: false });
     if (picked === null) return [];
