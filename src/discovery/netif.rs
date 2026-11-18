@@ -79,7 +79,12 @@ pub fn is_virtual(name: &str) -> bool {
         "docker", "br-", "veth", "virbr", "vboxnet", "vmnet", "utun", "tun", "tap", "wg", "zt",
         "awdl", "llw", "anpi", "bridge", "gif", "stf", "ap1",
     ];
-    CONTAINS.iter().any(|s| name.contains(s)) || PREFIXES.iter().any(|p| name.starts_with(p))
+    // Loopback interfaces can carry non-127 addresses: WSL's mirrored mode
+    // puts 10.255.255.254 on `lo`, which no other device can reach (#40).
+    const EXACT: &[&str] = &["lo", "lo0"];
+    EXACT.contains(&name.as_str())
+        || CONTAINS.iter().any(|s| name.contains(s))
+        || PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// How usable an address is on its own: LAN IPv4 first (the listener is
@@ -250,5 +255,19 @@ mod tests {
         let wide = LocalAddr::new("en0", "10.1.2.3", 8);
         assert!(wide.same_network(&"10.200.0.1".parse().unwrap()));
         assert_eq!(prefix_len([255, 255, 240, 0]), 20);
+    }
+
+    /// #40: WSL's mirrored networking puts 10.255.255.254 on `lo`. It isn't
+    /// in 127/8, but no other device can reach it, so it must not be the
+    /// address we tell people to use.
+    #[test]
+    fn wsl_mirrored_loopback_alias_is_not_the_lan_address() {
+        let wsl = vec![
+            LocalAddr::new("lo", "10.255.255.254", 32),
+            LocalAddr::new("eth0", "192.168.1.177", 24),
+        ];
+        assert!(is_virtual("lo") && is_virtual("lo0"));
+        assert!(!is_virtual("lowpan0") && !is_virtual("eth0"));
+        assert_eq!(best_lan_ip(&wsl), Some("192.168.1.177".parse().unwrap()));
     }
 }

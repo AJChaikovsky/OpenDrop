@@ -12,6 +12,7 @@ pub mod identity;
 pub mod mcp;
 pub mod network;
 pub mod pairing;
+pub mod paths;
 pub mod protocol;
 pub mod relay;
 pub mod share;

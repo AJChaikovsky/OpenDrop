@@ -4,6 +4,15 @@ All notable changes to OpenDrop. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- Linux: on systems without XDG user folders (WSL, minimal installs) the desktop app saved
+  received files to `./OpenDrop` relative to wherever it was started. They now go to
+  `~/Downloads/OpenDrop`, the same as the CLI.
+- Linux under WSL mirrored networking: `listen` no longer tells you to use the
+  loopback alias 10.255.255.254 instead of the LAN address.
+
 ## [0.1.0] - unreleased
 
 The first release: AirDrop-style sharing between macOS, Windows and Linux on the

@@ -39,7 +39,9 @@ Then:
 
 The first time, your system may ask whether OpenDrop can use the local network (macOS) or
 get through the firewall (Windows): allow it, or the devices can't see each other. On
-Windows, allow it for the network type you're on (Private or Public).
+Windows, allow it for the network type you're on (Private or Public). On Linux with a
+firewall turned on (`ufw` is off by default on Ubuntu), allow TCP 45454 and UDP 5353:
+`sudo ufw allow 45454/tcp && sudo ufw allow 5353/udp`.
 
 | Accepting a file | Pairing with a code |
 |---|---|
