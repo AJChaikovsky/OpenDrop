@@ -2,9 +2,9 @@
 //! inbox, over Streamable HTTP.
 //!
 //! Every request needs `Authorization: Bearer <token>`; the token decides
-//! which account's inbox the tools see. In B2 tokens come from `opendrop
-//! relay token`; B3 replaces them with OAuth so claude.ai and ChatGPT can
-//! connect on their own.
+//! which account's inbox the tools see. Tokens come from OAuth (`oauth`,
+//! for claude.ai and ChatGPT) or from `opendrop relay token`. Without one
+//! the answer is a `401` pointing at the OAuth metadata.
 
 use crate::Relay;
 use crate::inbox::Item;
@@ -84,20 +84,14 @@ async fn require_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim);
-    let account = match token.map(|t| relay.store.token_account(t)) {
+    let account = match token.map(|t| relay.bearer_account(t)) {
         Some(Ok(Some(account))) => account,
         Some(Err(e)) => {
             eprintln!("token check: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
-                "a valid OpenDrop token is required",
-            )
-                .into_response();
-        }
+        Some(Ok(None)) => return relay.unauthorized(true),
+        None => return relay.unauthorized(false),
     };
     request.extensions_mut().insert(AccountId(account));
     next.run(request).await
