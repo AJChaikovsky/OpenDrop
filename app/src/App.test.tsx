@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Api, DragEvent } from "./api";
 import App from "./App";
-import type { AppEvent, AuditEntry, Device, HistoryEntry, Me } from "./types";
+import type { AppEvent, AuditEntry, Device, HistoryEntry, Me, StandingAccess } from "./types";
 
 const pc: Device = { id: "device-pc", name: "AJ-PC", address: "192.168.1.30:45454", compatible: true, paired: false };
 
@@ -37,6 +37,8 @@ function fakeApi(devices: Device[] = [pc], history: HistoryEntry[] = []) {
     takeSendPaths: vi.fn(async (): Promise<string[]> => []),
     contextMenuStatus: vi.fn(async (): Promise<boolean | null> => false),
     setContextMenu: vi.fn(async () => {}),
+    relayAccess: vi.fn(async () => [] as StandingAccess[]),
+    revokeRelayAccess: vi.fn(async () => true),
     onEvent: vi.fn(async (h: (e: AppEvent) => void) => ((emit = h), () => {})),
     onDrag: vi.fn(async (h: (e: DragEvent) => void) => ((drag = h), () => {})),
   } satisfies Api;
@@ -326,6 +328,46 @@ describe("App", () => {
     // No folder offered (an incoming file): no checkbox.
     emit(fetchRequest("g3", "why", true));
     expect(within(screen.getByRole("dialog")).queryByRole("checkbox")).not.toBeInTheDocument();
+  });
+
+  it("offers standing access for a request over the relay", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("button", { name: /AJ-PC/ });
+    emit({
+      kind: "incoming_request",
+      transfer_id: "job_1",
+      peer_name: "Claude",
+      peer_ip: "0.0.0.0",
+      verified: true,
+      name: "/Users/aj/Documents/notes.txt",
+      size: 1200,
+      fetch: { reason: "to summarize", via_assistant: true, grant_folder: "/Users/aj", grant_always: true },
+    });
+    const dialog = screen.getByRole("dialog", { name: "File request" });
+    expect(dialog).toHaveTextContent("Claude (over the internet) asks for");
+    expect(dialog).toHaveTextContent("Claude is an AI assistant connected to your OpenDrop account.");
+    const always = within(dialog).getByRole("checkbox", {
+      name: "Always let Claude fetch any file from this device without asking (you can revoke it later)",
+    });
+    await userEvent.click(always);
+    await userEvent.click(within(dialog).getByRole("button", { name: "Approve" }));
+    expect(api.respond).toHaveBeenCalledWith("job_1", true, true);
+  });
+
+  it("lists standing access and revokes it", async () => {
+    const { api } = fakeApi();
+    let list: StandingAccess[] = [{ id: "oauth:abc", kind: "assistant", name: "Claude", granted_ms: 1 }];
+    api.relayAccess = vi.fn(async () => list);
+    api.revokeRelayAccess = vi.fn(async () => {
+      list = [];
+      return true;
+    });
+    render(<App api={api} />);
+    await screen.findByRole("heading", { name: "Standing access" });
+    await userEvent.click(screen.getByRole("button", { name: "Revoke Claude" }));
+    expect(api.revokeRelayAccess).toHaveBeenCalledWith("oauth:abc");
+    await vi.waitFor(() => expect(screen.queryByRole("heading", { name: "Standing access" })).not.toBeInTheDocument());
   });
 
   it("shows who asks for a shared file, the file, that an assistant asked and why", async () => {

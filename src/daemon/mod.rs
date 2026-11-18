@@ -130,6 +130,7 @@ pub struct Daemon {
     control: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
     server: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
     relay_status: Option<tokio::sync::watch::Receiver<crate::relay::Status>>,
+    remote: Option<Arc<crate::relay::remote::Remote>>,
     relay_task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -161,6 +162,7 @@ impl Daemon {
         let fetches = Arc::new(PendingFetches::new());
 
         let (requests, request_rx) = mpsc::channel(16);
+        let relay_requests = requests.clone();
         tokio::spawn(record_requests(
             request_rx,
             approval,
@@ -202,16 +204,36 @@ impl Daemon {
         } else {
             (None, None)
         };
+        // Relayed requests need the config folder: standing access is kept
+        // there, and it is the one folder they may never reach.
+        let remote = match (&relay, &control) {
+            (Some(config), Some(config_dir)) => Some(crate::relay::remote::Remote::new(
+                identity.clone(),
+                config.clone(),
+                config_dir.clone(),
+                download_dir.clone(),
+                relay_requests,
+                Arc::clone(&transfers),
+                Arc::clone(&audit),
+            )),
+            _ => None,
+        };
         let (relay_status, relay_task) = match relay {
             Some(config) => {
                 let (tx, rx) = tokio::sync::watch::channel(crate::relay::Status::Connecting);
-                let task = tokio::spawn(crate::relay::run(config, identity.clone(), tx));
+                let task = tokio::spawn(crate::relay::run(
+                    config,
+                    identity.clone(),
+                    tx,
+                    remote.clone(),
+                ));
                 (Some(rx), Some(task))
             }
             None => (None, None),
         };
         let daemon = Arc::new(Self {
             identity,
+            remote,
             relay_status,
             relay_task: Mutex::new(relay_task),
             port,
@@ -248,6 +270,12 @@ impl Daemon {
     /// Changes to the relay connection; `None` when the relay is off.
     pub fn relay_status(&self) -> Option<tokio::sync::watch::Receiver<crate::relay::Status>> {
         self.relay_status.clone()
+    }
+
+    /// Fetching from and listing the account's other devices over the
+    /// relay; `None` when the relay is off.
+    pub fn remote(&self) -> Option<&Arc<crate::relay::remote::Remote>> {
+        self.remote.as_ref()
     }
 
     pub fn discovery(&self) -> Option<&Discovery> {

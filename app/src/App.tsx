@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { tauriApi, type Api } from "./api";
 import { formatSize, formatSpeed, initialState, plural, reducer, type Transfer } from "./transfers";
-import type { AuditEntry, Device, HistoryEntry, IncomingRequest, Me, PairCode } from "./types";
+import type { AuditEntry, Device, HistoryEntry, IncomingRequest, Me, PairCode, StandingAccess } from "./types";
 import "./App.css";
 
 /** Seconds the receiver has to answer; matches APPROVAL_TIMEOUT in the crate. */
@@ -197,6 +197,7 @@ export default function App({ api = tauriApi }: { api?: Api }) {
       <Activity api={api} />
 
       <ContextMenuSetting api={api} />
+      <StandingAccessSetting api={api} />
 
       {state.pairing ? (
         <PairDialog key={state.pairing.pair_id} pairing={state.pairing} onAnswer={answerPair} />
@@ -243,6 +244,54 @@ function ContextMenuSetting({ api }: { api: Api }) {
           : "Add “Send with OpenDrop” to the right-click menu for files and folders."}
       </p>
       <button onClick={toggle}>{installed ? "Remove from the menu" : "Add to the menu"}</button>
+      {failed && (
+        <p className="error" role="alert">
+          {failed}
+        </p>
+      )}
+    </section>
+  );
+}
+
+/** Who may fetch any file on this device over the relay without asking,
+ * with a way to take it back. Hidden while nobody has it. */
+function StandingAccessSetting({ api }: { api: Api }) {
+  const [list, setList] = useState<StandingAccess[]>([]);
+  const [failed, setFailed] = useState<string | null>(null);
+  const load = useCallback(() => {
+    api
+      .relayAccess()
+      .then(setList)
+      .catch(() => setList([]));
+  }, [api]);
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 5000);
+    return () => clearInterval(timer);
+  }, [load]);
+  if (list.length === 0) return null;
+  const revoke = (id: string) =>
+    api
+      .revokeRelayAccess(id)
+      .then(() => {
+        setFailed(null);
+        load();
+      })
+      .catch((e) => setFailed(String(e)));
+  return (
+    <section className="standing-access">
+      <h2>Standing access</h2>
+      <p>These can fetch any file on this device over the internet without asking (never OpenDrop's own settings):</p>
+      <ul>
+        {list.map((s) => (
+          <li key={s.id}>
+            <strong>{s.name}</strong> <span className="detail">({s.kind === "assistant" ? "AI assistant" : "device"})</span>{" "}
+            <button onClick={() => revoke(s.id)} aria-label={`Revoke ${s.name}`}>
+              Revoke
+            </button>
+          </li>
+        ))}
+      </ul>
       {failed && (
         <p className="error" role="alert">
           {failed}
@@ -554,9 +603,11 @@ function RequestDialog({
           {fetch ? "File request" : text !== null ? "Incoming text" : folder ? "Incoming folder" : "Incoming file"}
         </h2>
         <p>
-          <strong>{request.peer_name}</strong> ({request.peer_ip}){" "}
+          <strong>{request.peer_name}</strong> ({request.peer_ip === "0.0.0.0" ? "over the internet" : request.peer_ip}){" "}
           {fetch
-            ? "asks for your file"
+            ? fetch.grant_always
+              ? "asks for"
+              : "asks for your file"
             : text !== null
               ? "wants to put this text on your clipboard"
               : folder
@@ -583,7 +634,9 @@ function RequestDialog({
         )}
         {fetch?.via_assistant && (
           <p className="assistant" role="note">
-            An AI assistant on {request.peer_name} asked for this file.
+            {fetch.grant_always
+              ? `${request.peer_name} is an AI assistant connected to your OpenDrop account.`
+              : `An AI assistant on ${request.peer_name} asked for this file.`}
           </p>
         )}
         {fetch && (
@@ -595,7 +648,12 @@ function RequestDialog({
             )}
           </p>
         )}
-        {fetch?.grant_folder && (
+        {fetch?.grant_always ? (
+          <label className="grant">
+            <input type="checkbox" checked={allowFolder} onChange={(e) => setAllowFolder(e.target.checked)} />
+            Always let {request.peer_name} fetch any file from this device without asking (you can revoke it later)
+          </label>
+        ) : fetch?.grant_folder && (
           <label className="grant">
             <input type="checkbox" checked={allowFolder} onChange={(e) => setAllowFolder(e.target.checked)} />
             Also let {request.peer_name} fetch from {fetch.grant_folder} for 10 minutes without asking

@@ -120,7 +120,7 @@ async fn sign_in_register_and_show_online_then_offline() {
 
     // Online within 5 s of starting.
     let (tx, mut rx) = tokio::sync::watch::channel(Status::Connecting);
-    let task = tokio::spawn(relay::run(config.clone(), mac.clone(), tx));
+    let task = tokio::spawn(relay::run(config.clone(), mac.clone(), tx, None));
     let up = wait_until(Duration::from_secs(5), || relay.relay.is_online(&mac.id))
         .await
         .expect("online within 5 s");

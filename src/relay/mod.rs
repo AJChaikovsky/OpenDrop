@@ -14,7 +14,9 @@
 //! Signatures always cover that challenge, so a captured message can't be
 //! replayed on another connection.
 
+pub mod access;
 pub mod proto;
+pub mod remote;
 
 use crate::identity::{DeviceIdentity, write_private};
 use crate::network::BoxError;
@@ -375,12 +377,22 @@ pub enum Status {
 }
 
 /// Connect and stay connected, reconnecting with backoff, until the task is
-/// dropped. Status changes go to `status`.
-pub async fn run(config: Config, identity: DeviceIdentity, status: watch::Sender<Status>) {
+/// dropped. Status changes go to `status`. With `remote`, requests from the
+/// relay (fetches, listings, deliveries) are answered over the connection.
+pub async fn run(
+    config: Config,
+    identity: DeviceIdentity,
+    status: watch::Sender<Status>,
+    remote: Option<std::sync::Arc<remote::Remote>>,
+) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let _ = status.send(Status::Connecting);
-        let error = match stay_connected(&config, &identity, &status).await {
+        let result = stay_connected(&config, &identity, &status, remote.as_ref()).await;
+        if let Some(remote) = &remote {
+            remote.connected(None);
+        }
+        let error = match result {
             // It was up, so the next try starts quickly again.
             Ok(()) => {
                 backoff = Duration::from_secs(1);
@@ -395,11 +407,13 @@ pub async fn run(config: Config, identity: DeviceIdentity, status: watch::Sender
 }
 
 /// One connection: say hello, then read (which answers the relay's pings)
-/// until it ends. `Ok` means it was accepted and later closed.
+/// and answer requests until it ends. `Ok` means it was accepted and later
+/// closed.
 async fn stay_connected(
     config: &Config,
     identity: &DeviceIdentity,
     status: &watch::Sender<Status>,
+    remote: Option<&std::sync::Arc<remote::Remote>>,
 ) -> Result<(), BoxError> {
     let mut connection = Connection::open(&config.url).await?;
     let signature = identity.sign(&proto::hello_message(&identity.id, &connection.nonce));
@@ -413,14 +427,28 @@ async fn stay_connected(
         ServerMsg::Welcome { .. } => {}
         other => return Err(unexpected(&other)),
     }
+    let (outbox, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<ClientMsg>();
+    if let Some(remote) = remote {
+        remote.connected(Some(outbox));
+    }
     let _ = status.send(Status::Online);
     // No reply timeout here: the relay pings, and drops us if we don't
     // answer. Reading with no deadline answers those pings.
     loop {
-        match connection.socket.next().await {
-            None | Some(Ok(Message::Close(_))) => return Ok(()),
-            Some(Err(_)) => return Ok(()),
-            Some(Ok(_)) => {}
+        tokio::select! {
+            frame = connection.socket.next() => match frame {
+                None | Some(Ok(Message::Close(_))) => return Ok(()),
+                Some(Err(_)) => return Ok(()),
+                Some(Ok(Message::Text(text))) => {
+                    if let (Some(remote), Ok(msg)) = (remote, serde_json::from_str::<ServerMsg>(&text)) {
+                        remote.handle(msg);
+                    }
+                }
+                Some(Ok(_)) => {}
+            },
+            Some(msg) = outgoing.recv() => {
+                connection.send(&msg).await?;
+            }
         }
     }
 }

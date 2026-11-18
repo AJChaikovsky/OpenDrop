@@ -167,6 +167,7 @@ mod tests {
             reason: String::new(),
             via_assistant: false,
             grant_folder: None,
+            grant_always: false,
         };
         assert_eq!(
             notice(&offer(Some(fetch), None)).unwrap().0,

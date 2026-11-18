@@ -43,8 +43,18 @@ The relay works out its public URL from `FLY_APP_NAME`
 opendrop relay login you@example.com --relay https://opendrop-relay.fly.dev
 ```
 
-Until an email provider is added, sign-in links are printed to the relay's
-log instead of emailed: open the one from `fly logs --app opendrop-relay`.
+Sign-in links are emailed through [Resend](https://resend.com) once you set
+its key (and, with a verified domain of your own, the sender):
+
+```sh
+fly secrets set RESEND_API_KEY=re_... \
+  OPENDROP_RELAY_EMAIL_FROM="OpenDrop <signin@your-domain>" --app opendrop-relay
+```
+
+Without a domain, leave out `OPENDROP_RELAY_EMAIL_FROM`: Resend's shared
+sender then only delivers to the address the Resend account was made with.
+Without a key, or when sending fails, links are printed to the relay's log
+(`fly logs --app opendrop-relay`).
 
 ## Later deploys and care
 
