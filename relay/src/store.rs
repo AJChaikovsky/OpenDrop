@@ -107,6 +107,45 @@ impl Store {
                  sent_ms INTEGER NOT NULL,
                  expires_ms INTEGER NOT NULL,
                  file_key BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS oauth_clients (
+                 client_id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 redirect_uris TEXT NOT NULL,
+                 secret_hash BLOB,
+                 created_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS oauth_requests (
+                 request_hash BLOB PRIMARY KEY,
+                 user_code TEXT NOT NULL UNIQUE,
+                 client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
+                 redirect_uri TEXT NOT NULL,
+                 state TEXT,
+                 code_challenge TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 resource TEXT NOT NULL,
+                 created_ms INTEGER NOT NULL,
+                 account_id INTEGER REFERENCES accounts(id),
+                 allowed INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS oauth_codes (
+                 code_hash BLOB PRIMARY KEY,
+                 client_id TEXT NOT NULL,
+                 redirect_uri TEXT NOT NULL,
+                 code_challenge TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 resource TEXT NOT NULL,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id),
+                 expires_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS oauth_tokens (
+                 token_hash BLOB PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 client_id TEXT NOT NULL,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id),
+                 scope TEXT NOT NULL,
+                 resource TEXT NOT NULL,
+                 expires_ms INTEGER NOT NULL
              );",
         )
         .map_err(err)?;
@@ -317,16 +356,36 @@ impl Store {
             .map_err(err)
     }
 
-    /// Revoke every token of the account; returns how many.
+    /// Revoke every token of the account: `opendrop relay token` ones and
+    /// every OAuth connection (access and refresh tokens, unused codes).
+    /// Returns how many tokens and connections that was.
     pub fn revoke_tokens(&self, account_id: i64) -> Result<usize> {
-        self.db
-            .lock()
-            .unwrap()
+        let db = self.db.lock().unwrap();
+        let api = db
             .execute(
                 "UPDATE api_tokens SET revoked = 1 WHERE account_id = ?1 AND revoked = 0",
                 params![account_id],
             )
-            .map_err(err)
+            .map_err(err)?;
+        // One refresh token per connected app.
+        let connections: usize = db
+            .query_row(
+                "SELECT COUNT(*) FROM oauth_tokens WHERE account_id = ?1 AND kind = 'refresh'",
+                params![account_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(err)? as usize;
+        db.execute(
+            "DELETE FROM oauth_tokens WHERE account_id = ?1",
+            params![account_id],
+        )
+        .map_err(err)?;
+        db.execute(
+            "DELETE FROM oauth_codes WHERE account_id = ?1",
+            params![account_id],
+        )
+        .map_err(err)?;
+        Ok(api + connections)
     }
 
     pub fn add_inbox_item(&self, item: &crate::inbox::Item, file_key: &[u8]) -> Result<()> {
@@ -434,6 +493,379 @@ impl Store {
             )
             .map(|n| n as u64)
             .map_err(err)
+    }
+}
+
+/// An app registered through OAuth dynamic client registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthClient {
+    pub client_id: String,
+    pub name: String,
+    pub redirect_uris: Vec<String>,
+    /// Set for confidential clients (`client_secret_basic` / `_post`).
+    pub secret_hash: Option<Vec<u8>>,
+}
+
+/// A browser sign-in waiting for someone to approve its code on a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthRequest {
+    pub client_id: String,
+    pub client_name: String,
+    pub redirect_uri: String,
+    pub state: Option<String>,
+    pub code_challenge: String,
+    pub scope: String,
+    pub resource: String,
+    pub created_ms: u64,
+    /// `None` until a device answers; then whether it allowed it.
+    pub allowed: Option<bool>,
+    pub account_id: Option<i64>,
+}
+
+/// What an authorization code or a token stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub client_id: String,
+    pub account_id: i64,
+    pub scope: String,
+    pub resource: String,
+}
+
+/// A code waiting to be exchanged at the token endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeGrant {
+    pub grant: Grant,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+}
+
+const REQUEST_COLUMNS: &str = "r.client_id, c.name, r.redirect_uri, r.state, r.code_challenge, \
+     r.scope, r.resource, r.created_ms, r.allowed, r.account_id";
+
+fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuthRequest> {
+    Ok(AuthRequest {
+        client_id: r.get(0)?,
+        client_name: r.get(1)?,
+        redirect_uri: r.get(2)?,
+        state: r.get(3)?,
+        code_challenge: r.get(4)?,
+        scope: r.get(5)?,
+        resource: r.get(6)?,
+        created_ms: r.get::<_, i64>(7)? as u64,
+        allowed: r.get::<_, Option<i64>>(8)?.map(|a| a != 0),
+        account_id: r.get(9)?,
+    })
+}
+
+/// OAuth (stage B3). Every secret (request ids, codes, tokens, client
+/// secrets) is stored as a SHA-256 hash only.
+impl Store {
+    pub fn add_oauth_client(&self, client: &OAuthClient) -> Result<()> {
+        let uris = serde_json::to_string(&client.redirect_uris).map_err(|e| e.to_string())?;
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO oauth_clients (client_id, name, redirect_uris, secret_hash, created_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![client.client_id, client.name, uris, client.secret_hash, now_ms() as i64],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    pub fn oauth_client(&self, client_id: &str) -> Result<Option<OAuthClient>> {
+        let row = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT client_id, name, redirect_uris, secret_hash FROM oauth_clients WHERE client_id = ?1",
+                params![client_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(err)?;
+        Ok(row.map(|(client_id, name, uris, secret_hash)| OAuthClient {
+            client_id,
+            name,
+            redirect_uris: serde_json::from_str(&uris).unwrap_or_default(),
+            secret_hash,
+        }))
+    }
+
+    /// Store a browser sign-in under `request_id` (the browser's secret)
+    /// and `user_code` (what the person types on a device).
+    pub fn add_auth_request(
+        &self,
+        request_id: &str,
+        user_code: &str,
+        request: &AuthRequest,
+    ) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO oauth_requests (request_hash, user_code, client_id, redirect_uri, state, \
+                 code_challenge, scope, resource, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    hash(request_id),
+                    user_code,
+                    request.client_id,
+                    request.redirect_uri,
+                    request.state,
+                    request.code_challenge,
+                    request.scope,
+                    request.resource,
+                    request.created_ms as i64
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    pub fn auth_request(&self, request_id: &str) -> Result<Option<AuthRequest>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT {REQUEST_COLUMNS} FROM oauth_requests r JOIN oauth_clients c \
+                     ON c.client_id = r.client_id WHERE r.request_hash = ?1"
+                ),
+                params![hash(request_id)],
+                row_to_request,
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// The user code of a sign-in (for reloading its page).
+    pub fn user_code(&self, request_id: &str) -> Result<Option<String>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT user_code FROM oauth_requests WHERE request_hash = ?1",
+                params![hash(request_id)],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// The undecided sign-in with this code, if it was created after
+    /// `not_before`.
+    pub fn pending_auth_request(
+        &self,
+        user_code: &str,
+        not_before: u64,
+    ) -> Result<Option<AuthRequest>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT {REQUEST_COLUMNS} FROM oauth_requests r JOIN oauth_clients c \
+                     ON c.client_id = r.client_id \
+                     WHERE r.user_code = ?1 AND r.allowed IS NULL AND r.created_ms > ?2"
+                ),
+                params![user_code, not_before as i64],
+                row_to_request,
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// Record a device's answer; false if the code isn't pending any more.
+    pub fn decide_auth_request(
+        &self,
+        user_code: &str,
+        not_before: u64,
+        account_id: i64,
+        allow: bool,
+    ) -> Result<bool> {
+        let changed = self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE oauth_requests SET allowed = ?1, account_id = ?2 \
+                 WHERE user_code = ?3 AND allowed IS NULL AND created_ms > ?4",
+                params![allow as i64, account_id, user_code, not_before as i64],
+            )
+            .map_err(err)?;
+        Ok(changed == 1)
+    }
+
+    /// Remove a sign-in; false if it was already gone (so only one caller
+    /// turns it into a code).
+    pub fn remove_auth_request(&self, request_id: &str) -> Result<bool> {
+        let changed = self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM oauth_requests WHERE request_hash = ?1",
+                params![hash(request_id)],
+            )
+            .map_err(err)?;
+        Ok(changed == 1)
+    }
+
+    pub fn add_code(&self, code: &str, code_grant: &CodeGrant, expires_ms: u64) -> Result<()> {
+        let g = &code_grant.grant;
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, scope, \
+                 resource, account_id, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    hash(code),
+                    g.client_id,
+                    code_grant.redirect_uri,
+                    code_grant.code_challenge,
+                    g.scope,
+                    g.resource,
+                    g.account_id,
+                    expires_ms as i64
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Use up a code: it works once, and not after it expires.
+    pub fn take_code(&self, code: &str, now: u64) -> Result<Option<CodeGrant>> {
+        let db = self.db.lock().unwrap();
+        let found = db
+            .query_row(
+                "SELECT client_id, redirect_uri, code_challenge, scope, resource, account_id, expires_ms \
+                 FROM oauth_codes WHERE code_hash = ?1",
+                params![hash(code)],
+                |r| {
+                    Ok((
+                        CodeGrant {
+                            grant: Grant {
+                                client_id: r.get(0)?,
+                                scope: r.get(3)?,
+                                resource: r.get(4)?,
+                                account_id: r.get(5)?,
+                            },
+                            redirect_uri: r.get(1)?,
+                            code_challenge: r.get(2)?,
+                        },
+                        r.get::<_, i64>(6)? as u64,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(err)?;
+        db.execute(
+            "DELETE FROM oauth_codes WHERE code_hash = ?1",
+            params![hash(code)],
+        )
+        .map_err(err)?;
+        Ok(found.filter(|(_, expires)| *expires > now).map(|(g, _)| g))
+    }
+
+    /// `kind` is `access` or `refresh`.
+    pub fn add_oauth_token(
+        &self,
+        token: &str,
+        kind: &str,
+        grant: &Grant,
+        expires_ms: u64,
+    ) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, resource, expires_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    hash(token),
+                    kind,
+                    grant.client_id,
+                    grant.account_id,
+                    grant.scope,
+                    grant.resource,
+                    expires_ms as i64
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    fn oauth_token(&self, token: &str, kind: &str, now: u64) -> Result<Option<Grant>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT client_id, account_id, scope, resource FROM oauth_tokens \
+                 WHERE token_hash = ?1 AND kind = ?2 AND expires_ms > ?3",
+                params![hash(token), kind, now as i64],
+                |r| {
+                    Ok(Grant {
+                        client_id: r.get(0)?,
+                        account_id: r.get(1)?,
+                        scope: r.get(2)?,
+                        resource: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// What a live (unexpired, unrevoked) access token grants.
+    pub fn access_token(&self, token: &str, now: u64) -> Result<Option<Grant>> {
+        self.oauth_token(token, "access", now)
+    }
+
+    /// Use up a refresh token (they rotate: each works once).
+    pub fn take_refresh_token(&self, token: &str, now: u64) -> Result<Option<Grant>> {
+        let grant = self.oauth_token(token, "refresh", now)?;
+        let removed = self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM oauth_tokens WHERE token_hash = ?1 AND kind = 'refresh'",
+                params![hash(token)],
+            )
+            .map_err(err)?;
+        // Two requests racing with one token: only the one that deleted it wins.
+        Ok(grant.filter(|_| removed == 1))
+    }
+
+    /// Drop expired codes and tokens, and sign-ins older than `requests_before`.
+    pub fn expire_oauth(&self, now: u64, requests_before: u64) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "DELETE FROM oauth_codes WHERE expires_ms <= ?1",
+            params![now as i64],
+        )
+        .map_err(err)?;
+        db.execute(
+            "DELETE FROM oauth_tokens WHERE expires_ms <= ?1",
+            params![now as i64],
+        )
+        .map_err(err)?;
+        db.execute(
+            "DELETE FROM oauth_requests WHERE created_ms <= ?1",
+            params![requests_before as i64],
+        )
+        .map_err(err)?;
+        Ok(())
     }
 }
 

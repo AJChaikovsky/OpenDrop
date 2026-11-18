@@ -68,7 +68,10 @@ USAGE:
                                     put files in your assistant inbox on the relay
                                     (read once, or deleted after 24 hours)
     opendrop relay token              a token for the relay's MCP server (/mcp)
-    opendrop relay revoke-tokens      revoke all of those tokens
+    opendrop relay approve <CODE> [--yes]
+                                    let an assistant app (claude.ai, ChatGPT) connect to
+                                    your inbox: CODE is shown on its sign-in page
+    opendrop relay revoke-tokens      disconnect every assistant app and revoke all tokens
     opendrop relay logout             stop using the relay
     opendrop mcp                      MCP server on stdin/stdout for AI assistants
                                     (Claude Code: claude mcp add opendrop -- opendrop mcp);
@@ -174,6 +177,10 @@ async fn main() -> ExitCode {
         ["relay", "logout"] => relay_logout(&me),
         ["relay", "token"] => relay_token(&me).await,
         ["relay", "revoke-tokens"] => relay_revoke(&me).await,
+        ["relay", "approve", code] => relay_approve(&me, code, false).await,
+        ["relay", "approve", code, "--yes"] | ["relay", "approve", "--yes", code] => {
+            relay_approve(&me, code, true).await
+        }
         ["help"] | ["--help"] | ["-h"] => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -306,6 +313,57 @@ async fn relay_revoke(me: &Me) -> ExitCode {
     match opendrop::relay::revoke_tokens(&config).await {
         Ok(n) => {
             println!("Revoked {n} token(s).");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+/// What each OAuth scope lets an app do (the relay's names).
+fn describe_scope(scope: &str) -> String {
+    match scope {
+        "inbox:read" => "read (and so remove) files you send to your assistant".to_owned(),
+        "inbox:write" => "delete files from your assistant inbox".to_owned(),
+        "devices:read" => "see your devices and what they share".to_owned(),
+        "devices:request" => "ask your devices for files (you approve each one)".to_owned(),
+        other => format!("{other} (unknown)"),
+    }
+}
+
+async fn relay_approve(me: &Me, code: &str, yes: bool) -> ExitCode {
+    let config = match signed_in(me) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    let request = match opendrop::relay::authorize_lookup(&config, code).await {
+        Ok(request) => request,
+        Err(e) => return fail(&e.to_string()),
+    };
+    println!(
+        "\"{}\" (returning to {}) wants to connect to {}'s assistant inbox on {} and:",
+        request.client_name, request.redirect_host, config.account, config.url
+    );
+    for scope in &request.scopes {
+        println!("  - {}", describe_scope(scope));
+    }
+    let allow = if yes {
+        true
+    } else {
+        print!("Allow it? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+    };
+    match opendrop::relay::authorize_decide(&config, code, allow).await {
+        Ok(()) if allow => {
+            println!(
+                "Allowed. The sign-in page continues on its own. `opendrop relay revoke-tokens` disconnects it."
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(()) => {
+            println!("Denied.");
             ExitCode::SUCCESS
         }
         Err(e) => fail(&e.to_string()),

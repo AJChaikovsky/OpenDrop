@@ -2,15 +2,16 @@
 //! inbox, over Streamable HTTP.
 //!
 //! Every request needs `Authorization: Bearer <token>`; the token decides
-//! which account's inbox the tools see. In B2 tokens come from `opendrop
-//! relay token`; B3 replaces them with OAuth so claude.ai and ChatGPT can
-//! connect on their own.
+//! which account's inbox the tools see and which tools it may use. Tokens
+//! come from OAuth (`oauth.rs`, how claude.ai and ChatGPT connect) or from
+//! `opendrop relay token` (for testing with the MCP Inspector). Without a
+//! valid one the answer is a `401` pointing at the OAuth metadata.
 
-use crate::Relay;
 use crate::inbox::Item;
+use crate::{Relay, oauth};
 use axum::Router;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -29,9 +30,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-/// The account a request's token belongs to (set by the auth layer).
-#[derive(Debug, Clone, Copy)]
-struct AccountId(i64);
+/// Who a request comes from (set by the auth layer): the token's account
+/// and the scopes it was granted.
+#[derive(Debug, Clone)]
+struct Caller {
+    account: i64,
+    scopes: Vec<String>,
+}
 
 const INSTRUCTIONS: &str = "OpenDrop inbox: files the user sent to their assistant from \
 their own devices. Call list_inbox when the user mentions a file they just sent, then \
@@ -84,23 +89,72 @@ async fn require_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim);
-    let account = match token.map(|t| relay.store.token_account(t)) {
-        Some(Ok(Some(account))) => account,
-        Some(Err(e)) => {
-            eprintln!("token check: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
-                "a valid OpenDrop token is required",
-            )
-                .into_response();
-        }
+    let Some(token) = token else {
+        return unauthorized(&relay, None);
     };
-    request.extensions_mut().insert(AccountId(account));
-    next.run(request).await
+    match caller(&relay, token) {
+        Ok(Some(caller)) => {
+            request.extensions_mut().insert(caller);
+            next.run(request).await
+        }
+        Ok(None) => unauthorized(&relay, Some("the token is invalid, expired or revoked")),
+        Err(e) => {
+            eprintln!("token check: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// An OAuth access token issued for this MCP server, or a token from
+/// `opendrop relay token` (which can do everything).
+fn caller(relay: &Relay, token: &str) -> Result<Option<Caller>, String> {
+    if let Some(grant) = relay.store.access_token(token, relay.now())? {
+        // Tokens are bound to the resource they were issued for (RFC 8707).
+        if grant.resource != relay.mcp_resource() {
+            return Ok(None);
+        }
+        return Ok(Some(Caller {
+            account: grant.account_id,
+            scopes: grant.scope.split_whitespace().map(str::to_owned).collect(),
+        }));
+    }
+    Ok(relay.store.token_account(token)?.map(|account| Caller {
+        account,
+        scopes: oauth::ALL_SCOPES.iter().map(|s| (*s).to_owned()).collect(),
+    }))
+}
+
+/// `401` that tells OAuth clients where to sign in (RFC 9728 section 5.1).
+fn unauthorized(relay: &Relay, problem: Option<&str>) -> Response {
+    let mut challenge = format!(
+        "Bearer resource_metadata=\"{}\", scope=\"{}\"",
+        relay.resource_metadata_url(),
+        oauth::DEFAULT_SCOPE
+    );
+    if let Some(problem) = problem {
+        challenge.push_str(&format!(
+            ", error=\"invalid_token\", error_description=\"{problem}\""
+        ));
+    }
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        "sign in to OpenDrop to use this connector",
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("www-authenticate"),
+    );
+    response
 }
 
 #[derive(Clone)]
@@ -115,12 +169,21 @@ pub struct InboxArgs {
     pub inbox_id: String,
 }
 
-fn account(ctx: &RequestContext<RoleServer>) -> Option<i64> {
-    ctx.extensions
-        .get::<axum::http::request::Parts>()?
+/// The caller's account, if its token has `scope`.
+fn account(ctx: &RequestContext<RoleServer>, scope: &str) -> Result<i64, CallToolResult> {
+    let caller = ctx
         .extensions
-        .get::<AccountId>()
-        .map(|a| a.0)
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<Caller>())
+        .ok_or_else(|| error("unauthorized", "no account for this request"))?;
+    if caller.scopes.iter().any(|s| s == scope) {
+        Ok(caller.account)
+    } else {
+        Err(error(
+            "insufficient_scope",
+            format!("this connection wasn't allowed {scope}; reconnect the connector to grant it"),
+        ))
+    }
 }
 
 fn error(code: &str, message: impl Into<String>) -> CallToolResult {
@@ -167,8 +230,9 @@ impl InboxMcp {
         and that haven't been read yet, newest first. Files leave the inbox when read or after 24 hours."
     )]
     pub async fn list_inbox(&self, ctx: RequestContext<RoleServer>) -> CallToolResult {
-        let Some(account) = account(&ctx) else {
-            return error("unauthorized", "no account for this request");
+        let account = match account(&ctx, oauth::SCOPE_INBOX_READ) {
+            Ok(account) => account,
+            Err(refused) => return refused,
         };
         match self.relay.store.inbox(account, self.relay.now()) {
             Ok(items) => CallToolResult::structured(json!({
@@ -188,8 +252,9 @@ impl InboxMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<InboxArgs>,
     ) -> CallToolResult {
-        let Some(account) = account(&ctx) else {
-            return error("unauthorized", "no account for this request");
+        let account = match account(&ctx, oauth::SCOPE_INBOX_READ) {
+            Ok(account) => account,
+            Err(refused) => return refused,
         };
         let found = match self
             .relay
@@ -243,8 +308,9 @@ impl InboxMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<InboxArgs>,
     ) -> CallToolResult {
-        let Some(account) = account(&ctx) else {
-            return error("unauthorized", "no account for this request");
+        let account = match account(&ctx, oauth::SCOPE_INBOX_WRITE) {
+            Ok(account) => account,
+            Err(refused) => return refused,
         };
         match self
             .relay

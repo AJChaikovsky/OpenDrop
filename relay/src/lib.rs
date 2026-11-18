@@ -12,6 +12,7 @@
 
 pub mod inbox;
 pub mod mcp;
+pub mod oauth;
 pub mod store;
 
 use axum::Router;
@@ -190,6 +191,7 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/v1/login/verify", get(verify))
         .route("/healthz", get(|| async { "ok" }))
         .nest("/mcp", mcp::router(Arc::clone(&relay)))
+        .merge(oauth::router())
         .with_state(relay)
 }
 
@@ -204,12 +206,21 @@ pub async fn serve(listener: tokio::net::TcpListener, relay: Arc<Relay>) -> std:
             match sweeper.upgrade() {
                 Some(relay) => {
                     relay.expire_inbox();
+                    relay.expire_oauth();
                 }
                 None => return,
             }
         }
     });
     axum::serve(listener, router(relay)).await
+}
+
+const NO_SUCH_CODE: &str = "no sign-in is waiting with that code (it was mistyped, already answered, or is over 10 minutes old)";
+
+fn oauth_redirect_host(uri: &str) -> String {
+    let rest = uri.split("://").nth(1).unwrap_or(uri);
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    authority.rsplit('@').next().unwrap_or(authority).to_owned()
 }
 
 fn random_token() -> String {
@@ -394,6 +405,40 @@ async fn handle(relay: Arc<Relay>, mut socket: WebSocket) -> Done {
                 };
                 let count = relay.store.revoke_tokens(account_id)? as u64;
                 send(&mut socket, &ServerMsg::TokensRevoked { count }).await?;
+            }
+            ClientMsg::AuthorizeLookup { session, user_code } => {
+                if relay.store.session_account(&session)?.is_none() {
+                    return refuse(&mut socket, codes::BAD_SESSION, "not signed in").await;
+                }
+                let Some(request) = relay.pending_authorization(&user_code)? else {
+                    return refuse(&mut socket, codes::UNKNOWN_CODE, NO_SUCH_CODE).await;
+                };
+                send(
+                    &mut socket,
+                    &ServerMsg::AuthorizeRequest {
+                        client_name: request.client_name,
+                        redirect_host: oauth_redirect_host(&request.redirect_uri),
+                        scopes: request
+                            .scope
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect(),
+                    },
+                )
+                .await?;
+            }
+            ClientMsg::AuthorizeDecide {
+                session,
+                user_code,
+                allow,
+            } => {
+                let Some((account_id, _)) = relay.store.session_account(&session)? else {
+                    return refuse(&mut socket, codes::BAD_SESSION, "not signed in").await;
+                };
+                if !relay.decide_authorization(&user_code, account_id, allow)? {
+                    return refuse(&mut socket, codes::UNKNOWN_CODE, NO_SUCH_CODE).await;
+                }
+                send(&mut socket, &ServerMsg::AuthorizeDecided { allowed: allow }).await?;
             }
         }
     }

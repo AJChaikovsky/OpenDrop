@@ -362,6 +362,60 @@ pub async fn revoke_tokens(config: &Config) -> Result<u64, BoxError> {
     }
 }
 
+/// An assistant app's sign-in waiting for approval on a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizeRequest {
+    pub client_name: String,
+    pub redirect_host: String,
+    pub scopes: Vec<String>,
+}
+
+/// What the app showing `user_code` in its sign-in page asks for.
+pub async fn authorize_lookup(
+    config: &Config,
+    user_code: &str,
+) -> Result<AuthorizeRequest, BoxError> {
+    let mut connection = Connection::open(&config.url).await?;
+    connection
+        .send(&ClientMsg::AuthorizeLookup {
+            session: config.session.clone(),
+            user_code: user_code.to_owned(),
+        })
+        .await?;
+    match connection.receive(REPLY_TIMEOUT).await? {
+        ServerMsg::AuthorizeRequest {
+            client_name,
+            redirect_host,
+            scopes,
+        } => Ok(AuthorizeRequest {
+            client_name,
+            redirect_host,
+            scopes,
+        }),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Allow (or deny) that sign-in for this device's account.
+pub async fn authorize_decide(
+    config: &Config,
+    user_code: &str,
+    allow: bool,
+) -> Result<(), BoxError> {
+    let mut connection = Connection::open(&config.url).await?;
+    connection
+        .send(&ClientMsg::AuthorizeDecide {
+            session: config.session.clone(),
+            user_code: user_code.to_owned(),
+            allow,
+        })
+        .await?;
+    match connection.receive(REPLY_TIMEOUT).await? {
+        ServerMsg::AuthorizeDecided { .. } => Ok(()),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Where the device's relay connection stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {

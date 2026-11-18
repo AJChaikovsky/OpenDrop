@@ -44,6 +44,19 @@ pub enum ServerMsg {
     TokensRevoked {
         count: u64,
     },
+    /// What an assistant app is asking for, for the code shown in its
+    /// sign-in page (answer to `authorize_lookup`).
+    AuthorizeRequest {
+        /// The name the app registered with (its own claim).
+        client_name: String,
+        /// Where the browser goes back to, e.g. `claude.ai`.
+        redirect_host: String,
+        scopes: Vec<String>,
+    },
+    /// The request was allowed or denied; the browser page moves on.
+    AuthorizeDecided {
+        allowed: bool,
+    },
     /// The request was refused; the relay closes the connection after this.
     Error {
         code: String,
@@ -93,9 +106,20 @@ pub enum ClientMsg {
         session: String,
         label: String,
     },
-    /// Revoke all of the account's connector tokens.
+    /// Revoke all of the account's connector tokens (OAuth ones included).
     RevokeTokens {
         session: String,
+    },
+    /// Look up the assistant-app sign-in waiting with this code.
+    AuthorizeLookup {
+        session: String,
+        user_code: String,
+    },
+    /// Allow (or deny) that sign-in for the session's account.
+    AuthorizeDecide {
+        session: String,
+        user_code: String,
+        allow: bool,
     },
 }
 
@@ -122,6 +146,8 @@ pub mod codes {
     pub const TOO_LARGE: &str = "too_large";
     pub const QUOTA: &str = "quota";
     pub const BAD_UPLOAD: &str = "bad_upload";
+    /// No assistant sign-in is waiting with that code (wrong or expired).
+    pub const UNKNOWN_CODE: &str = "unknown_code";
 }
 
 /// What a device signs to register to `account` on the connection whose
