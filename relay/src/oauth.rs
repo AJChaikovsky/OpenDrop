@@ -1032,11 +1032,11 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         assert!(pkce_matches(
             verifier,
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGKSsTyfh8"
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         ));
         assert!(!pkce_matches(
             verifier,
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGKSsTyfh9"
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cN"
         ));
     }
 
