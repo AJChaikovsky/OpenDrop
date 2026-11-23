@@ -153,10 +153,11 @@ pub(super) async fn answer_next(
     request.fetch
 }
 
-/// Issue #22 acceptance: exactly the tools (five from #22, plus send_file from #29), each with a valid input
-/// schema and the documented read-only annotations.
+/// Issue #22 acceptance: exactly the tools (five from #22, send_file from #29, and the two
+/// relay tools from #46), each with a valid input schema and the documented read-only
+/// annotations.
 #[tokio::test]
-async fn lists_exactly_six_tools_with_valid_schemas() {
+async fn lists_exactly_eight_tools_with_valid_schemas() {
     let rig = rig(b"pdf").await;
     let client = connect(&rig.requester_config).await;
     let tools = client.list_all_tools().await.unwrap();
@@ -169,8 +170,10 @@ async fn lists_exactly_six_tools_with_valid_schemas() {
             "cancel_transfer",
             "get_transfer_status",
             "list_devices",
+            "list_remote_files",
             "list_shared_files",
             "request_file",
+            "request_remote_file",
             "send_file"
         ]
     );
@@ -193,7 +196,7 @@ async fn lists_exactly_six_tools_with_valid_schemas() {
         let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
         let expected = !matches!(
             tool.name.as_ref(),
-            "request_file" | "cancel_transfer" | "send_file"
+            "request_file" | "cancel_transfer" | "send_file" | "request_remote_file"
         );
         assert_eq!(read_only, Some(expected), "{} read_only_hint", tool.name);
     }

@@ -540,8 +540,10 @@ fn mcp_server_answers_over_stdio() {
             "cancel_transfer",
             "get_transfer_status",
             "list_devices",
+            "list_remote_files",
             "list_shared_files",
             "request_file",
+            "request_remote_file",
             "send_file"
         ]
     );

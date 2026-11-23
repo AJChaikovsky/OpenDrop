@@ -335,6 +335,20 @@ impl Store {
         Ok(())
     }
 
+    /// The account and label of a (not revoked) token.
+    pub fn token_info(&self, token: &str) -> Result<Option<(i64, String)>> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT account_id, label FROM api_tokens WHERE token_hash = ?1 AND revoked = 0",
+                params![hash(token)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(err)
+    }
+
     /// The account a (not revoked) token belongs to.
     pub fn token_account(&self, token: &str) -> Result<Option<i64>> {
         self.db

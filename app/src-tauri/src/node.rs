@@ -83,6 +83,9 @@ pub struct FetchDetails {
     /// The folder the user may let this device fetch from for 10 minutes
     /// without asking, along with a yes.
     pub grant_folder: Option<String>,
+    /// Over the relay the offer is standing access instead: a yes with it
+    /// lets the requester fetch any file here without asking, until revoked.
+    pub grant_always: bool,
 }
 
 /// Everything the UI needs to hear about. Serialized as
@@ -226,6 +229,8 @@ pub struct Node {
     sink: EventSink,
     /// Finished transfers, kept across restarts.
     pub history: Arc<History>,
+    /// Standing access given over the relay (with a config dir).
+    access: Option<opendrop::relay::access::Access>,
     next_send_id: AtomicU64,
     /// The runtime the node was started on, for work started from plain
     /// (non-async) methods: Tauri runs sync commands on the main thread,
@@ -314,7 +319,12 @@ impl Node {
                 Some(config) => AuditLog::open(config),
                 None => AuditLog::in_memory(),
             }),
-            control: config_dir,
+            // Signed in with `opendrop relay login`: stay reachable from
+            // the account's other devices and its assistants.
+            relay: config_dir
+                .as_deref()
+                .and_then(|c| opendrop::relay::Config::load(c).ok().flatten()),
+            control: config_dir.clone(),
             shares,
             ..daemon::Options::new(
                 identity.clone(),
@@ -373,6 +383,9 @@ impl Node {
             pair_prompts,
             sink,
             history,
+            access: config_dir
+                .as_deref()
+                .map(opendrop::relay::access::Access::new),
             next_send_id: AtomicU64::new(1),
             runtime: tokio::runtime::Handle::current(),
         }))
@@ -413,6 +426,26 @@ impl Node {
             (self.sink)(AppEvent::HistoryAdded { entry });
         }
         respond.send(accept).is_ok()
+    }
+
+    /// Who may fetch any file here over the relay without asking.
+    pub fn relay_access(&self) -> Result<Vec<opendrop::relay::access::Standing>, String> {
+        match &self.access {
+            Some(access) => access.list().map_err(|e| e.to_string()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Take standing access away from requester `id`. Returns whether it
+    /// had it.
+    pub fn revoke_relay_access(&self, id: &str) -> Result<bool, String> {
+        match &self.access {
+            Some(access) => access
+                .revoke(id)
+                .map(|gone| !gone.is_empty())
+                .map_err(|e| e.to_string()),
+            None => Ok(false),
+        }
     }
 
     /// Call off transfer `transfer_id`, in either direction, waiting or
@@ -792,6 +825,7 @@ async fn forward_requests(
         } = request;
         let grant = fetch.as_ref().and_then(|f| f.grant.clone());
         let grant_folder = grant.as_ref().map(|g| g.folder.display().to_string());
+        let grant_always = grant.as_ref().is_some_and(|g| g.always);
         if let Some(grant) = grant {
             grant_offers
                 .lock()
@@ -818,6 +852,7 @@ async fn forward_requests(
                 reason: f.reason,
                 via_assistant: f.via_assistant,
                 grant_folder,
+                grant_always,
             }),
         });
         let pending = Arc::clone(&pending);
@@ -1144,6 +1179,7 @@ mod tests {
                 reason: "To summarize your notes".into(),
                 via_assistant: true,
                 grant_folder: Some(docs.canonicalize().unwrap().display().to_string()),
+                grant_always: false,
             })
         );
         // Yes, and let it fetch from that folder for 10 minutes.

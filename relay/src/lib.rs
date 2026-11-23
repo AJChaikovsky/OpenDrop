@@ -10,7 +10,9 @@
 //! `opendrop::relay::proto`); the only other routes are the sign-in link a
 //! person opens in a browser and a health check.
 
+pub mod email;
 pub mod inbox;
+pub mod jobs;
 pub mod mcp;
 pub mod oauth;
 pub mod store;
@@ -23,13 +25,16 @@ use axum::routing::get;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use opendrop::relay::proto::{ClientMsg, DeviceStatus, ServerMsg, codes};
-use opendrop::relay::proto::{hello_message, register_message, upload_message};
+use opendrop::relay::proto::{
+    hello_message, job_download_message, job_upload_message, register_message, upload_message,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::{Store, Verified};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 
 /// How the relay emails sign-in links.
 pub trait Mailer: Send + Sync {
@@ -99,13 +104,20 @@ impl Config {
     }
 }
 
+/// One hello connection: its number and where to send it messages.
+type Outbox = (u64, mpsc::UnboundedSender<ServerMsg>);
+
 pub struct Relay {
     store: Store,
     blobs: inbox::Blobs,
     mailer: Box<dyn Mailer>,
     config: Config,
-    /// Connections per online device id.
-    online: Mutex<HashMap<String, usize>>,
+    /// The hello connections of each online device id, newest last: where
+    /// to send it requests.
+    online: Mutex<HashMap<String, Vec<Outbox>>>,
+    next_connection: AtomicU64,
+    /// Requests routed to devices (`jobs`).
+    jobs: Mutex<HashMap<String, jobs::Job>>,
     /// Sign-ins waiting for their link to be opened.
     waiting: Mutex<HashMap<String, Arc<Notify>>>,
     /// Recent sign-in requests per email, for rate limiting.
@@ -125,6 +137,8 @@ impl Relay {
             mailer,
             config,
             online: Mutex::new(HashMap::new()),
+            next_connection: AtomicU64::new(1),
+            jobs: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             recent_logins: Mutex::new(HashMap::new()),
         })
@@ -159,17 +173,43 @@ impl Relay {
         self.online.lock().unwrap().contains_key(device_id)
     }
 
-    fn set_online(&self, device_id: &str, up: bool) {
-        let mut online = self.online.lock().unwrap();
-        let count = online.entry(device_id.to_owned()).or_insert(0);
-        if up {
-            *count += 1;
-        } else {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+    /// A hello connection of `device_id` came up; returns its number.
+    fn connect_device(&self, device_id: &str, outbox: mpsc::UnboundedSender<ServerMsg>) -> u64 {
+        let n = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        self.online
+            .lock()
+            .unwrap()
+            .entry(device_id.to_owned())
+            .or_default()
+            .push((n, outbox));
+        n
+    }
+
+    /// Hello connection `n` of `device_id` ended.
+    fn disconnect_device(&self, device_id: &str, n: u64) {
+        let gone = {
+            let mut online = self.online.lock().unwrap();
+            let connections = online.entry(device_id.to_owned()).or_default();
+            connections.retain(|(c, _)| *c != n);
+            let gone = connections.is_empty();
+            if gone {
                 online.remove(device_id);
             }
+            gone
+        };
+        if gone {
+            self.device_gone(device_id);
         }
+    }
+
+    /// Send `msg` on `device_id`'s newest hello connection. False when it
+    /// isn't connected.
+    fn push(&self, device_id: &str, msg: ServerMsg) -> bool {
+        let online = self.online.lock().unwrap();
+        online
+            .get(device_id)
+            .and_then(|c| c.last())
+            .is_some_and(|(_, outbox)| outbox.send(msg).is_ok())
     }
 
     fn login_allowed(&self, email: &str) -> bool {
@@ -206,6 +246,7 @@ pub async fn serve(listener: tokio::net::TcpListener, relay: Arc<Relay>) -> std:
             match sweeper.upgrade() {
                 Some(relay) => {
                     relay.expire_inbox();
+                    relay.expire_jobs();
                 }
                 None => return,
             }
@@ -397,6 +438,46 @@ async fn handle(relay: Arc<Relay>, mut socket: WebSocket) -> Done {
                 let count = relay.store.revoke_tokens(account_id)? as u64;
                 send(&mut socket, &ServerMsg::TokensRevoked { count }).await?;
             }
+            ClientMsg::JobUpload {
+                device_id,
+                job_id,
+                name,
+                size,
+                sha256,
+                signature,
+            } => {
+                return job_upload(
+                    &relay,
+                    &mut socket,
+                    &nonce,
+                    &device_id,
+                    &job_id,
+                    &name,
+                    size,
+                    &sha256,
+                    &signature,
+                )
+                .await;
+            }
+            ClientMsg::JobDownload {
+                device_id,
+                job_id,
+                signature,
+            } => {
+                return job_download(&relay, &mut socket, &nonce, &device_id, &job_id, &signature)
+                    .await;
+            }
+            ClientMsg::JobAnswer { .. }
+            | ClientMsg::ListAnswer { .. }
+            | ClientMsg::RemoteFetch { .. }
+            | ClientMsg::RemoteList { .. } => {
+                return refuse(
+                    &mut socket,
+                    codes::BAD_REQUEST,
+                    "this goes on a hello connection",
+                )
+                .await;
+            }
         }
     }
 }
@@ -470,35 +551,7 @@ async fn upload(
         )
         .await;
     }
-    send(socket, &ServerMsg::UploadReady).await?;
-    let mut data = Vec::with_capacity(size as usize);
-    while (data.len() as u64) < size {
-        let frame = tokio::time::timeout(relay.config.request_timeout, socket.recv())
-            .await
-            .map_err(|_| "upload stalled".to_owned())?;
-        match frame {
-            Some(Ok(Message::Binary(chunk))) => {
-                if data.len() as u64 + chunk.len() as u64 > size {
-                    return refuse(socket, codes::BAD_UPLOAD, "more data than announced").await;
-                }
-                data.extend_from_slice(&chunk);
-            }
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-            _ => return Err("upload ended early".to_owned()),
-        }
-    }
-    let digest: String = Sha256::digest(&data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    if !digest.eq_ignore_ascii_case(sha256) {
-        return refuse(
-            socket,
-            codes::BAD_UPLOAD,
-            "the file's SHA-256 doesn't match; nothing was saved",
-        )
-        .await;
-    }
+    let (data, digest) = receive_file(relay, socket, size, sha256).await?;
     let item = inbox::Item {
         inbox_id: format!("in_{}", &random_token()[..22]),
         account_id: device.account_id,
@@ -523,6 +576,226 @@ async fn upload(
         },
     )
     .await
+}
+
+/// After `upload_ready`, read exactly `size` bytes whose SHA-256 must be
+/// `sha256`. Returns them and their digest; a mismatch is refused.
+async fn receive_file(
+    relay: &Relay,
+    socket: &mut WebSocket,
+    size: u64,
+    sha256: &str,
+) -> Result<(Vec<u8>, String), String> {
+    send(socket, &ServerMsg::UploadReady).await?;
+    let mut data = Vec::with_capacity(size as usize);
+    while (data.len() as u64) < size {
+        let frame = tokio::time::timeout(relay.config.request_timeout, socket.recv())
+            .await
+            .map_err(|_| "upload stalled".to_owned())?;
+        match frame {
+            Some(Ok(Message::Binary(chunk))) => {
+                if data.len() as u64 + chunk.len() as u64 > size {
+                    refuse(socket, codes::BAD_UPLOAD, "more data than announced").await?;
+                }
+                data.extend_from_slice(&chunk);
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            _ => return Err("upload ended early".to_owned()),
+        }
+    }
+    let digest: String = Sha256::digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !digest.eq_ignore_ascii_case(sha256) {
+        refuse(
+            socket,
+            codes::BAD_UPLOAD,
+            "the file's SHA-256 doesn't match; nothing was saved",
+        )
+        .await?;
+    }
+    Ok((data, digest))
+}
+
+/// Only the base name, and nothing a file system or a chat would trip on.
+fn clean_name(name: &str) -> String {
+    name.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect()
+}
+
+/// The device `device_id`, if its signature over `message` checks out.
+async fn signed_device(
+    relay: &Relay,
+    socket: &mut WebSocket,
+    device_id: &str,
+    signature: &str,
+    message: impl FnOnce() -> Vec<u8>,
+) -> Result<store::Device, String> {
+    let Some(device) = relay.store.device(device_id)? else {
+        refuse(
+            socket,
+            codes::UNKNOWN_DEVICE,
+            "this device isn't registered; run `opendrop relay login`",
+        )
+        .await?;
+        unreachable!("refuse always errs");
+    };
+    let Some(sig) = decode_signature(signature) else {
+        refuse(socket, codes::BAD_REQUEST, "malformed signature").await?;
+        unreachable!("refuse always errs");
+    };
+    if !opendrop::identity::verify(&device.public_key, &message(), &sig) {
+        refuse(
+            socket,
+            codes::BAD_SIGNATURE,
+            "the device's signature doesn't match its key",
+        )
+        .await?;
+    }
+    Ok(device)
+}
+
+/// A device sends the file of a job it approved.
+#[allow(clippy::too_many_arguments)]
+async fn job_upload(
+    relay: &Relay,
+    socket: &mut WebSocket,
+    nonce: &[u8],
+    device_id: &str,
+    job_id: &str,
+    name: &str,
+    size: u64,
+    sha256: &str,
+    signature: &str,
+) -> Done {
+    signed_device(relay, socket, device_id, signature, || {
+        job_upload_message(device_id, job_id, name, size, sha256, nonce)
+    })
+    .await?;
+    let Some((account_id, source, delivery)) = relay.upload_slot(device_id, job_id) else {
+        return refuse(
+            socket,
+            codes::UNKNOWN_JOB,
+            "no approved request for that file",
+        )
+        .await;
+    };
+    let name = clean_name(name);
+    if name.is_empty() || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        relay.upload_failed(job_id, "the device sent no file name or SHA-256");
+        return refuse(socket, codes::BAD_REQUEST, "missing file name or SHA-256").await;
+    }
+    let room = match delivery {
+        jobs::Delivery::Inbox => relay.inbox_room(account_id, size),
+        jobs::Delivery::Device { .. } if size > inbox::MAX_FILE => {
+            relay.inbox_room(account_id, size)
+        }
+        jobs::Delivery::Device { .. } => Ok(()),
+    };
+    if let Err((code, message)) = room {
+        relay.upload_failed(job_id, &message);
+        return refuse(socket, code, &message).await;
+    }
+    let (data, digest) = match receive_file(relay, socket, size, sha256).await {
+        Ok(received) => received,
+        Err(e) => {
+            relay.upload_failed(job_id, &format!("the upload broke off ({e})"));
+            return Err(e);
+        }
+    };
+    match delivery {
+        jobs::Delivery::Inbox => {
+            let now = relay.now();
+            let item = inbox::Item {
+                inbox_id: format!("in_{}", &random_token()[..22]),
+                account_id,
+                mime: inbox::mime_for(&name).to_owned(),
+                name,
+                size,
+                sha256: digest,
+                from_device: source.name.clone(),
+                sent_ms: now,
+                expires_ms: now + inbox::TTL_MS,
+            };
+            let wrapped = relay.blobs.put(&item.inbox_id, &data)?;
+            if let Err(e) = relay.store.add_inbox_item(&item, &wrapped) {
+                relay.blobs.delete(&item.inbox_id);
+                relay.upload_failed(job_id, "the relay couldn't store it");
+                return Err(e);
+            }
+            relay.uploaded_to_inbox(job_id, item.inbox_id);
+        }
+        jobs::Delivery::Device { .. } => {
+            let wrapped = relay.blobs.put(job_id, &data)?;
+            relay.uploaded_for_device(
+                job_id,
+                jobs::Held {
+                    name,
+                    size,
+                    sha256: digest,
+                    wrapped,
+                },
+            );
+        }
+    }
+    send(socket, &ServerMsg::JobUploaded).await
+}
+
+/// A device collects a file another device sent it.
+async fn job_download(
+    relay: &Relay,
+    socket: &mut WebSocket,
+    nonce: &[u8],
+    device_id: &str,
+    job_id: &str,
+    signature: &str,
+) -> Done {
+    signed_device(relay, socket, device_id, signature, || {
+        job_download_message(device_id, job_id, nonce)
+    })
+    .await?;
+    let Some(held) = relay.collect(device_id, job_id) else {
+        return refuse(
+            socket,
+            codes::UNKNOWN_JOB,
+            "no file waiting for this device",
+        )
+        .await;
+    };
+    let data = match relay.blobs.get(job_id, &held.wrapped) {
+        Ok(data) => data,
+        Err(e) => {
+            relay.collected(job_id, false);
+            return Err(e);
+        }
+    };
+    let result = async {
+        send(
+            socket,
+            &ServerMsg::DownloadReady {
+                name: held.name.clone(),
+                size: held.size,
+                sha256: held.sha256.clone(),
+            },
+        )
+        .await?;
+        for chunk in data.chunks(32 * 1024) {
+            socket
+                .send(Message::binary(chunk.to_vec()))
+                .await
+                .map_err(|e| format!("send failed: {e}"))?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    relay.collected(job_id, result.is_ok());
+    result
 }
 
 async fn login(relay: &Relay, socket: &mut WebSocket, email: &str) -> Done {
@@ -695,16 +968,23 @@ async fn hello(
     }
     let account = relay.store.account_email(device.account_id)?;
     send(&mut socket, &ServerMsg::Welcome { account }).await?;
-    relay.set_online(device_id, true);
+    let (outbox, mut outgoing) = mpsc::unbounded_channel();
+    let connection = relay.connect_device(device_id, outbox);
     relay.store.touch_device(device_id)?;
-    let result = stay_online(relay, &mut socket).await;
-    relay.set_online(device_id, false);
+    let result = stay_online(relay, &device, &mut socket, &mut outgoing).await;
+    relay.disconnect_device(device_id, connection);
     relay.store.touch_device(device_id)?;
     result
 }
 
-/// Ping the device and wait; return when it hangs up or goes quiet.
-async fn stay_online(relay: &Relay, socket: &mut WebSocket) -> Done {
+/// Ping the device, pass it requests and take its answers; return when it
+/// hangs up or goes quiet.
+async fn stay_online(
+    relay: &Relay,
+    device: &store::Device,
+    socket: &mut WebSocket,
+    outgoing: &mut mpsc::UnboundedReceiver<ServerMsg>,
+) -> Done {
     let mut ping = tokio::time::interval(relay.config.ping_interval);
     ping.tick().await;
     let mut last_heard = Instant::now();
@@ -712,9 +992,16 @@ async fn stay_online(relay: &Relay, socket: &mut WebSocket) -> Done {
         tokio::select! {
             frame = socket.recv() => match frame {
                 None | Some(Ok(Message::Close(_))) | Some(Err(_)) => return Ok(()),
+                Some(Ok(Message::Text(text))) => {
+                    last_heard = Instant::now();
+                    if let Ok(msg) = serde_json::from_str::<ClientMsg>(&text) {
+                        relay.device_request(device, msg);
+                    }
+                }
                 // Anything, pongs included, shows the device is still there.
                 Some(Ok(_)) => last_heard = Instant::now(),
             },
+            Some(msg) = outgoing.recv() => send(socket, &msg).await?,
             _ = ping.tick() => {
                 if last_heard.elapsed() >= relay.config.idle_timeout {
                     let _ = socket.send(Message::Close(None)).await;

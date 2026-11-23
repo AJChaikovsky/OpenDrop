@@ -185,6 +185,20 @@ fn respond_pair(node: State<'_, Arc<Node>>, pair_id: String, accept: bool) -> bo
     node.respond_pair(&pair_id, accept)
 }
 
+/// Who may fetch any file here over the relay without asking.
+#[tauri::command]
+fn relay_access(
+    node: State<'_, Arc<Node>>,
+) -> Result<Vec<opendrop::relay::access::Standing>, String> {
+    node.relay_access()
+}
+
+/// Take standing access away. Returns whether it was there.
+#[tauri::command]
+fn revoke_relay_access(node: State<'_, Arc<Node>>, id: String) -> Result<bool, String> {
+    node.revoke_relay_access(&id)
+}
+
 /// Forget a paired device. Returns whether it was paired.
 #[tauri::command]
 fn unpair_device(node: State<'_, Arc<Node>>, device_id: String) -> Result<bool, String> {
@@ -220,7 +234,9 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         take_send_paths,
         send_clipboard,
         context_menu_status,
-        set_context_menu
+        set_context_menu,
+        relay_access,
+        revoke_relay_access
     ])
 }
 

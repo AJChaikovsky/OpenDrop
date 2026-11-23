@@ -1,6 +1,7 @@
 //! `opendrop-relay`: run the OpenDrop relay server.
 
-use opendrop_relay::{Config, LogMailer, Relay, inbox::Blobs, serve, store::Store};
+use opendrop_relay::email::{DEFAULT_FROM, ResendMailer};
+use opendrop_relay::{Config, LogMailer, Mailer, Relay, inbox::Blobs, serve, store::Store};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -18,8 +19,10 @@ USAGE:
                        https://$FLY_APP_NAME.fly.dev on Fly.io, else
                        http://<bind address>)
 
-Sign-in links are printed here rather than emailed. The hosted MCP server for
-assistants is at <public URL>/mcp (needs a token from `opendrop relay token`).";
+Sign-in links are printed here, or emailed through Resend when RESEND_API_KEY
+is set (sender: $OPENDROP_RELAY_EMAIL_FROM, default onboarding@resend.dev).
+The hosted MCP server for assistants is at <public URL>/mcp (OAuth, or a token
+from `opendrop relay token`).";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -82,7 +85,19 @@ async fn main() -> ExitCode {
         })
         .unwrap_or_else(|| format!("http://{bind}"));
     println!("OpenDrop relay listening on {bind}, reachable as {public_url}");
-    let relay = Relay::new(store, blobs, Box::new(LogMailer), Config::new(public_url));
+    let mailer: Box<dyn Mailer> = match std::env::var("RESEND_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => {
+            let from = std::env::var("OPENDROP_RELAY_EMAIL_FROM")
+                .unwrap_or_else(|_| DEFAULT_FROM.to_owned());
+            println!("Sign-in links are emailed through Resend, from {from}");
+            Box::new(ResendMailer::new(key.trim(), from))
+        }
+        _ => {
+            println!("Sign-in links are printed here (set RESEND_API_KEY to email them)");
+            Box::new(LogMailer)
+        }
+    };
+    let relay = Relay::new(store, blobs, mailer, Config::new(public_url));
     match serve(listener, relay).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

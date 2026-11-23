@@ -27,6 +27,17 @@ export interface FetchDetails {
   /** The folder the user may let this device fetch from for 10 minutes
    * without asking, along with a yes. */
   grant_folder: string | null;
+  /** Over the relay: the offer is standing access to the whole device
+   * (until revoked) instead of 10 minutes of one folder. */
+  grant_always?: boolean;
+}
+
+/** Someone who may fetch any file here over the relay without asking. */
+export interface StandingAccess {
+  id: string;
+  kind: "assistant" | "device";
+  name: string;
+  granted_ms: number;
 }
 
 export type PairStatus = "paired" | "declined" | "declined_by_peer" | "timed_out" | "failed";

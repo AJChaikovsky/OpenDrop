@@ -12,9 +12,11 @@ COPY relay relay
 COPY app/src-tauri app/src-tauri
 RUN cargo build --release --locked -p opendrop-relay
 
-# The relay makes no outbound TLS calls (and rustls carries its own roots),
-# so the slim image needs nothing added.
 FROM debian:bookworm-slim
+# CA roots for HTTPS calls out (emailing sign-in links through Resend).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/opendrop-relay /usr/local/bin/opendrop-relay
 # Accounts, devices, the encrypted inbox and its key: mount a volume here.
 VOLUME /data

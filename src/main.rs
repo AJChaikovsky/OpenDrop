@@ -69,6 +69,15 @@ USAGE:
                                     (read once, or deleted after 24 hours)
     opendrop relay token              a token for the relay's MCP server (/mcp)
     opendrop relay revoke-tokens      revoke all of those tokens
+    opendrop relay files <DEVICE> [FOLDER] [--find TEXT]
+                                    list a folder (home by default) on one of your
+                                    devices anywhere, or find files by name
+    opendrop relay fetch <DEVICE> <PATH> [--reason TEXT]
+                                    get a file from one of your devices anywhere;
+                                    its owner approves (or gave standing access)
+    opendrop relay access             who may fetch from this device without asking
+    opendrop relay revoke <NAME|ID|all>
+                                    take that standing access away
     opendrop relay logout             stop using the relay
     opendrop mcp                      MCP server on stdin/stdout for AI assistants
                                     (Claude Code: claude mcp add opendrop -- opendrop mcp);
@@ -110,6 +119,7 @@ async fn main() -> ExitCode {
     let auto_accept = take_switch(&mut args, "--auto-accept");
     let allow_unpaired_fetch = take_switch(&mut args, "--allow-unpaired-fetch");
     let reason = take_flag(&mut args, "--reason").unwrap_or_default();
+    let find = take_flag(&mut args, "--find");
     let relay_url =
         take_flag(&mut args, "--relay").or_else(|| std::env::var("OPENDROP_RELAY").ok());
     let config_dir = take_flag(&mut args, "--config")
@@ -174,6 +184,20 @@ async fn main() -> ExitCode {
         ["relay", "logout"] => relay_logout(&me),
         ["relay", "token"] => relay_token(&me).await,
         ["relay", "revoke-tokens"] => relay_revoke(&me).await,
+        ["relay", "files", device] => relay_files(&me, device, None, find.as_deref()).await,
+        ["relay", "files", device, folder] => {
+            relay_files(&me, device, Some(folder), find.as_deref()).await
+        }
+        ["relay", "fetch", device, path] => {
+            let request = Request::RemoteFetch {
+                device: device.to_string(),
+                path: path.to_string(),
+                reason: reason.clone(),
+            };
+            follow_fetch(&me, request).await
+        }
+        ["relay", "access"] => relay_access(&me),
+        ["relay", "revoke", who] => relay_revoke_access(&me, who),
         ["help"] | ["--help"] | ["-h"] => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -306,6 +330,96 @@ async fn relay_revoke(me: &Me) -> ExitCode {
     match opendrop::relay::revoke_tokens(&config).await {
         Ok(n) => {
             println!("Revoked {n} token(s).");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+async fn relay_files(me: &Me, device: &str, folder: Option<&str>, find: Option<&str>) -> ExitCode {
+    let mut client = match Client::connect(&me.config_dir).await {
+        Ok(c) => c,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let request = Request::RemoteList {
+        device: device.to_owned(),
+        folder: folder.map(str::to_owned),
+        query: find.map(str::to_owned),
+    };
+    println!("Asking \"{device}\" (its owner may have to allow it)...");
+    match client.call(&request).await {
+        Ok(Response::RemoteFiles {
+            device_name,
+            folder,
+            entries,
+            truncated,
+        }) => {
+            println!("{device_name}: {folder}");
+            for e in &entries {
+                if e.is_dir {
+                    println!("  {:>9}  {}/", "folder", e.path);
+                } else {
+                    println!("  {:>9}  {}", human_size(e.size), e.path);
+                }
+            }
+            if entries.is_empty() {
+                println!("  (nothing)");
+            }
+            if truncated {
+                println!("  (more than fit; narrow it down)");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error { message, .. }) => fail(&message),
+        Ok(other) => fail(&format!("unexpected answer: {other:?}")),
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+fn relay_access(me: &Me) -> ExitCode {
+    let access = opendrop::relay::access::Access::new(&me.config_dir);
+    match access.list() {
+        Ok(list) if list.is_empty() => {
+            println!(
+                "Nobody has standing access: every request over the relay is asked here first."
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(list) => {
+            println!(
+                "May fetch any file on this device (except OpenDrop's own settings) without asking:"
+            );
+            for s in list {
+                let kind = match s.kind {
+                    opendrop::relay::proto::RequesterKind::Assistant => "assistant",
+                    opendrop::relay::proto::RequesterKind::Device => "device",
+                };
+                println!("  {kind:9}  \"{}\" ({})", s.name, s.id);
+            }
+            println!("Take it away with `opendrop relay revoke <NAME|ID|all>`.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+fn relay_revoke_access(me: &Me, who: &str) -> ExitCode {
+    let access = opendrop::relay::access::Access::new(&me.config_dir);
+    match access.revoke(who) {
+        Ok(gone) if gone.is_empty() && who == "all" => {
+            println!("Nobody had standing access.");
+            ExitCode::SUCCESS
+        }
+        Ok(gone) if gone.is_empty() => fail(&format!(
+            "nobody called \"{who}\" has standing access (see `opendrop relay access`)"
+        )),
+        Ok(gone) => {
+            for s in gone {
+                println!(
+                    "\"{}\" must ask again before fetching from this device.",
+                    s.name
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => fail(&e.to_string()),
@@ -823,15 +937,20 @@ async fn files(me: &Me, device: &str) -> ExitCode {
 /// Fetch a shared file from `device` through the running daemon, waiting
 /// for the owner's approval and showing progress.
 async fn fetch(me: &Me, device: &str, file: &str, reason: &str) -> ExitCode {
-    let mut client = match Client::connect(&me.config_dir).await {
-        Ok(c) => c,
-        Err(e) => return fail(&e.to_string()),
-    };
     let request = Request::Fetch {
         device: device.to_owned(),
         file: file.to_owned(),
         reason: reason.to_owned(),
         via_assistant: false,
+    };
+    follow_fetch(me, request).await
+}
+
+/// Start a fetch through the running daemon and follow it to the end.
+async fn follow_fetch(me: &Me, request: Request) -> ExitCode {
+    let mut client = match Client::connect(&me.config_dir).await {
+        Ok(c) => c,
+        Err(e) => return fail(&e.to_string()),
     };
     let id = match client.call(&request).await {
         Ok(Response::FetchStarted { transfer_id }) => transfer_id,
@@ -840,6 +959,7 @@ async fn fetch(me: &Me, device: &str, file: &str, reason: &str) -> ExitCode {
         Err(e) => return fail(&e.to_string()),
     };
     let mut bar: Option<Progress> = None;
+    let mut asked = false;
     loop {
         let transfer = match client
             .call(&Request::GetTransfer {
@@ -852,20 +972,24 @@ async fn fetch(me: &Me, device: &str, file: &str, reason: &str) -> ExitCode {
             Err(e) => return fail(&e.to_string()),
         };
         match transfer.status {
-            Status::AwaitingApproval if bar.is_none() => {
+            Status::AwaitingApproval if !asked => {
+                asked = true;
+                let size = if transfer.size > 0 {
+                    format!(" ({})", human_size(transfer.size))
+                } else {
+                    String::new()
+                };
                 println!(
-                    "Asked \"{}\" for \"{}\" ({}). Waiting for them to approve (up to {}s)...",
+                    "Asked \"{}\" for \"{}\"{size}. Waiting for them to approve (up to {}s)...",
                     transfer.peer_name,
                     transfer.name,
-                    human_size(transfer.size),
                     APPROVAL_TIMEOUT.as_secs()
                 );
-                bar = Some(Progress::new(Path::new(&transfer.name), transfer.size));
             }
             Status::Transferring => {
-                if let Some(bar) = &mut bar
-                    && transfer.bytes > 0
-                {
+                let bar = bar
+                    .get_or_insert_with(|| Progress::new(Path::new(&transfer.name), transfer.size));
+                if transfer.bytes > 0 {
                     bar.update(transfer.bytes);
                 }
             }
@@ -1166,6 +1290,15 @@ fn describe(peer: &Peer, paired: &PairedDevices) -> String {
     line
 }
 
+/// Where a request came from, for prompts: its IP, or the relay.
+fn where_from(addr: SocketAddr) -> String {
+    if addr.ip().is_unspecified() {
+        "over the relay".to_owned()
+    } else {
+        addr.ip().to_string()
+    }
+}
+
 /// Ask on the terminal about each offered file and each pairing request,
 /// one at a time. Requests that arrive while one is pending wait their turn.
 fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
@@ -1179,24 +1312,34 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                     format!("{}{}", if verified { "" } else { "[unverified device] " }, match &fetch {
                         None if text.is_some() => format!(
                             "\"{peer_name}\" ({}) wants to send you text ({}):\n  {}\n  Accept?",
-                            peer_addr.ip(),
+                            where_from(peer_addr),
                             human_size(size),
                             preview(text.as_deref().unwrap_or_default()),
                         ),
                         None if count.is_some() => format!(
                             "\"{peer_name}\" ({}) wants to send you the folder \"{name}\" ({} files, {}).\n  Accept?",
-                            peer_addr.ip(),
+                            where_from(peer_addr),
                             count.unwrap_or_default(),
                             human_size(size),
                         ),
                         None => format!(
                             "\"{peer_name}\" ({}) wants to send you \"{name}\" ({}).\n  Accept?",
-                            peer_addr.ip(),
+                            where_from(peer_addr),
                             human_size(size),
+                        ),
+                        Some(fetch) if fetch.grant.as_ref().is_some_and(|g| g.always) => format!(
+                            "Over the relay: \"{peer_name}\"{} asks for {}.{}\n  Allow it?",
+                            if fetch.via_assistant { " (an AI assistant)" } else { "" },
+                            if size > 0 { format!("\"{name}\" ({})", human_size(size)) } else { name.clone() },
+                            if fetch.reason.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n  Reason given: \"{}\"", fetch.reason)
+                            },
                         ),
                         Some(fetch) => format!(
                             "Fetch request: \"{peer_name}\" ({}) asks for your shared file \"{name}\" ({}){}.{}\n  Send it?",
-                            peer_addr.ip(),
+                            where_from(peer_addr),
                             human_size(size),
                             if fetch.via_assistant { " on behalf of an AI assistant" } else { "" },
                             if fetch.reason.is_empty() {
@@ -1230,6 +1373,10 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                 continue; // Timed out or the sender hung up while queued.
             }
             match &grant {
+                Some(grant) if grant.always => print!(
+                    "\n? {question} [y/N/a] (within {}s; a = yes, and always let it fetch any file here without asking; undo with `opendrop relay revoke`): ",
+                    limit.as_secs(),
+                ),
                 Some(grant) => print!(
                     "\n? {question} [y/N/a] (within {}s; a = yes, and let it fetch from {} for 10 minutes without asking): ",
                     limit.as_secs(),
@@ -1250,10 +1397,16 @@ fn spawn_prompt() -> (mpsc::Sender<FileRequest>, PairPrompts) {
                 .is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "a" | "always"));
             if let Some(grant) = grant.filter(|_| always) {
                 grant.accept();
-                println!(
-                    "  For 10 minutes, it can fetch from {} without asking.",
-                    grant.folder.display()
-                );
+                if grant.always {
+                    println!(
+                        "  It can now fetch any file here without asking, until `opendrop relay revoke`."
+                    );
+                } else {
+                    println!(
+                        "  For 10 minutes, it can fetch from {} without asking.",
+                        grant.folder.display()
+                    );
+                }
             }
             let _ = respond.send(always || is_yes(answer));
         }
