@@ -5,7 +5,8 @@ description = "OpenDrop relay: accounts, device registry and presence for the as
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 base64 = "0.22"
 chacha20poly1305 = "0.11.0"
 opendrop = { path = ".." }
@@ -21,5 +22,6 @@ tokio = { version = "1.54.1", features = ["full"] }
 [dev-dependencies]
 rmcp = { version = "3.8.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3.27.0"
+reqwest = { version = "0.13", default-features = false, features = ["multipart", "form"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"

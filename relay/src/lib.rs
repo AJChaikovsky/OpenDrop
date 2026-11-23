@@ -15,6 +15,7 @@ pub mod inbox;
 pub mod jobs;
 pub mod mcp;
 pub mod oauth;
+pub mod phone;
 pub mod store;
 
 use axum::Router;
@@ -212,7 +213,37 @@ impl Relay {
             .is_some_and(|(_, outbox)| outbox.send(msg).is_ok())
     }
 
-    fn login_allowed(&self, email: &str) -> bool {
+    /// Seal `data` into `account_id`'s assistant inbox as `name`, sent
+    /// from `from` (a device or phone name). `sha256` is its hex digest.
+    pub(crate) fn put_in_inbox(
+        &self,
+        account_id: i64,
+        from: &str,
+        name: String,
+        data: &[u8],
+        sha256: String,
+    ) -> Result<inbox::Item, String> {
+        let now = self.now();
+        let item = inbox::Item {
+            inbox_id: format!("in_{}", &random_token()[..22]),
+            account_id,
+            mime: inbox::mime_for(&name).to_owned(),
+            name,
+            size: data.len() as u64,
+            sha256,
+            from_device: from.to_owned(),
+            sent_ms: now,
+            expires_ms: now + inbox::TTL_MS,
+        };
+        let wrapped = self.blobs.put(&item.inbox_id, data)?;
+        if let Err(e) = self.store.add_inbox_item(&item, &wrapped) {
+            self.blobs.delete(&item.inbox_id);
+            return Err(e);
+        }
+        Ok(item)
+    }
+
+    pub(crate) fn login_allowed(&self, email: &str) -> bool {
         let window = Duration::from_secs(15 * 60);
         let mut recent = self.recent_logins.lock().unwrap();
         let times = recent.entry(email.to_owned()).or_default();
@@ -232,6 +263,7 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .nest("/mcp", mcp::router(Arc::clone(&relay)))
         .merge(oauth::router())
+        .merge(phone::router())
         .with_state(relay)
 }
 
@@ -255,7 +287,7 @@ pub async fn serve(listener: tokio::net::TcpListener, relay: Arc<Relay>) -> std:
     axum::serve(listener, router(relay)).await
 }
 
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     B64URL.encode(opendrop::identity::random_bytes())
 }
 
@@ -552,22 +584,7 @@ async fn upload(
         .await;
     }
     let (data, digest) = receive_file(relay, socket, size, sha256).await?;
-    let item = inbox::Item {
-        inbox_id: format!("in_{}", &random_token()[..22]),
-        account_id: device.account_id,
-        mime: inbox::mime_for(&name).to_owned(),
-        name,
-        size,
-        sha256: digest,
-        from_device: device.name.clone(),
-        sent_ms: now,
-        expires_ms: now + inbox::TTL_MS,
-    };
-    let wrapped = relay.blobs.put(&item.inbox_id, &data)?;
-    if let Err(e) = relay.store.add_inbox_item(&item, &wrapped) {
-        relay.blobs.delete(&item.inbox_id);
-        return Err(e);
-    }
+    let item = relay.put_in_inbox(device.account_id, &device.name, name, &data, digest)?;
     send(
         socket,
         &ServerMsg::Uploaded {
@@ -619,7 +636,7 @@ async fn receive_file(
 }
 
 /// Only the base name, and nothing a file system or a chat would trip on.
-fn clean_name(name: &str) -> String {
+pub(crate) fn clean_name(name: &str) -> String {
     name.rsplit(['/', '\\'])
         .next()
         .unwrap_or_default()
@@ -711,24 +728,13 @@ async fn job_upload(
     };
     match delivery {
         jobs::Delivery::Inbox => {
-            let now = relay.now();
-            let item = inbox::Item {
-                inbox_id: format!("in_{}", &random_token()[..22]),
-                account_id,
-                mime: inbox::mime_for(&name).to_owned(),
-                name,
-                size,
-                sha256: digest,
-                from_device: source.name.clone(),
-                sent_ms: now,
-                expires_ms: now + inbox::TTL_MS,
+            let item = match relay.put_in_inbox(account_id, &source.name, name, &data, digest) {
+                Ok(item) => item,
+                Err(e) => {
+                    relay.upload_failed(job_id, "the relay couldn't store it");
+                    return Err(e);
+                }
             };
-            let wrapped = relay.blobs.put(&item.inbox_id, &data)?;
-            if let Err(e) = relay.store.add_inbox_item(&item, &wrapped) {
-                relay.blobs.delete(&item.inbox_id);
-                relay.upload_failed(job_id, "the relay couldn't store it");
-                return Err(e);
-            }
             relay.uploaded_to_inbox(job_id, item.inbox_id);
         }
         jobs::Delivery::Device { .. } => {

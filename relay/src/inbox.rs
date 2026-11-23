@@ -193,6 +193,7 @@ pub fn mime_for(name: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "heic" | "heif" => "image/heic",
         "pdf" => "application/pdf",
         "zip" => "application/zip",
         _ => "application/octet-stream",

@@ -314,7 +314,7 @@ fn enc(s: &str) -> String {
     out
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -322,7 +322,7 @@ fn esc(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn page(title: &str, body: &str) -> Response {
+pub(crate) fn page(title: &str, body: &str) -> Response {
     (
         [
             (header::CACHE_CONTROL, "no-store"),

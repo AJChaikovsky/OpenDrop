@@ -139,6 +139,13 @@ impl Store {
                  resource TEXT NOT NULL,
                  expires_ms INTEGER NOT NULL,
                  revoked INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS phones (
+                 key_hash BLOB PRIMARY KEY,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id),
+                 name TEXT NOT NULL,
+                 created_ms INTEGER NOT NULL,
+                 last_used_ms INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(err)?;
@@ -380,6 +387,51 @@ impl Store {
             )
             .map_err(err)?;
         Ok(api + oauth)
+    }
+
+    /// A phone signed in with `key`, which can only send to the inbox.
+    pub fn add_phone(&self, account_id: i64, key: &str, name: &str, now: u64) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO phones (key_hash, account_id, name, created_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![hash(key), account_id, name, now as i64],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// The account and name of the phone signed in with `key`.
+    pub fn phone(&self, key: &str, now: u64) -> Result<Option<(i64, String)>> {
+        let db = self.db.lock().unwrap();
+        let found: Option<(i64, String)> = db
+            .query_row(
+                "SELECT account_id, name FROM phones WHERE key_hash = ?1",
+                params![hash(key)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        if found.is_some() {
+            db.execute(
+                "UPDATE phones SET last_used_ms = ?2 WHERE key_hash = ?1",
+                params![hash(key), now as i64],
+            )
+            .map_err(err)?;
+        }
+        Ok(found)
+    }
+
+    /// Sign the phone with `key` out; false if it wasn't signed in.
+    pub fn remove_phone(&self, key: &str) -> Result<bool> {
+        let n = self
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM phones WHERE key_hash = ?1", params![hash(key)])
+            .map_err(err)?;
+        Ok(n > 0)
     }
 
     pub fn add_inbox_item(&self, item: &crate::inbox::Item, file_key: &[u8]) -> Result<()> {
