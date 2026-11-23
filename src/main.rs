@@ -406,6 +406,10 @@ fn relay_access(me: &Me) -> ExitCode {
 fn relay_revoke_access(me: &Me, who: &str) -> ExitCode {
     let access = opendrop::relay::access::Access::new(&me.config_dir);
     match access.revoke(who) {
+        Ok(gone) if gone.is_empty() && who == "all" => {
+            println!("Nobody had standing access.");
+            ExitCode::SUCCESS
+        }
         Ok(gone) if gone.is_empty() => fail(&format!(
             "nobody called \"{who}\" has standing access (see `opendrop relay access`)"
         )),
