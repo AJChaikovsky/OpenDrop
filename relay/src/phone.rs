@@ -365,7 +365,11 @@ async fn signout(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Respons
 /// Whether the answer should be a page (a browser) or one line of text (a
 /// Shortcut or script, which sends a bearer token).
 fn wants_text(headers: &HeaderMap) -> bool {
-    headers.contains_key(header::AUTHORIZATION)
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    headers.contains_key(header::AUTHORIZATION) || !accept.contains("text/html")
 }
 
 fn answer(text_mode: bool, status: StatusCode, title: &str, detail: &str) -> Response {
@@ -396,6 +400,10 @@ async fn share(
 ) -> Response {
     let text_mode = wants_text(&headers);
     let Some((_, account, phone)) = signed_in(&relay, &headers) else {
+        eprintln!(
+            "phone share refused: not signed in (key given: {})",
+            phone_key(&headers).is_some()
+        );
         if text_mode {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -480,6 +488,7 @@ async fn share(
             }
         }
     }
+    eprintln!("phone share: {} file(s) into account {account}", sent.len());
     if sent.is_empty() {
         return answer(
             text_mode,
@@ -612,7 +621,7 @@ self.addEventListener('fetch', (e) => {
   if (e.request.method === 'POST' && url.pathname === '/phone/share' && e.request.mode === 'navigate') {
     e.respondWith((async () => {
       const form = await e.request.formData();
-      return fetch('/phone/share', { method: 'POST', body: form, credentials: 'same-origin' });
+      return fetch('/phone/share', { method: 'POST', body: form, credentials: 'same-origin', headers: { Accept: 'text/html' } });
     })());
   }
 });

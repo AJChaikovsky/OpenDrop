@@ -155,9 +155,12 @@ impl TestRelay {
             .post(format!("{}/phone/share", self.url))
             .multipart(form);
         let request = match auth {
-            Auth::Cookie(key) => request.header("cookie", format!("od_phone={key}")),
+            Auth::Cookie(key) => request
+                .header("cookie", format!("od_phone={key}"))
+                .header("accept", "text/html"),
             Auth::Bearer(key) => request.bearer_auth(key),
-            Auth::None => request,
+            Auth::None => request.header("accept", "text/html"),
+            Auth::Script => request,
         };
         request.send().await.unwrap()
     }
@@ -168,6 +171,8 @@ enum Auth<'a> {
     Cookie(&'a str),
     Bearer(&'a str),
     None,
+    /// No key and no browser: a Shortcut whose key went missing.
+    Script,
 }
 
 fn sha(data: &[u8]) -> String {
@@ -283,6 +288,13 @@ async fn shares_without_a_signed_in_phone_are_refused() {
     assert_eq!(r.status(), 303, "a browser is sent to sign in");
     let r = relay.share(Auth::Bearer("odp_made_up"), &file).await;
     assert_eq!(r.status(), 401);
+    let r = relay.share(Auth::Script, &file).await;
+    assert_eq!(
+        r.status(),
+        401,
+        "a Shortcut without its key is told, not redirected"
+    );
+    assert!(r.text().await.unwrap().contains("isn't signed in"));
     let r = relay.share(Auth::Cookie("odp_made_up"), &file).await;
     assert_eq!(r.status(), 303);
     // An MCP token isn't a phone key, nor the other way round.
