@@ -414,6 +414,8 @@ async fn share(
         return Redirect::to("/phone/").into_response();
     };
     let mut sent = Vec::new();
+    // What came that wasn't a file, for the log when nothing was sent.
+    let mut skipped = Vec::new();
     loop {
         let field = match form.next_field().await {
             Ok(Some(field)) => field,
@@ -427,11 +429,16 @@ async fn share(
                 );
             }
         };
-        if field.name() != Some("file") {
+        // A file is the `file` field, or any field that carries a file name
+        // (some senders name their fields differently).
+        let field_name = field.name().unwrap_or_default().to_owned();
+        let has_file_name = field.file_name().is_some();
+        let content_type = field.content_type().unwrap_or_default().to_owned();
+        if field_name != "file" && !has_file_name {
+            skipped.push(format!("{field_name:?} ({content_type})"));
             continue;
         }
         let name = field.file_name().map(crate::clean_name).unwrap_or_default();
-        let content_type = field.content_type().unwrap_or_default().to_owned();
         let data = match field.bytes().await {
             Ok(data) => data,
             Err(e) => {
@@ -444,6 +451,9 @@ async fn share(
             }
         };
         if data.is_empty() {
+            skipped.push(format!(
+                "{field_name:?} ({content_type}, file name: {has_file_name}, empty)"
+            ));
             continue;
         }
         let name = if name.is_empty() {
@@ -489,6 +499,9 @@ async fn share(
         }
     }
     eprintln!("phone share: {} file(s) into account {account}", sent.len());
+    if sent.is_empty() {
+        eprintln!("phone share: nothing usable in fields {skipped:?}");
+    }
     if sent.is_empty() {
         return answer(
             text_mode,
